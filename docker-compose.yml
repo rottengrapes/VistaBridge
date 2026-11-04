@@ -1,0 +1,57 @@
+# ==============================================================================
+# VistaBridge Docker Compose Configuration
+# Supports both local build testing and automated Docker Hub image deployment
+# ==============================================================================
+
+services:
+  vistabridge:
+    image: ${DOCKER_IMAGE:-pbokaderottengrapes/vistabridge:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        PORT: ${PORT:-3007}
+        GEOSERVER_URL: ${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+        NEXT_PUBLIC_GEOSERVER_URL: ${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+        NEXT_PUBLIC_TILESERV_URL: ${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
+        NEXT_PUBLIC_ANALYTICS_URL: ${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
+        DB_TYPE: ${DB_TYPE:-sqlite}
+        SQLITE_DB_PATH: ${SQLITE_DB_PATH:-/app/data/geovista.db}
+    container_name: vistabridge
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3007}:3007"
+    environment:
+      # Application & Network Settings
+      - NODE_ENV=${NODE_ENV:-production}
+      - NEXT_TELEMETRY_DISABLED=${NEXT_TELEMETRY_DISABLED:-1}
+      - PORT=${PORT:-3007}
+      - HOSTNAME=${HOSTNAME:-0.0.0.0}
+
+      # Database Configuration
+      - DB_TYPE=${DB_TYPE:-sqlite}
+      - SQLITE_DB_PATH=${SQLITE_DB_PATH:-/app/data/geovista.db}
+
+      # GeoServer & Spatial Services
+      - GEOSERVER_URL=${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_TILESERV_URL=${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}
+      - NEXT_PUBLIC_ANALYTICS_URL=${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
+
+      # Authentication Secret
+      - JWT_SECRET=${JWT_SECRET:-}
+    volumes:
+      # Persistent SQLite database storage on host machine
+      - ./data:/app/data
+    extra_hosts:
+      # Allows container to reach host-level services (e.g. local GeoServer / TileServ)
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${PORT:-3007}/api/config/public || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

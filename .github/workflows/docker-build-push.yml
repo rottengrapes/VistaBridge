@@ -1,0 +1,88 @@
+name: "Docker: Build & Publish to Docker Hub"
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    name: "Build & Push to Docker Hub"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'pbokaderottengrapes' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry (Backup Mirror)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker Metadata (Tags & Labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            pbokaderottengrapes/vistabridge
+            ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=v1.0.${{ github.run_number }}
+            type=sha,format=short,prefix=sha-
+            type=ref,event=branch
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PORT=3007
+            NODE_ENV=production
+            NEXT_TELEMETRY_DISABLED=1
+            DB_TYPE=sqlite
+            SQLITE_DB_PATH=/app/data/geovista.db
+            GEOSERVER_URL=http://host.docker.internal:8080/geoserver
+            NEXT_PUBLIC_GEOSERVER_URL=http://host.docker.internal:8080/geoserver
+            NEXT_PUBLIC_TILESERV_URL=http://host.docker.internal:7800
+            NEXT_PUBLIC_API_URL=/api
+            NEXT_PUBLIC_ANALYTICS_URL=http://host.docker.internal:8000
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Pipeline Execution Summary
+        if: success()
+        run: |
+          echo "## 🚀 Image Published to Docker Hub Successfully!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Primary Docker Hub Image:** \`pbokaderottengrapes/vistabridge:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Sequential Version Tag:** \`pbokaderottengrapes/vistabridge:v1.0.${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA Tag:** \`pbokaderottengrapes/vistabridge:sha-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **GHCR Backup Mirror:** \`ghcr.io/${{ github.repository }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deploy anywhere with Docker Compose:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker compose up -d" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
