@@ -171,6 +171,8 @@ chmod +x setup.sh start.sh stop.sh
 ./start.sh
 ```
 
+If `setup.sh` cannot save configuration to `data/geovista.db`, it reports an error and exits before clearing the build cache, building, or launching the application. Check that the database and its parent directory are writable by your user and that disk space is available, then rerun `./setup.sh`. A GeoServer reachability warning alone does not stop setup.
+
 ---
 
 ### Option B: Manual Setup
