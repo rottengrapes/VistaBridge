@@ -42,7 +42,8 @@ docker compose ps
 echo ""
 echo -e "${GREEN}==============================================================================${NC}"
 echo -e "${GREEN}        DEPLOYMENT READY: Running on latest Docker Hub image!                ${NC}"
-echo -e "${GREEN}        Access URL: http://localhost:3007                                     ${NC}"
+echo -e "${GREEN}        Access URL: http://localhost (or http://<SERVER_IP>)                ${NC}"
+echo -e "${GREEN}        Direct Port: http://localhost:3007                                    ${NC}"
 echo -e "${GREEN}==============================================================================${NC}"
 echo ""
 

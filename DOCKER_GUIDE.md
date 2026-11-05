@@ -81,13 +81,13 @@ docker compose down
 
 Every commit pushed to the `main` branch automatically triggers `.github/workflows/docker-build-push.yml` to compile a fresh image and generate:
 - **`:latest` Tag**: Automatically updated to point to the newest build.
-- **New Sequential Version Tag**: `pbokaderottengrapes/vistabridge:v1.0.<RUN_NUMBER>` (e.g. `v1.0.1`, `v1.0.2`, `v1.0.3`...) so every build has a unique, trackable version.
-- **Commit SHA Tag**: `pbokaderottengrapes/vistabridge:sha-<SHORT_SHA>` for exact code traceability.
+- **New Sequential Version Tag**: `rottengrapesprivatelimited/vistabridge:v1.0.<RUN_NUMBER>` (e.g. `v1.0.1`, `v1.0.2`, `v1.0.3`...) so every build has a unique, trackable version.
+- **Commit SHA Tag**: `rottengrapesprivatelimited/vistabridge:sha-<SHORT_SHA>` for exact code traceability.
 
 ### Step 1: Configure Docker Hub Secrets in GitHub
 1. In your GitHub repository (`rottengrapes/VistaBridge`), go to **Settings** -> **Secrets and variables** -> **Actions**.
 2. Add the following repository secrets:
-   - `DOCKERHUB_USERNAME`: `pbokaderottengrapes`
+   - `DOCKERHUB_USERNAME`: Your Docker Hub username or organization account (`rottengrapesprivatelimited`).
    - `DOCKERHUB_TOKEN`: Your Docker Hub Personal Access Token (created via Docker Hub Account Settings -> Security -> New Access Token with Read/Write/Delete permissions).
 
 ### Step 2: Commit and Push
@@ -109,7 +109,7 @@ docker compose pull && docker compose up -d --force-recreate
 ```
 
 ### Why this guarantees you always run the latest version:
-1. `docker compose pull`: Contacts Docker Hub and downloads the latest layers for `pbokaderottengrapes/vistabridge:latest`.
+1. `docker compose pull`: Contacts Docker Hub and downloads the latest layers for `rottengrapesprivatelimited/vistabridge:latest`.
 2. `pull_policy: always`: Instructs Docker Compose to inspect the remote registry before launching.
 3. `--force-recreate`: Replaces the running container immediately with the brand new image while keeping all SQLite database records safe inside `./data`.
 
@@ -117,7 +117,7 @@ docker compose pull && docker compose up -d --force-recreate
 
 ## 5. How a New User Sets Up Their Own Custom Environment (ENV)
 
-If a new user, client, or team member pulls `pbokaderottengrapes/vistabridge:latest` and wants to run it with **their own custom GeoServer, custom port, and custom secrets**, they can do it using either of the two methods below.
+If a new user, client, or team member pulls `rottengrapesprivatelimited/vistabridge:latest` and wants to run it with **their own custom GeoServer, custom port, and custom secrets**, they can do it using either of the two methods below.
 
 ---
 
@@ -175,7 +175,7 @@ A new user does **not even need to clone the repository**. They can pull the ima
 2. The user pulls and runs the container:
    ```bash
    # Pull the latest image
-   docker pull pbokaderottengrapes/vistabridge:latest
+   docker pull rottengrapesprivatelimited/vistabridge:latest
 
    # Run container using the custom env file
    docker run -d \
@@ -184,7 +184,7 @@ A new user does **not even need to clone the repository**. They can pull the ima
      -p 9000:9000 \
      --env-file ./my-vistabridge.env \
      -v vistabridge_data:/app/data \
-     pbokaderottengrapes/vistabridge:latest
+     rottengrapesprivatelimited/vistabridge:latest
    ```
 
 ---
@@ -203,16 +203,27 @@ docker run -d \
   -e GEOSERVER_URL="https://mygeoserver.org/geoserver" \
   -e NEXT_PUBLIC_GEOSERVER_URL="https://mygeoserver.org/geoserver" \
   -v "${PWD}/data:/app/data" \
-  pbokaderottengrapes/vistabridge:latest
+  rottengrapesprivatelimited/vistabridge:latest
 ```
 
 ---
 
-### Summary Checklist for Any New User
+## 6. Automated Nginx Reverse Proxy (Port 80 & Domain/Server IP)
+
+VistaBridge includes an integrated, auto-configured Nginx reverse proxy:
+
+### Key Features:
+- **Default Port 80**: Accessible on standard HTTP (`http://<SERVER_IP>` or `http://localhost`) without needing to specify `:3007`.
+- **Automatic IP & Domain Detection**:
+  - By default, `DOMAIN=_` allows traffic from any **Server IP address** or **localhost**.
+  - To bind to a custom domain (e.g. `vistabridge.mycompany.com`), simply set `DOMAIN=vistabridge.mycompany.com` in `.env`.
+- **Large GIS File Uploads**: `client_max_body_size 100M;` enables large Shapefile, GeoTIFF, and GeoJSON imports.
+- **WebSocket & SSE Ready**: Next.js hydration, streaming, and live map updates are fully supported.
+- **Auto Configuration**: Uses Docker's native `envsubst` to compile `nginx/templates/default.conf.template` at boot.
 
 | Step | User Action |
 | :--- | :--- |
-| **1. Pull Image** | `docker pull pbokaderottengrapes/vistabridge:latest` |
+| **1. Pull Image** | `docker pull rottengrapesprivatelimited/vistabridge:latest` |
 | **2. Define Environment** | Set custom variables in `.env`, `my.env`, or inline `-e` flags |
 | **3. Mount Database** | Mount `-v ./data:/app/data` or `-v vistabridge_data:/app/data` so their settings & maps persist |
 | **4. Launch Container** | `docker compose up -d` OR `docker run -d ...` |

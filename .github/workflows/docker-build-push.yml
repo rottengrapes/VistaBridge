@@ -27,7 +27,7 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME || 'pbokaderottengrapes' }}
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'rottengrapesprivatelimited' }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Log in to GitHub Container Registry (Backup Mirror)
@@ -42,7 +42,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            pbokaderottengrapes/vistabridge
+            rottengrapesprivatelimited/vistabridge
             ghcr.io/${{ github.repository }}
           tags: |
             type=raw,value=latest
@@ -77,9 +77,9 @@ jobs:
         run: |
           echo "## 🚀 Image Published to Docker Hub Successfully!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Primary Docker Hub Image:** \`pbokaderottengrapes/vistabridge:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **New Sequential Version Tag:** \`pbokaderottengrapes/vistabridge:v1.0.${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Commit SHA Tag:** \`pbokaderottengrapes/vistabridge:sha-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Primary Docker Hub Image:** \`rottengrapesprivatelimited/vistabridge:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **New Sequential Version Tag:** \`rottengrapesprivatelimited/vistabridge:v1.0.${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit SHA Tag:** \`rottengrapesprivatelimited/vistabridge:sha-${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **GHCR Backup Mirror:** \`ghcr.io/${{ github.repository }}:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Deploy anywhere with Docker Compose:" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,50 @@
+# ==============================================================================
+# VistaBridge Nginx Reverse Proxy Template
+# Automatically configured via environment variables at container startup
+# Listens on port 80 and accepts traffic via Server IP, localhost, or Domain
+# ==============================================================================
+
+server {
+    listen 80;
+    
+    # Matches configured domain, localhost, or any server IP address by default
+    server_name ${DOMAIN} localhost _;
+
+    # Maximum upload size for GIS layers (Shapefiles, GeoTIFFs, GeoJSON)
+    client_max_body_size 100M;
+
+    # Timeout settings for heavy spatial and raster operations
+    proxy_connect_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+
+    # Enable Gzip compression for Next.js bundles and GeoJSON responses
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript image/svg+xml;
+
+    # Next.js Application Proxy
+    location / {
+        proxy_pass http://vistabridge:${PORT};
+        proxy_http_version 1.1;
+
+        # WebSocket and Server-Sent Events (SSE) support
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # Client and Host Forwarding Headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Port $server_port;
+
+        # Disable caching for Next.js dynamic API routes
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+

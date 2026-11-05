@@ -47,7 +47,8 @@ docker compose ps
 echo.
 echo ==============================================================================
 echo        DEPLOYMENT READY: Running on latest Docker Hub image!
-echo        Access URL: http://localhost:3007
+echo        Access URL: http://localhost (or http://<SERVER_IP>)
+echo        Direct Port: http://localhost:3007
 echo ==============================================================================
 echo.
 pause
