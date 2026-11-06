@@ -433,6 +433,14 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
   }
 
   const store = useAuthStore.getState();
+  if (!store.user?.geoserverUrl && !useConfigStore.getState().isLoaded) {
+    try {
+      await useConfigStore.getState().fetchConfig();
+    } catch {
+      // ignore
+    }
+  }
+
   const geoserverUrl = (
     store.user?.geoserverUrl ||
     useConfigStore.getState().geoserverUrl ||

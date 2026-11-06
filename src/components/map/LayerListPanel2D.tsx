@@ -10,6 +10,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import React, { useState } from 'react';
+import { usePathname } from 'next/navigation';
 import { Button, Divider, Tooltip, Dropdown, Tag, Checkbox, Slider, Modal } from 'antd';
 import LegendImage from './LegendImage';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -75,6 +76,7 @@ interface LayerListPanel2DProps {
   notification: any;
   modal: any;
   token?: string | null;
+  isQuickMap?: boolean;
   getVisibleFeatureIdsForLayer?: (layerId: string) => Promise<string[]>;
   getViewportBboxAndSize?: () => { bbox: [number, number, number, number]; size: [number, number] } | null;
   getOlLayer?: (layerId: string) => any;
@@ -98,10 +100,13 @@ export default function LayerListPanel2D({
   notification,
   modal,
   token,
+  isQuickMap = false,
   getVisibleFeatureIdsForLayer,
   getViewportBboxAndSize,
   getOlLayer,
 }: LayerListPanel2DProps) {
+  const pathname = usePathname();
+  const isQuick = isQuickMap || pathname === '/quick-map';
   const { user } = useAuthStore();
   const [expandedLegends, setExpandedLegends] = useState<Record<string, boolean>>({});
   const [expandedOpacity, setExpandedOpacity] = useState<Record<string, boolean>>({});
@@ -583,7 +588,7 @@ export default function LayerListPanel2D({
         <Button
           type="primary"
           size="small"
-          disabled={!token}
+          disabled={!token && !isQuick}
           icon={<Plus size={14} />}
           onClick={() => setIsAddLayerModalOpen(true)}
           className="text-[11px] h-7 flex items-center gap-1 rounded-lg font-bold"

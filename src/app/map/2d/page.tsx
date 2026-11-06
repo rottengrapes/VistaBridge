@@ -361,9 +361,18 @@ const annotationStyleFunction = (feature: any) => {
   return styles;
 };
 
-
-
-
+const getActiveGeoserverUrl = (userUrl?: string) => {
+  const store = useAuthStore.getState();
+  const cfg = useConfigStore.getState();
+  return (
+    userUrl ||
+    store.user?.geoserverUrl ||
+    cfg.geoserverUrl ||
+    (typeof window !== 'undefined' && window.location.origin && !window.location.origin.includes('localhost') ? `${window.location.origin}/geoserver` : '') ||
+    process.env.NEXT_PUBLIC_GEOSERVER_URL ||
+    'http://localhost:8080/geoserver'
+  ).replace(/\/+$/, '');
+};
 
 function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string; isQuickMap?: boolean }) {
   const router = useRouter();
@@ -998,13 +1007,13 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
 
     const checkAuthAndFetchMap = async () => {
       if (isQuick) {
-        setIsPublicMap(true);
+        setIsPublicMap(false);
         const defaultBm = useAppearanceStore.getState().defaultBasemap || 'osm';
         setMapDetail({
           id: 'quick-map',
           name: 'Quick Map',
-          description: 'Temporary geospatial workspace (unsaved)',
-          share: 'PUBLIC',
+          description: 'Quick geospatial exploration (unsaved)',
+          share: 'QUICK_MAP',
           basemap_id: defaultBm,
         });
         setNewName('Quick Map');
@@ -1692,7 +1701,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     const isWmtsLayer = chosenProtocol === 'WMTS';
     const isWfsLayer = chosenProtocol === 'WFS';
     const isWcsLayerFinal = chosenProtocol === 'WCS';
-    const geoserverBaseUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverBaseUrl = getActiveGeoserverUrl(user?.geoserverUrl);
     const geoserverAuth = user?.geoserverAuth;
 
     if (isWmtsLayer) {
@@ -2154,11 +2163,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       const layersListState: LayerState[] = [];
       let zIndex = 1;
 
-      const geoserverUrl = (
-        user?.geoserverUrl ||
-        useConfigStore.getState().geoserverUrl ||
-        'http://localhost:8080/geoserver'
-      ).replace(/\/$/, '');
+      const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
       const geoserverAuth = user?.geoserverAuth;
       const headers: Record<string, string> = {};
       if (geoserverAuth) {
@@ -3304,7 +3309,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       } else {
         // Fallback: query GeoServer WMS GetCapabilities for the layer's real bbox
         try {
-          const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+          const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
           const headers: Record<string, string> = {};
           if (user?.geoserverAuth) headers['Authorization'] = user.geoserverAuth;
           const capRes = await fetch(`${geoserverUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`, { headers });
@@ -3443,7 +3448,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
           zIndex: maxZIndex + 10,
         });
       } else {
-        const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+        const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
         const geoserverAuth = user?.geoserverAuth;
 
         newOlLayer = new TileLayer({
@@ -4854,7 +4859,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     stopDrawingAnnotation();
     stopQueryDraw();
 
-    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
     const geoserverAuth = user?.geoserverAuth;
 
     const targetAddedLayer = addedLayers.find(l => l.id === layerId || l.name === layerId);
@@ -4951,7 +4956,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     if (!selectedWfsLayerId || !wfsLayerSchema) return;
 
     setIsWfsSaving(true);
-    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
     const geoserverAuth = user?.geoserverAuth;
 
     try {
@@ -5089,7 +5094,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     }
 
     setIsWfsSaving(true);
-    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
     const geoserverAuth = user?.geoserverAuth;
 
     try {
@@ -5190,7 +5195,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     }
 
     setIsWfsSaving(true);
-    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
     const geoserverAuth = user?.geoserverAuth;
 
     try {
@@ -5792,9 +5797,9 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       d.id.toLowerCase().includes(cleanSearch);
     const matchesType = modalTypeFilter === 'ALL' || d.data_type === modalTypeFilter;
 
-    // If the map is PUBLIC, restrict the list to PUBLIC datasets only
-    const isPublicMap = mapDetail?.share === 'PUBLIC';
-    const matchesAccess = !isPublicMap || d.access_level === 'PUBLIC';
+    // For shared public maps, only show datasets flagged as public; for Quick Map, show all available public layers from GeoServer
+    const isPublicShare = !isQuick && isPublicMap;
+    const matchesAccess = !isPublicShare || d.access_level === 'PUBLIC' || isQuick;
 
     return matchesSearch && matchesType && matchesAccess;
   });
@@ -7261,6 +7266,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                     notification={notification}
                     modal={modal}
                     token={token}
+                    isQuickMap={isQuick}
                     getVisibleFeatureIdsForLayer={getVisibleFeatureIdsForLayer}
                     getViewportBboxAndSize={getViewportBboxAndSize}
                     getOlLayer={getOlLayer}
@@ -7994,7 +8000,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
             datasetId={attributeTableDataset.id}
             datasetName={attributeTableDataset.name}
             layerType={addedLayers.find(l => l.id === attributeTableDataset.id)?.type as any}
-            geoserverBase={(user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '')}
+            geoserverBase={getActiveGeoserverUrl(user?.geoserverUrl)}
             geoserverAuth={user?.geoserverAuth}
             onClose={handleCloseAttributeTable}
             getVisibleFeatureIds={getVisibleFeatureIds}
