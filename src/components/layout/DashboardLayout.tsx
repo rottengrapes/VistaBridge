@@ -12,7 +12,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { Layout, Menu as AntMenu, Input, Button, Typography, Divider, notification, Form, Modal, Select, type InputRef } from 'antd';
+import { Layout, Menu as AntMenu, Input, Button, Typography, Divider, notification, Form, Modal, Select, Tag, type InputRef } from 'antd';
 import {
   Map as MapIcon,
   User as UserIcon,
@@ -25,7 +25,8 @@ import {
   UserCircle,
   LayoutDashboard,
   Home,
-  Palette
+  Palette,
+  Shield,
 } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -106,6 +107,24 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
   const [savingDashboard, setSavingDashboard] = useState(false);
   const [hideSubmenu, setHideSubmenu] = useState(false);
 
+  const [createDashboardShareType, setCreateDashboardShareType] = useState<'PRIVATE' | 'ROLES' | 'PUBLIC'>('PRIVATE');
+  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+  const [loadingRoles, setLoadingRoles] = useState(false);
+
+  useEffect(() => {
+    if (createDashboardModalOpen && availableRoles.length === 0) {
+      setLoadingRoles(true);
+      apiRequest('/geoserver/roles')
+        .then((res) => (res.ok ? res.json() : { roles: [] }))
+        .then((data) => {
+          const list = Array.isArray(data) ? data : data?.roles || [];
+          if (Array.isArray(list)) setAvailableRoles(list);
+        })
+        .catch(() => {})
+        .finally(() => setLoadingRoles(false));
+    }
+  }, [createDashboardModalOpen, availableRoles.length]);
+
   useEffect(() => {
     if (createMapModalOpen || createDashboardModalOpen) {
       queueMicrotask(() => {
@@ -136,6 +155,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 
   interface CreateMapFormValues {
     name: string;
+    slug?: string;
     description?: string;
     share?: string;
   }
@@ -151,6 +171,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
         method: 'POST',
         body: JSON.stringify({
           name: trimmedName,
+          slug: values.slug?.trim() || undefined,
           description: (values.description || '').trim(),
           share: values.share,
           type: '2D',
@@ -162,7 +183,8 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       });
 
       if (!response.ok) {
-        throw new Error('Failed to create map workspace');
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to create map workspace');
       }
 
       const mapData = await response.json();
@@ -174,9 +196,8 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       setCreateMapModalOpen(false);
       form.resetFields();
 
-      // Redirect to the created workspace view: e.g. /map/2d?id=uuid
-      // Using window.location.href ensures a fresh lifecycle without stale map/layer state across browsers
-      window.location.href = `/map/2d?id=${mapData.id}`;
+      // Redirect directly to the slug route: /map/urban_body
+      window.location.href = `/map/${mapData.slug || mapData.id}`;
     } catch (err: unknown) {
       notification.error({
         message: 'Error',
@@ -195,13 +216,30 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 
   interface CreateDashboardFormValues {
     name: string;
+    slug?: string;
     description?: string;
-    share?: string;
+    share_type?: 'PRIVATE' | 'ROLES' | 'USERS' | 'PUBLIC';
+    allowed_roles?: string[];
+    allowed_users?: string[];
   }
 
   const handleSaveDashboard = async (values: CreateDashboardFormValues) => {
     const trimmedName = (values.name || '').trim();
     if (!trimmedName || trimmedName.length < 2) return;
+
+    const shareType = values.share_type || createDashboardShareType || 'PRIVATE';
+    const allowedRoles = shareType === 'ROLES'
+      ? (values.allowed_roles || []).map((r: string) => ({ role: r, permission: 'VIEWER' as const }))
+      : [];
+
+    if (shareType === 'ROLES' && allowedRoles.length === 0) {
+      notification.warning({
+        message: 'No Roles Selected',
+        description: 'Please select at least one GeoServer role for role-based access.',
+        placement: 'topRight',
+      });
+      return;
+    }
 
     setSavingDashboard(true);
     try {
@@ -209,10 +247,14 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
         method: 'POST',
         body: JSON.stringify({
           name: trimmedName,
+          slug: values.slug?.trim() || undefined,
           description: (values.description || '').trim(),
-          is_public: values.share === 'PUBLIC',
-          content: { widgets: [] }
-        })
+          share_type: shareType,
+          allowed_roles: allowedRoles,
+          allowed_users: [],
+          is_public: shareType === 'PUBLIC',
+          content: { widgets: [] },
+        }),
       });
 
       if (!response.ok) {
@@ -224,17 +266,18 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       notification.success({
         message: 'Success',
         description: `Dashboard "${data.name}" created successfully.`,
-        placement: 'topRight'
+        placement: 'topRight',
       });
       setCreateDashboardModalOpen(false);
       dashboardForm.resetFields();
+      setCreateDashboardShareType('PRIVATE');
 
-      router.push(`/dashboard/view?id=${data.id}`);
+      router.push(`/dashboard/${data.slug || data.id}`);
     } catch (err: unknown) {
       notification.error({
         message: 'Error',
         description: (err as Error).message || 'Could not create dashboard.',
-        placement: 'topRight'
+        placement: 'topRight',
       });
     } finally {
       setSavingDashboard(false);
@@ -244,6 +287,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
   const handleCancelDashboard = () => {
     setCreateDashboardModalOpen(false);
     dashboardForm.resetFields();
+    setCreateDashboardShareType('PRIVATE');
   };
 
   const handleLogout = async () => {
@@ -552,7 +596,11 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               }
             ]}
           >
-            <Input maxLength={32} placeholder="e.g. San Francisco Roads Plan" className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold" />
+            <Input
+              maxLength={32}
+              placeholder="e.g. San Francisco Roads Plan"
+              className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold"
+            />
           </Form.Item>
 
           <Form.Item
@@ -648,7 +696,11 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               }
             ]}
           >
-            <Input maxLength={64} placeholder="e.g. Urban Analytics Overview" className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold" />
+            <Input
+              maxLength={64}
+              placeholder="e.g. Urban Analytics Overview"
+              className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold"
+            />
           </Form.Item>
 
           <Form.Item
@@ -659,19 +711,65 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
           </Form.Item>
 
           <Form.Item
-            name="share"
+            name="share_type"
             label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Access Control</span>}
             initialValue="PRIVATE"
             rules={[{ required: true }]}
           >
             <Select
               className="vismap-select h-11"
+              value={createDashboardShareType}
+              onChange={(val) => {
+                setCreateDashboardShareType(val);
+                dashboardForm.setFieldValue('share_type', val);
+              }}
               options={[
-                { label: 'Private', value: 'PRIVATE' },
-                { label: 'Public', value: 'PUBLIC' }
+                { label: 'Private (Only you can access)', value: 'PRIVATE' },
+                { label: 'GeoServer Roles (Grant access to security roles)', value: 'ROLES' },
+                { label: 'Public (Anyone with link can view)', value: 'PUBLIC' }
               ]}
             />
           </Form.Item>
+
+          {createDashboardShareType === 'ROLES' && (
+            <Form.Item
+              name="allowed_roles"
+              label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Select GeoServer Roles</span>}
+              rules={[{ required: true, message: 'Please select at least one GeoServer role' }]}
+            >
+              <Select
+                mode="multiple"
+                placeholder="Select GeoServer security roles..."
+                loading={loadingRoles}
+                className="w-full rounded-xl"
+                tagRender={(props) => (
+                  <Tag
+                    closable={props.closable}
+                    onClose={props.onClose}
+                    className="rounded-lg text-xs font-semibold px-2 py-0.5 mr-1 bg-blue-50 border border-blue-200 text-blue-700 flex items-center gap-1"
+                  >
+                    <Shield size={11} className="inline mr-1" />
+                    {props.value}
+                  </Tag>
+                )}
+                options={availableRoles.map((role) => ({
+                  label: (
+                    <div className="flex items-center gap-2 text-xs py-0.5">
+                      <Shield size={13} className="text-primary shrink-0" />
+                      <span className="font-semibold text-gray-800">{role}</span>
+                    </div>
+                  ),
+                  value: role,
+                }))}
+              />
+            </Form.Item>
+          )}
+
+          <div className="text-[11px] text-gray-400 -mt-2">
+            {createDashboardShareType === 'PRIVATE' && '🔒 Only you can view or edit this dashboard.'}
+            {createDashboardShareType === 'ROLES' && '🛡️ Users holding any of the selected GeoServer roles can access this dashboard.'}
+            {createDashboardShareType === 'PUBLIC' && '🌐 Anyone with the link can view this dashboard without logging in.'}
+          </div>
 
           <div className="flex gap-3 justify-end pt-5 border-t border-gray-100 mt-8">
             <Button className="rounded-xl h-11 px-6 font-semibold" onClick={handleCancelDashboard}>

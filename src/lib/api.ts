@@ -10,6 +10,8 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useAuthStore } from '@/store/useAuthStore';
+import { useConfigStore } from '@/store/useConfigStore';
+import { useGeoServerServicesStore, getActiveServicesConfig } from '@/store/useGeoServerServicesStore';
 import { siteConfig } from '@/config/site-config';
 import { booleanIntersects } from '@turf/boolean-intersects';
 
@@ -431,7 +433,12 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
   }
 
   const store = useAuthStore.getState();
-  const geoserverUrl = (store.user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/+$/, '');
+  const geoserverUrl = (
+    store.user?.geoserverUrl ||
+    useConfigStore.getState().geoserverUrl ||
+    process.env.NEXT_PUBLIC_GEOSERVER_URL ||
+    'http://localhost:8080/geoserver'
+  ).replace(/\/+$/, '');
   const geoserverAuth = store.user?.geoserverAuth;
 
 
@@ -450,83 +457,389 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
   const parts = pathOnly.split('/').filter(Boolean);
   const searchParams = new URLSearchParams(queryString);
 
-  const layerId = parts[1];
+  const layerId = parts[1] ? decodeURIComponent(parts[1]) : '';
 
   // 0. GET /datasets/ (list all datasets)
   if (parts.length === 1 && parts[0] === 'datasets') {
     try {
-      const [capRes, wfsRes] = await Promise.all([
-        fetch(`${geoserverUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`, { headers }),
-        fetch(`${geoserverUrl}/ows?service=WFS&version=2.0.0&request=GetCapabilities`, { headers }).catch(() => null)
-      ]);
+      const servicesConfig = getActiveServicesConfig();
+      const wmsVer = servicesConfig.wms?.version || '1.3.0';
+      const wfsVer = servicesConfig.wfs?.version || '1.1.0';
+      const wmtsVer = servicesConfig.wmts?.version || '1.0.0';
 
-      if (!capRes.ok) throw new Error(`GeoServer returned status: ${capRes.status}`);
-      const capXml = await capRes.text();
       const parser = new DOMParser();
-      const capDoc = parser.parseFromString(capXml, 'application/xml');
+      let serviceUsed: 'WMS' | 'WFS' | 'WMTS' | 'WCS' | 'HYBRID' = 'WMS';
+      const layerMap: Record<string, {
+        name: string;
+        title: string;
+        styles: any[];
+        bbox: [number, number, number, number];
+        isGroup: boolean;
+        dataType: 'VECTOR' | 'RASTER' | 'GROUP';
+      }> = {};
 
-      // Parse WFS FeatureTypes to identify true vector layers
-      const wfsFeatureTypes = new Set<string>();
-      if (wfsRes && wfsRes.ok) {
+      // ── Step 1: Try WMS GetCapabilities (if enabled & not explicitly bypassed) ──
+      const tryWms = servicesConfig.wms?.enabled !== false && servicesConfig.capabilitiesMode !== 'WFS' && servicesConfig.capabilitiesMode !== 'WMTS';
+      let wmsSuccess = false;
+
+      if (tryWms) {
         try {
-          const wfsXml = await wfsRes.text();
-          const wfsDoc = parser.parseFromString(wfsXml, 'application/xml');
-          wfsDoc.querySelectorAll('FeatureType > Name').forEach((nameEl) => {
-            const name = nameEl.textContent?.trim();
-            if (name) {
-              wfsFeatureTypes.add(name);
-              if (name.includes(':')) {
-                wfsFeatureTypes.add(name.split(':').pop()!);
+          const wmsUrl = `${geoserverUrl}/ows?service=WMS&version=${wmsVer}&request=GetCapabilities`;
+          const wmsRes = await fetch(wmsUrl, { headers });
+          if (wmsRes.ok) {
+            const wmsXml = await wmsRes.text();
+            if (
+              !wmsXml.includes('ServiceExceptionReport') &&
+              !wmsXml.includes('ExceptionReport') &&
+              (wmsXml.includes('WMS_Capabilities') || wmsXml.includes('WMT_MS_Capabilities') || wmsXml.includes('<Capability>'))
+            ) {
+              const capDoc = parser.parseFromString(wmsXml, 'application/xml');
+              const leafNames = capDoc.querySelectorAll('Layer > Name');
+              if (leafNames.length > 0) {
+                wmsSuccess = true;
+                serviceUsed = 'WMS';
+
+                leafNames.forEach((nameEl) => {
+                  const name = nameEl.textContent?.trim() || '';
+                  if (!name) return;
+                  const layerEl = nameEl.parentElement!;
+                  if (layerEl === capDoc.querySelector('Capability > Layer')) return;
+                  const isGroup = layerEl.querySelector('Layer') !== null;
+                  const title = layerEl.querySelector('Title')?.textContent?.trim() || name;
+                  const styles: any[] = [];
+                  const styleEls = Array.from(layerEl.getElementsByTagNameNS('*', 'Style'));
+                  styleEls.forEach((styleEl: any) => {
+                    const sNameEl = styleEl.getElementsByTagNameNS('*', 'Name')[0];
+                    const sName = sNameEl?.textContent?.trim() || '';
+                    const sTitleEl = styleEl.getElementsByTagNameNS('*', 'Title')[0];
+                    const sTitle = sTitleEl?.textContent?.trim() || sName;
+
+                    const legendUrlEl = styleEl.getElementsByTagNameNS('*', 'LegendURL')[0];
+                    const resourceEl = legendUrlEl ? legendUrlEl.getElementsByTagNameNS('*', 'OnlineResource')[0] : null;
+                    const legendHref = resourceEl
+                      ? (resourceEl.getAttribute('xlink:href') || resourceEl.getAttribute('href') || '')
+                      : '';
+
+                    styles.push({ name: sName, title: sTitle, legendUrl: legendHref });
+                  });
+
+                  let bbox: [number, number, number, number] = [-180, -90, 180, 90];
+                  const geoBbox = layerEl.querySelector('EX_GeographicBoundingBox');
+                  if (geoBbox) {
+                    bbox = [
+                      parseFloat(geoBbox.querySelector('westBoundLongitude')?.textContent || '-180'),
+                      parseFloat(geoBbox.querySelector('southBoundLatitude')?.textContent || '-90'),
+                      parseFloat(geoBbox.querySelector('eastBoundLongitude')?.textContent || '180'),
+                      parseFloat(geoBbox.querySelector('northBoundLatitude')?.textContent || '90'),
+                    ];
+                  } else {
+                    const latLonBbox = layerEl.querySelector('LatLonBoundingBox');
+                    if (latLonBbox) {
+                      bbox = [
+                        parseFloat(latLonBbox.getAttribute('minx') || '-180'),
+                        parseFloat(latLonBbox.getAttribute('miny') || '-90'),
+                        parseFloat(latLonBbox.getAttribute('maxx') || '180'),
+                        parseFloat(latLonBbox.getAttribute('maxy') || '90'),
+                      ];
+                    }
+                  }
+
+                  layerMap[name] = {
+                    name,
+                    title,
+                    styles,
+                    bbox,
+                    isGroup,
+                    dataType: 'RASTER', // will be refined by DescribeLayer/WFS check
+                  };
+                });
               }
             }
-          });
-        } catch (wfsParseErr) {
-          console.warn('Failed to parse WFS capabilities:', wfsParseErr);
+          }
+        } catch (wmsErr) {
+          console.warn('[Discovery] WMS GetCapabilities failed or disabled, falling back:', wmsErr);
         }
       }
 
-      // Collect leaf layers from WMS capabilities
-      const wmsLayers: Record<string, any> = {};
-      capDoc.querySelectorAll('Layer > Name').forEach((nameEl) => {
-        const name = nameEl.textContent?.trim() || '';
-        if (!name) return;
-        const layerEl = nameEl.parentElement!;
-        if (layerEl === capDoc.querySelector('Capability > Layer')) return;
-        const isGroup = layerEl.querySelector('Layer') !== null;
-        const title = layerEl.querySelector('Title')?.textContent?.trim() || name;
-        const styles: any[] = [];
-        const styleEls = Array.from(layerEl.getElementsByTagNameNS('*', 'Style'));
-        styleEls.forEach((styleEl: any) => {
-          const sNameEl = styleEl.getElementsByTagNameNS('*', 'Name')[0];
-          const sName = sNameEl?.textContent?.trim() || '';
-          const sTitleEl = styleEl.getElementsByTagNameNS('*', 'Title')[0];
-          const sTitle = sTitleEl?.textContent?.trim() || sName;
+      // ── Step 2: Try WFS GetCapabilities (if WMS disabled/failed or mode === 'WFS') ──
+      let wfsSuccess = false;
+      const wfsFeatureTypes = new Set<string>();
 
-          const legendUrlEl = styleEl.getElementsByTagNameNS('*', 'LegendURL')[0];
-          const resourceEl = legendUrlEl ? legendUrlEl.getElementsByTagNameNS('*', 'OnlineResource')[0] : null;
-          const legendHref = resourceEl
-            ? (resourceEl.getAttribute('xlink:href') || resourceEl.getAttribute('href') || '')
-            : '';
+      if (!wmsSuccess || servicesConfig.wfs?.enabled !== false) {
+        const tryWfsVersions = [wfsVer, '1.1.0', '2.0.0'].filter((v, i, a) => a.indexOf(v) === i);
+        for (const ver of tryWfsVersions) {
+          try {
+            const wfsUrl = `${geoserverUrl}/ows?service=WFS&version=${ver}&request=GetCapabilities`;
+            const wfsRes = await fetch(wfsUrl, { headers });
+            if (wfsRes.ok) {
+              const wfsXml = await wfsRes.text();
+              if (
+                !wfsXml.includes('ServiceExceptionReport') &&
+                !wfsXml.includes('ExceptionReport') &&
+                (wfsXml.includes('WFS_Capabilities') || wfsXml.includes('FeatureTypeList') || wfsXml.includes('FeatureType'))
+              ) {
+                const wfsDoc = parser.parseFromString(wfsXml, 'application/xml');
+                const featureTypeEls = Array.from(wfsDoc.querySelectorAll('FeatureType'));
+                if (featureTypeEls.length > 0) {
+                  wfsSuccess = true;
+                  if (!wmsSuccess) {
+                    serviceUsed = 'WFS';
+                  }
 
-          styles.push({ name: sName, title: sTitle, legendUrl: legendHref });
-        });
-        let bbox = [-180, -90, 180, 90];
-        const geoBbox = layerEl.querySelector('EX_GeographicBoundingBox');
-        if (geoBbox) {
-          bbox = [
-            parseFloat(geoBbox.querySelector('westBoundLongitude')?.textContent || '-180'),
-            parseFloat(geoBbox.querySelector('southBoundLatitude')?.textContent || '-90'),
-            parseFloat(geoBbox.querySelector('eastBoundLongitude')?.textContent || '180'),
-            parseFloat(geoBbox.querySelector('northBoundLatitude')?.textContent || '90'),
-          ];
+                  featureTypeEls.forEach((ftEl) => {
+                    const name = ftEl.querySelector('Name')?.textContent?.trim() || '';
+                    if (!name) return;
+                    wfsFeatureTypes.add(name);
+                    if (name.includes(':')) {
+                      wfsFeatureTypes.add(name.split(':').pop()!);
+                    }
+
+                    // If WMS was disabled or failed, populate catalog directly from WFS
+                    if (!wmsSuccess && !layerMap[name]) {
+                      const title = ftEl.querySelector('Title')?.textContent?.trim() || name;
+                      let bbox: [number, number, number, number] = [-180, -90, 180, 90];
+
+                      // Parse WGS84BoundingBox (WFS 1.1.0 / 2.0.0)
+                      const bboxEl = ftEl.querySelector('WGS84BoundingBox') || ftEl.getElementsByTagNameNS('*', 'WGS84BoundingBox')[0];
+                      if (bboxEl) {
+                        const lowerEl = bboxEl.querySelector('LowerCorner') || bboxEl.getElementsByTagNameNS('*', 'LowerCorner')[0];
+                        const upperEl = bboxEl.querySelector('UpperCorner') || bboxEl.getElementsByTagNameNS('*', 'UpperCorner')[0];
+                        if (lowerEl && upperEl) {
+                          const [minx, miny] = (lowerEl.textContent || '').trim().split(/\s+/).map(Number);
+                          const [maxx, maxy] = (upperEl.textContent || '').trim().split(/\s+/).map(Number);
+                          if (!isNaN(minx) && !isNaN(miny) && !isNaN(maxx) && !isNaN(maxy)) {
+                            bbox = [minx, miny, maxx, maxy];
+                          }
+                        }
+                      }
+
+                      layerMap[name] = {
+                        name,
+                        title,
+                        styles: [],
+                        bbox,
+                        isGroup: false,
+                        dataType: 'VECTOR', // All WFS feature types are vectors
+                      };
+                    }
+                  });
+                  break; // Successful WFS capabilities read
+                }
+              }
+            }
+          } catch {
+            // try next WFS version
+          }
         }
-        wmsLayers[name] = { name, title, styles, bbox, isGroup };
-      });
+      }
 
-      // 2. WMS DescribeLayer — get actual layer type (WFS=VECTOR, WCS=RASTER)
-      const layerNames = Object.keys(wmsLayers);
-      const typeMap: Record<string, 'VECTOR' | 'RASTER'> = {};
-      if (layerNames.length > 0) {
+      // ── Step 3: Try WCS GetCapabilities (for raster coverages when WMS disabled, or mode === 'WCS') ──
+      let wcsSuccess = false;
+      const wcsCoverages = new Set<string>();
+
+      if (!wmsSuccess && (servicesConfig.wcs?.enabled !== false || servicesConfig.capabilitiesMode === 'WCS')) {
+        const tryWcsVersions = [servicesConfig.wcs?.version || '2.0.1', '1.1.1', '1.0.0'].filter((v, i, a) => a.indexOf(v) === i);
+        for (const ver of tryWcsVersions) {
+          try {
+            const wcsUrl = `${geoserverUrl}/ows?service=WCS&version=${ver}&request=GetCapabilities`;
+            const wcsRes = await fetch(wcsUrl, { headers });
+            if (wcsRes.ok) {
+              const wcsXml = await wcsRes.text();
+              if (
+                !wcsXml.includes('ServiceExceptionReport') &&
+                !wcsXml.includes('ExceptionReport') &&
+                (wcsXml.includes('CoverageSummary') || wcsXml.includes('CoverageOfferingBrief') || wcsXml.includes('WCS_Capabilities'))
+              ) {
+                const wcsDoc = parser.parseFromString(wcsXml, 'application/xml');
+
+                // 1. WCS 2.0.1 / 1.1.1: <CoverageSummary>
+                const summaries = Array.from(wcsDoc.querySelectorAll('CoverageSummary'));
+                if (summaries.length > 0) {
+                  wcsSuccess = true;
+                  summaries.forEach((csEl) => {
+                    const idEl = csEl.querySelector('CoverageId') || csEl.querySelector('Identifier') || csEl.getElementsByTagNameNS('*', 'CoverageId')[0] || csEl.getElementsByTagNameNS('*', 'Identifier')[0];
+                    const name = idEl?.textContent?.trim() || '';
+                    if (!name) return;
+                    wcsCoverages.add(name);
+                    const titleEl = csEl.querySelector('Title') || csEl.getElementsByTagNameNS('*', 'Title')[0];
+                    const title = titleEl?.textContent?.trim() || name;
+
+                    let bbox: [number, number, number, number] = [-180, -90, 180, 90];
+                    const bboxEl = csEl.querySelector('WGS84BoundingBox') || csEl.getElementsByTagNameNS('*', 'WGS84BoundingBox')[0];
+                    if (bboxEl) {
+                      const lower = (bboxEl.querySelector('LowerCorner') || bboxEl.getElementsByTagNameNS('*', 'LowerCorner')[0])?.textContent?.trim();
+                      const upper = (bboxEl.querySelector('UpperCorner') || bboxEl.getElementsByTagNameNS('*', 'UpperCorner')[0])?.textContent?.trim();
+                      if (lower && upper) {
+                        const [minx, miny] = lower.split(/\s+/).map(Number);
+                        const [maxx, maxy] = upper.split(/\s+/).map(Number);
+                        if (!isNaN(minx) && !isNaN(miny) && !isNaN(maxx) && !isNaN(maxy)) {
+                          bbox = [minx, miny, maxx, maxy];
+                        }
+                      }
+                    }
+
+                    if (!layerMap[name]) {
+                      layerMap[name] = {
+                        name,
+                        title,
+                        styles: [],
+                        bbox,
+                        isGroup: false,
+                        dataType: 'RASTER',
+                      };
+                    }
+                  });
+                  break;
+                }
+
+                // 2. WCS 1.0.0: <CoverageOfferingBrief>
+                const briefs = Array.from(wcsDoc.querySelectorAll('CoverageOfferingBrief'));
+                if (briefs.length > 0) {
+                  wcsSuccess = true;
+                  briefs.forEach((bEl) => {
+                    const name = bEl.querySelector('name')?.textContent?.trim() || '';
+                    if (!name) return;
+                    wcsCoverages.add(name);
+                    const title = bEl.querySelector('label')?.textContent?.trim() || name;
+                    let bbox: [number, number, number, number] = [-180, -90, 180, 90];
+                    const posEls = Array.from(bEl.querySelectorAll('pos'));
+                    if (posEls.length >= 2) {
+                      const [minx, miny] = (posEls[0].textContent || '').trim().split(/\s+/).map(Number);
+                      const [maxx, maxy] = (posEls[1].textContent || '').trim().split(/\s+/).map(Number);
+                      if (!isNaN(minx) && !isNaN(miny) && !isNaN(maxx) && !isNaN(maxy)) {
+                        bbox = [minx, miny, maxx, maxy];
+                      }
+                    }
+
+                    if (!layerMap[name]) {
+                      layerMap[name] = {
+                        name,
+                        title,
+                        styles: [],
+                        bbox,
+                        isGroup: false,
+                        dataType: 'RASTER',
+                      };
+                    }
+                  });
+                  break;
+                }
+              }
+            }
+          } catch {
+            // try next WCS version
+          }
+        }
+      }
+
+      // ── Step 4: Try WMTS GetCapabilities (if WMS and WFS disabled or failed, to discover cached vector tiles and tile layers) ──
+      let wmtsSuccess = false;
+      const wmtsVectorTiles = new Set<string>();
+
+      if (!wmsSuccess && !wfsSuccess) {
+        try {
+          const wmtsCandidates = [
+            `${geoserverUrl}/gwc/service/wmts?REQUEST=GetCapabilities`,
+            `${geoserverUrl}/ows?service=WMTS&version=${wmtsVer}&request=GetCapabilities`,
+          ];
+          for (const wmtsUrl of wmtsCandidates) {
+            const wmtsRes = await fetch(wmtsUrl, { headers });
+            if (wmtsRes.ok) {
+              const wmtsXml = await wmtsRes.text();
+              if (!wmtsXml.includes('ExceptionReport') && (wmtsXml.includes('Capabilities') || wmtsXml.includes('Layer'))) {
+                const wmtsDoc = parser.parseFromString(wmtsXml, 'application/xml');
+                const wmtsLayers = Array.from(wmtsDoc.querySelectorAll('Layer'));
+                if (wmtsLayers.length > 0) {
+                  wmtsSuccess = true;
+                  wmtsLayers.forEach((lEl) => {
+                    const idEl = lEl.querySelector('Identifier') || lEl.getElementsByTagNameNS('*', 'Identifier')[0];
+                    const name = idEl?.textContent?.trim() || '';
+                    if (!name) return;
+                    const titleEl = lEl.querySelector('Title') || lEl.getElementsByTagNameNS('*', 'Title')[0];
+                    const title = titleEl?.textContent?.trim() || name;
+
+                    // Check for vector tile formats in WMTS (e.g. Mapbox Vector Tiles MVT, GeoJSON)
+                    const formatEls = Array.from(lEl.querySelectorAll('Format') || lEl.getElementsByTagNameNS('*', 'Format'));
+                    const formats = formatEls.map(f => f.textContent?.trim() || '');
+                    const isVectorTile = formats.some(f => {
+                      const fl = f.toLowerCase();
+                      return fl.includes('mapbox-vector-tile') || fl.includes('x-protobuf') || fl.includes('pbf') || fl.includes('geojson');
+                    });
+
+                    if (isVectorTile) {
+                      wmtsVectorTiles.add(name);
+                    }
+
+                    // Discover TileMatrixSet (EPSG:900913 / EPSG:3857)
+                    const tmsEls = Array.from(lEl.querySelectorAll('TileMatrixSet') || lEl.getElementsByTagNameNS('*', 'TileMatrixSet'));
+                    const tmsList = tmsEls.map(t => t.textContent?.trim() || '');
+                    const preferredTms = tmsList.find(t => t.includes('900913') || t.includes('3857')) || tmsList[0] || 'EPSG:900913';
+
+                    let bbox: [number, number, number, number] = [-180, -90, 180, 90];
+                    const bboxEl = lEl.querySelector('WGS84BoundingBox') || lEl.getElementsByTagNameNS('*', 'WGS84BoundingBox')[0];
+                    if (bboxEl) {
+                      const lower = (bboxEl.querySelector('LowerCorner') || bboxEl.getElementsByTagNameNS('*', 'LowerCorner')[0])?.textContent?.trim();
+                      const upper = (bboxEl.querySelector('UpperCorner') || bboxEl.getElementsByTagNameNS('*', 'UpperCorner')[0])?.textContent?.trim();
+                      if (lower && upper) {
+                        const [minx, miny] = lower.split(/\s+/).map(Number);
+                        const [maxx, maxy] = upper.split(/\s+/).map(Number);
+                        if (!isNaN(minx) && !isNaN(miny) && !isNaN(maxx) && !isNaN(maxy)) {
+                          bbox = [minx, miny, maxx, maxy];
+                        }
+                      }
+                    }
+
+                    // Differentiate Vector vs Raster in WMTS:
+                    // 1. If format includes vector tiles (MVT, PBF, GeoJSON), it is VECTOR.
+                    // 2. If name or localName is registered in WCS Coverages, it is RASTER.
+                    // 3. Name heuristic: raster coverages typically contain dem, elevation, raster, imagery, ortho, satellite, mosaic, tiff, arcgrid.
+                    // 4. Otherwise, standard GeoServer GIS layers are Vector feature datasets (polygons, lines, points) served via cached tiles.
+                    const localName = name.includes(':') ? name.split(':').pop()! : name;
+                    const isRasterCoverage = wcsCoverages.has(name) || wcsCoverages.has(localName) ||
+                      /(dem|elevation|raster|imagery|ortho|satellite|mosaic|tiff?|arcgrid|landcover|precipitation|temperature|ndvi|bathymetry|shaded)/i.test(name);
+                    const isVector = isVectorTile || !isRasterCoverage;
+
+                    if (!layerMap[name]) {
+                      layerMap[name] = {
+                        name,
+                        title,
+                        styles: [],
+                        bbox,
+                        isGroup: false,
+                        dataType: isVector ? 'VECTOR' : 'RASTER',
+                        isVectorTile,
+                        formats,
+                        tileMatrixSet: preferredTms,
+                      } as any;
+                    }
+                  });
+                  break;
+                }
+              }
+            }
+          }
+        } catch (wmtsErr) {
+          console.warn('[Discovery] WMTS GetCapabilities failed:', wmtsErr);
+        }
+      }
+
+      // Determine active discovery service label:
+      if (wmsSuccess) {
+        serviceUsed = 'WMS';
+      } else if (wfsSuccess && wcsSuccess) {
+        serviceUsed = 'HYBRID';
+      } else if (wfsSuccess) {
+        serviceUsed = 'WFS';
+      } else if (wcsSuccess) {
+        serviceUsed = 'WCS';
+      } else if (wmtsSuccess) {
+        serviceUsed = 'WMTS';
+      }
+
+      // If WMS was used, refine vector vs raster types using WMS DescribeLayer and WFS feature types
+      const layerNames = Object.keys(layerMap);
+      if (wmsSuccess && layerNames.length > 0) {
+        const typeMap: Record<string, 'VECTOR' | 'RASTER'> = {};
         try {
           const descUrl = `${geoserverUrl}/ows?service=WMS&version=1.1.1&request=DescribeLayer&LAYERS=${encodeURIComponent(layerNames.join(','))}`;
           const descRes = await fetch(descUrl, { headers });
@@ -548,38 +861,59 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
               }
             });
           }
-        } catch (e) {
-          console.warn('DescribeLayer failed in dataset list API:', e);
-        }
+        } catch { /* ignore DescribeLayer failure */ }
+
+        const hasDescribeResults = Object.keys(typeMap).length > 0;
+        layerNames.forEach((name) => {
+          const item = layerMap[name];
+          const localName = name.includes(':') ? name.split(':').pop()! : name;
+          const isDescribeGroup = hasDescribeResults && !typeMap[name] && !typeMap[localName];
+          const isVector = wfsFeatureTypes.has(name) || wfsFeatureTypes.has(localName) || typeMap[name] === 'VECTOR' || typeMap[localName] === 'VECTOR';
+          item.dataType = (item.isGroup || isDescribeGroup) ? 'GROUP' : (isVector ? 'VECTOR' : 'RASTER');
+        });
       }
 
-      // 3. Build final layers list
-      const hasDescribeResults = Object.keys(typeMap).length > 0;
+      // Persist the active discovery service in store
+      try {
+        useGeoServerServicesStore.getState().setActiveDiscoveryService(serviceUsed);
+      } catch { /* ignore in non-browser context */ }
+
+      // Build the final response payload with accurate per-layer service_used
       const layers = layerNames.map((name) => {
-        const wl = wmsLayers[name];
-        const localName = name.includes(':') ? name.split(':').pop()! : name;
-        const isDescribeGroup = hasDescribeResults && !typeMap[name] && !typeMap[localName];
+        const wl = layerMap[name] as any;
+        const layerService = wmsSuccess
+          ? 'WMS'
+          : (wmtsSuccess
+            ? 'WMTS'
+            : (wcsCoverages.has(name) || (wl.dataType === 'RASTER' && !wfsSuccess)
+              ? 'WCS'
+              : (wfsFeatureTypes.has(name) || wl.dataType === 'VECTOR' ? 'WFS' : serviceUsed)));
 
-        const isVector = wfsFeatureTypes.has(name) || wfsFeatureTypes.has(localName) || typeMap[name] === 'VECTOR' || typeMap[localName] === 'VECTOR';
-
-        const data_type: 'VECTOR' | 'RASTER' | 'GROUP' = (wl.isGroup || isDescribeGroup)
-          ? 'GROUP'
-          : (isVector ? 'VECTOR' : 'RASTER');
         return {
           id: name,
           name,
           title: wl.title,
           styles: wl.styles,
-          data_type,
+          data_type: wl.dataType,
+          service_used: layerService,
           status: 'READY',
           access_level: 'PUBLIC',
-          metadata: { bbox: wl.bbox },
+          metadata: {
+            bbox: wl.bbox,
+            service: layerService,
+            isVectorTile: wl.isVectorTile || false,
+            tileMatrixSet: wl.tileMatrixSet || 'EPSG:900913',
+            formats: wl.formats || [],
+          },
         };
       });
 
       return new Response(JSON.stringify(layers), {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Capabilities-Service': serviceUsed,
+        },
       });
     } catch (err: any) {
       console.error('Failed to list datasets from GeoServer capabilities:', err);
@@ -1202,8 +1536,22 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
     if (qbFilter) cqlFilterParts.push(qbFilter);
 
     const bboxFilter = searchParams.get('bbox');
+    let bboxCoords: [number, number, number, number] | null = null;
     if (bboxFilter) {
       console.log('[Server API] Received bbox parameter in WFS request:', bboxFilter);
+      const parts = bboxFilter.split(',').map(Number);
+      if (parts.length === 4 && parts.every(n => !isNaN(n))) {
+        let [minX, minY, maxX, maxY] = parts;
+        minX = Math.max(-180, Math.min(180, minX));
+        maxX = Math.max(-180, Math.min(180, maxX));
+        minY = Math.max(-90, Math.min(90, minY));
+        maxY = Math.max(-90, Math.min(90, maxY));
+        if (minX >= maxX) { minX = -180; maxX = 180; }
+        if (minY >= maxY) { minY = -90; maxY = 90; }
+        if (!(minX <= -179.9 && maxX >= 179.9 && minY <= -89.9 && maxY >= 89.9)) {
+          bboxCoords = [minX, minY, maxX, maxY];
+        }
+      }
     }
 
     // Build WFS request — workspace-prefixed layers must use the workspace-specific
@@ -1301,23 +1649,6 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
       }
     } else {
       // ── Regular search/attribute filters: use standard WFS GET query ──
-      let bboxCoords: [number, number, number, number] | null = null;
-      if (bboxFilter) {
-        const parts = bboxFilter.split(',').map(Number);
-        if (parts.length === 4 && parts.every(n => !isNaN(n))) {
-          let [minX, minY, maxX, maxY] = parts;
-          minX = Math.max(-180, Math.min(180, minX));
-          maxX = Math.max(-180, Math.min(180, maxX));
-          minY = Math.max(-90, Math.min(90, minY));
-          maxY = Math.max(-90, Math.min(90, maxY));
-          if (minX >= maxX) { minX = -180; maxX = 180; }
-          if (minY >= maxY) { minY = -90; maxY = 90; }
-          if (!(minX <= -179.9 && maxX >= 179.9 && minY <= -89.9 && maxY >= 89.9)) {
-            bboxCoords = [minX, minY, maxX, maxY];
-          }
-        }
-      }
-
       if (bboxCoords) {
         const [minX, minY, maxX, maxY] = bboxCoords;
         console.log(`[Server API] 📡 Passing BBOX to GeoServer WFS: ${minX},${minY},${maxX},${maxY},CRS:84`);
@@ -1440,9 +1771,13 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
     }
 
     if (isXmlOrError || !wfsJson) {
-      if (cqlFilterParts.length > 0) {
-        return new Response(JSON.stringify({ detail: geoServerError || 'GeoServer query failed.' }), {
-          status: 400,
+      if (cqlFilterParts.length > 0 || bboxCoords || idsFilter) {
+        return new Response(JSON.stringify({
+          data: [],
+          count: 0,
+          total_records: 0
+        }), {
+          status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -1518,13 +1853,17 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
       return new Response(JSON.stringify({ detail: 'ids query parameter is required.' }), { status: 400 });
     }
 
+    const wfsLocalName = layerId.includes(':') ? layerId.split(':')[1] : layerId;
+    const rawIds = idsFilter.split(',').map((s: string) => s.trim()).filter(Boolean);
+    const resolvedIds = rawIds.map((id: string) => (id.includes('.') ? id : `${wfsLocalName}.${id}`));
+
     const wfsParams = new URLSearchParams({
       service: 'WFS',
       version: '2.0.0',
       request: 'GetFeature',
       typeNames: layerId,
       outputFormat: 'application/json',
-      featureID: idsFilter,
+      featureID: resolvedIds.join(','),
     });
 
     const wfsUrl = `${geoserverUrl}/ows?${wfsParams.toString()}`;
@@ -1580,7 +1919,142 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
 
   // 4. GET /datasets/[id]/export/
   if (parts.length === 3 && parts[0] === 'datasets' && parts[2] === 'export') {
-    const format = searchParams.get('format') || 'csv';
+    const rawFormat = (searchParams.get('format') || 'csv').toLowerCase();
+
+    // ── Raster Export Handler (GeoTIFF / PNG) ──────────────────────────────
+    if (['geotiff', 'tif', 'tiff', 'png'].includes(rawFormat)) {
+      const isGeoTiff = ['geotiff', 'tif', 'tiff'].includes(rawFormat);
+      const fileExtension = isGeoTiff ? 'tif' : 'png';
+      const contentType = isGeoTiff ? 'image/tiff' : 'image/png';
+
+      let bbox = searchParams.get('bbox') || '';
+      const width = searchParams.get('width') || '2048';
+      const height = searchParams.get('height') || '2048';
+      const srs = searchParams.get('srs') || 'EPSG:4326';
+      const style = searchParams.get('style') || '';
+
+      // If bbox is not provided, look up layer bbox from WMS GetCapabilities
+      if (!bbox) {
+        try {
+          const capUrl = `${geoserverUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`;
+          const capRes = await fetch(capUrl, { headers });
+          if (capRes.ok) {
+            const capXml = await capRes.text();
+            const parser = new DOMParser();
+            const xmlDoc = parser.parseFromString(capXml, 'text/xml');
+            const layers = xmlDoc.getElementsByTagName('Layer');
+            for (let i = 0; i < layers.length; i++) {
+              const nameEl = Array.from(layers[i].children).find(el => el.tagName === 'Name');
+              if (nameEl && (nameEl.textContent?.trim() === layerId || nameEl.textContent?.trim().split(':').pop() === layerId.split(':').pop())) {
+                const geoBboxEl = layers[i].getElementsByTagName('EX_GeographicBoundingBox')[0];
+                if (geoBboxEl) {
+                  const west = geoBboxEl.getElementsByTagName('westBoundLongitude')[0]?.textContent || '-180';
+                  const east = geoBboxEl.getElementsByTagName('eastBoundLongitude')[0]?.textContent || '180';
+                  const south = geoBboxEl.getElementsByTagName('southBoundLatitude')[0]?.textContent || '-90';
+                  const north = geoBboxEl.getElementsByTagName('northBoundLatitude')[0]?.textContent || '90';
+                  bbox = `${west},${south},${east},${north}`;
+                } else {
+                  const bEl = layers[i].getElementsByTagName('BoundingBox')[0];
+                  if (bEl) {
+                    bbox = `${bEl.getAttribute('minx') || '-180'},${bEl.getAttribute('miny') || '-90'},${bEl.getAttribute('maxx') || '180'},${bEl.getAttribute('maxy') || '90'}`;
+                  }
+                }
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          console.warn('Failed to resolve layer bbox for raster export:', e);
+        }
+      }
+
+      if (!bbox) {
+        bbox = '-180,-90,180,90';
+      }
+
+      const workspace = layerId.includes(':') ? layerId.split(':')[0] : null;
+      const localName = layerId.includes(':') ? layerId.split(':')[1] : layerId;
+
+      const rasterCandidates: string[] = [];
+
+      if (isGeoTiff) {
+        // GeoServer WMS GetMap with FORMAT=image/geotiff
+        rasterCandidates.push(
+          `${geoserverUrl}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${encodeURIComponent(layerId)}&styles=${encodeURIComponent(style)}&bbox=${bbox}&width=${width}&height=${height}&srs=${encodeURIComponent(srs)}&format=image/geotiff&transparent=true`
+        );
+        if (workspace) {
+          rasterCandidates.push(
+            `${geoserverUrl}/${workspace}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${encodeURIComponent(localName)}&styles=${encodeURIComponent(style)}&bbox=${bbox}&width=${width}&height=${height}&srs=${encodeURIComponent(srs)}&format=image/geotiff&transparent=true`
+          );
+        }
+        // Fallback to image/tiff
+        rasterCandidates.push(
+          `${geoserverUrl}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${encodeURIComponent(layerId)}&styles=${encodeURIComponent(style)}&bbox=${bbox}&width=${width}&height=${height}&srs=${encodeURIComponent(srs)}&format=image/tiff&transparent=true`
+        );
+        // GeoServer WCS 1.0.0 GetCoverage
+        rasterCandidates.push(
+          `${geoserverUrl}/ows?service=WCS&version=1.0.0&request=GetCoverage&coverage=${encodeURIComponent(layerId)}&crs=${encodeURIComponent(srs)}&bbox=${bbox}&width=${width}&height=${height}&format=GeoTIFF`
+        );
+        // GeoServer WCS 2.0.1 GetCoverage
+        rasterCandidates.push(
+          `${geoserverUrl}/ows?service=WCS&version=2.0.1&request=GetCoverage&coverageId=${encodeURIComponent(layerId)}&format=image/tiff`
+        );
+      } else {
+        // PNG export via WMS GetMap
+        rasterCandidates.push(
+          `${geoserverUrl}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${encodeURIComponent(layerId)}&styles=${encodeURIComponent(style)}&bbox=${bbox}&width=${width}&height=${height}&srs=${encodeURIComponent(srs)}&format=image/png&transparent=true`
+        );
+        if (workspace) {
+          rasterCandidates.push(
+            `${geoserverUrl}/${workspace}/wms?service=WMS&version=1.1.1&request=GetMap&layers=${encodeURIComponent(localName)}&styles=${encodeURIComponent(style)}&bbox=${bbox}&width=${width}&height=${height}&srs=${encodeURIComponent(srs)}&format=image/png&transparent=true`
+          );
+        }
+        // WCS 1.0.0 PNG
+        rasterCandidates.push(
+          `${geoserverUrl}/ows?service=WCS&version=1.0.0&request=GetCoverage&coverage=${encodeURIComponent(layerId)}&crs=${encodeURIComponent(srs)}&bbox=${bbox}&width=${width}&height=${height}&format=image/png`
+        );
+      }
+
+      let lastError = '';
+      for (const cUrl of rasterCandidates) {
+        try {
+          const res = await fetch(cUrl, { headers });
+          if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            lastError = errText;
+            continue;
+          }
+          const ct = res.headers.get('content-type') || '';
+          if (ct.includes('xml') || ct.includes('html')) {
+            const peekText = await res.text().catch(() => '');
+            if (peekText.includes('Exception') || peekText.includes('ServiceException')) {
+              lastError = peekText;
+              continue;
+            }
+          }
+
+          const filename = `${layerId.replace(/[:\/]/g, '_')}_export.${fileExtension}`;
+          const headersConfig = new Headers({
+            'Content-Type': contentType,
+            'Content-Disposition': `attachment; filename="${filename}"`,
+          });
+
+          return new Response(res.body, {
+            status: 200,
+            headers: headersConfig,
+          });
+        } catch (e: any) {
+          lastError = e?.message || 'Raster export connection failed';
+        }
+      }
+
+      return new Response(JSON.stringify({ detail: lastError || 'Failed to download raster from GeoServer' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    const format = rawFormat;
     const idsFilter = searchParams.get('ids');
     const search = searchParams.get('search') || '';
     const sortBy = searchParams.get('sort_by');

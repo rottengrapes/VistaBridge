@@ -13,10 +13,11 @@
 'use client';
 
 import React, { useEffect, useState, useRef, Suspense, useCallback } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams, useParams, usePathname } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useConfigStore } from '@/store/useConfigStore';
-import { Spin, Typography, Button, App, Divider, Tooltip, Modal, Input, Dropdown, Table, Tag, Select, Popover, Slider } from 'antd';
+import { useGeoServerServicesStore } from '@/store/useGeoServerServicesStore';
+import { Spin, Typography, Button, App, Divider, Tooltip, Modal, Input, Dropdown, Table, Tag, Select, Popover, Slider, Popconfirm } from 'antd';
 import {
   ArrowLeft,
   ArrowRight,
@@ -52,6 +53,8 @@ import {
   Database,
   CircleDot,
   BoxSelect,
+  Check,
+  FileJson,
 } from 'lucide-react';
 import { apiRequest } from '@/lib/api';
 import basemapsConfig from '@/config/basemap.config.json';
@@ -72,6 +75,8 @@ import { sampleRasterPixel } from '@/raster-analysis/services/rasterPixelSample'
 import { siteConfig } from '@/config/site-config';
 
 import Feature from 'ol/Feature';
+import { fetchWfsLayerSchema, type WfsLayerSchema } from '@/lib/gis/describeFeatureType';
+import { buildInsertXml, buildUpdateXml, buildDeleteXml, executeWfsTransaction } from '@/lib/gis/wfsTransaction';
 
 // OpenLayers Imports
 import 'ol/ol.css';
@@ -80,11 +85,19 @@ import View from 'ol/View';
 import TileLayer from 'ol/layer/Tile';
 import ImageLayer from 'ol/layer/Image';
 import VectorLayer from 'ol/layer/Vector';
+import VectorTileLayer from 'ol/layer/VectorTile';
+import VectorTileSource from 'ol/source/VectorTile';
+import MVT from 'ol/format/MVT';
 import OSM from 'ol/source/OSM';
-import { toLonLat, fromLonLat, transformExtent } from 'ol/proj';
+import { toLonLat, fromLonLat, transformExtent, transform, get as getProjection } from 'ol/proj';
+import { getTopLeft, getWidth } from 'ol/extent';
 import { defaults as defaultControls } from 'ol/control';
+import { normalizeCrs, getWfsGmlSrsName, transformGeometry, isPointInsideGeometry } from '@/lib/gis/crsTransformer';
 import XYZ from 'ol/source/XYZ';
 import TileWMS from 'ol/source/TileWMS';
+import WMTS from 'ol/source/WMTS';
+import { createFromTileUrlFunctions } from 'ol/tileurlfunction';
+import WMTSTileGrid from 'ol/tilegrid/WMTS';
 import ImageStatic from 'ol/source/ImageStatic';
 import VectorSource from 'ol/source/Vector';
 import GeoJSON from 'ol/format/GeoJSON';
@@ -148,10 +161,26 @@ const createWmsTileLoadFunction = (geoserverAuth?: string) => {
           res = await fetch(src, { headers });
         }
 
-        if (!res.ok) throw new Error(`WMS tile failed: ${res.status}`);
+        if (!res.ok) {
+          const errBody = await res.text().catch(() => '');
+          // GeoServer GWC returns 400 TileOutOfRange for tiles outside the layer's bounding box.
+          // In standard GIS mapping, tiles outside the layer are transparent.
+          if (res.status === 400 && (errBody.includes('TileOutOfRange') || errBody.includes('out of range'))) {
+            img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+            return;
+          }
+          console.error(`[GeoServer Tile Error ${res.status}] URL: ${src}\nResponse:`, errBody);
+          throw new Error(`Tile HTTP ${res.status}: ${errBody}`);
+        }
         const contentType = res.headers.get('content-type') || '';
         if (contentType.includes('xml') || contentType.includes('html')) {
-          throw new Error(`WMS returned XML/HTML error: ${contentType}`);
+          const errText = await res.text().catch(() => '');
+          if (errText.includes('TileOutOfRange') || errText.includes('out of range')) {
+            img.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+            return;
+          }
+          console.error(`[GeoServer Tile Exception] URL: ${src}\nResponse:`, errText);
+          throw new Error(`WMS/WMTS returned XML/HTML error: ${errText || contentType}`);
         }
         const blob = await res.blob();
         objectUrl = URL.createObjectURL(blob);
@@ -336,12 +365,16 @@ const annotationStyleFunction = (feature: any) => {
 
 
 
-function Map2DContent() {
+function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string; isQuickMap?: boolean }) {
   const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
-  const mapId = searchParams.get('id');
+  const params = useParams<{ slug?: string }>();
+  const isQuick = isQuickMap || pathname === '/quick-map';
+  const mapId = isQuick ? 'quick-map' : (identifier || params?.slug || searchParams.get('id'));
   const { notification, modal } = App.useApp();
   const { user, token, hydrated } = useAuthStore();
+  const servicesConfig = useGeoServerServicesStore();
   const [loading, setLoading] = useState(true);
   const [mapDetail, setMapDetail] = useState<any>(null);
   const [isPublicMap, setIsPublicMap] = useState(false);
@@ -654,6 +687,19 @@ function Map2DContent() {
   }>({});
   const [infoData, setInfoData] = useState<any[]>([]);
 
+  // WFS-T Editing State
+  const [selectedWfsLayerId, setSelectedWfsLayerId] = useState<string>('');
+  const [editingFeatureId, setEditingFeatureId] = useState<string | null>(null);
+  const [editValues, setEditValues] = useState<Record<string, any>>({});
+  const [isWfsSaving, setIsWfsSaving] = useState<boolean>(false);
+  const [isAddFeatureActive, setIsAddFeatureActive] = useState<boolean>(false);
+  const [newFeatureGeometry, setNewFeatureGeometry] = useState<any | null>(null);
+  const [newFeatureValues, setNewFeatureValues] = useState<Record<string, any>>({});
+  const [wfsLayerSchema, setWfsLayerSchema] = useState<WfsLayerSchema | null>(null);
+  const wfsDrawRef = useRef<any>(null);
+  const wfsDrawActiveRef = useRef<boolean>(false);
+  const wfsFeatureSourceRef = useRef<VectorSource | null>(null);
+
   // Vector analysis info modal content
   const [infoModalContent, setInfoModalContent] = useState<{ title: string; detail: string } | null>(null);
 
@@ -686,10 +732,14 @@ function Map2DContent() {
     nativeCRS?: string;
     url?: string;
     geojson?: any;
+    protocol?: 'WMS' | 'WFS' | 'WMTS' | 'WCS';
   }
   const [addedLayers, setAddedLayers] = useState<LayerState[]>([]);
   const [isAddLayerModalOpen, setIsAddLayerModalOpen] = useState(false);
+  const [protocolModalDataset, setProtocolModalDataset] = useState<any | null>(null);
+  const [chosenProtocol, setChosenProtocol] = useState<'WMS' | 'WFS' | 'WMTS' | 'WCS'>('WMS');
   const [datasetsList, setDatasetsList] = useState<any[]>([]);
+  const [activeCatalogService, setActiveCatalogService] = useState<'WMS' | 'WFS' | 'WMTS' | 'WCS' | 'HYBRID'>('WMS');
   const [modalLoading, setModalLoading] = useState(false);
   const [gisAccessToken, setGisAccessToken] = useState('');
   const [modalSearchText, setModalSearchText] = useState('');
@@ -718,6 +768,18 @@ function Map2DContent() {
   // Explicitly reset layer and map state whenever mapId changes
   useEffect(() => {
     setAddedLayers([]);
+    setSelectedWfsLayerId('');
+    setWfsLayerSchema(null);
+    setInfoData([]);
+    setIsAddFeatureActive(false);
+    setNewFeatureGeometry(null);
+    stopWfsDraw();
+    if (wfsFeatureSourceRef.current) {
+      wfsFeatureSourceRef.current.clear();
+    }
+    if (highlightSourceRef.current) {
+      highlightSourceRef.current.clear();
+    }
     setMapDetail(null);
     loadedMapIdRef.current = null;
     if (mapInstance.current) {
@@ -732,8 +794,18 @@ function Map2DContent() {
     }
   }, [mapId]);
 
+  // Ensure selected vector layer is strictly a layer present in addedLayers
+  useEffect(() => {
+    const vectorLayerIds = new Set(addedLayers.filter(l => l.type === 'VECTOR').map(l => l.id));
+    if (selectedWfsLayerId && !vectorLayerIds.has(selectedWfsLayerId)) {
+      const firstVector = addedLayers.find(l => l.type === 'VECTOR');
+      setSelectedWfsLayerId(firstVector ? firstVector.id : '');
+    }
+  }, [addedLayers, selectedWfsLayerId]);
+
   const handleCopyLink = () => {
-    const link = `${window.location.protocol}//${window.location.host}${window.location.pathname}?id=${mapId}`;
+    const targetSlug = mapDetail?.slug || mapId;
+    const link = `${window.location.protocol}//${window.location.host}/map/${targetSlug}`;
     navigator.clipboard.writeText(link);
     notification.success({
       message: 'Link Copied',
@@ -905,7 +977,7 @@ function Map2DContent() {
 
   // Fetch GIS access token
   useEffect(() => {
-    if (!hydrated || !token || isPublicMap) return;
+    if (!hydrated || !token || isPublicMap || isQuick) return;
     const fetchGisToken = async () => {
       try {
         const response = await apiRequest('/auth/access-token/');
@@ -918,13 +990,29 @@ function Map2DContent() {
       }
     };
     fetchGisToken();
-  }, [hydrated, token, isPublicMap]);
+  }, [hydrated, token, isPublicMap, isQuick]);
 
   // Auth and Data Fetch
   useEffect(() => {
     if (!hydrated) return;
 
     const checkAuthAndFetchMap = async () => {
+      if (isQuick) {
+        setIsPublicMap(true);
+        const defaultBm = useAppearanceStore.getState().defaultBasemap || 'osm';
+        setMapDetail({
+          id: 'quick-map',
+          name: 'Quick Map',
+          description: 'Temporary geospatial workspace (unsaved)',
+          share: 'PUBLIC',
+          basemap_id: defaultBm,
+        });
+        setNewName('Quick Map');
+        setSelectedBasemap(defaultBm);
+        setLoading(false);
+        return;
+      }
+
       let isPublicMap = false;
       let mapData = null;
 
@@ -962,7 +1050,7 @@ function Map2DContent() {
     };
 
     checkAuthAndFetchMap();
-  }, [token, hydrated, mapId, router]);
+  }, [token, hydrated, mapId, router, isQuick]);
 
   // OpenLayers Map Initialization
   useEffect(() => {
@@ -1083,20 +1171,22 @@ function Map2DContent() {
 
         return new Style({
           stroke: new Stroke({
-            color: '#facc15',
-            width: geometryType?.includes('Line') ? 5 : 4,
+            color: '#2563eb',
+            width: geometryType?.includes('Line') ? 3 : 2,
+            lineJoin: 'round',
+            lineCap: 'round',
           }),
           fill: new Fill({
-            color: 'rgba(250, 204, 21, 0.22)',
+            color: 'rgba(37, 99, 235, 0.06)',
           }),
           image: new CircleStyle({
-            radius: 9,
+            radius: 6,
             fill: new Fill({
-              color: 'rgba(250, 204, 21, 0.32)',
+              color: '#2563eb',
             }),
             stroke: new Stroke({
-              color: '#f59e0b',
-              width: 3,
+              color: '#ffffff',
+              width: 2,
             }),
           }),
         });
@@ -1104,6 +1194,39 @@ function Map2DContent() {
     });
     highlightLayerRef.current = highlightLayer;
     map.addLayer(highlightLayer);
+
+    const wfsFeatureSource = new VectorSource();
+    wfsFeatureSourceRef.current = wfsFeatureSource;
+
+    const wfsFeatureLayer = new VectorLayer({
+      source: wfsFeatureSource,
+      zIndex: 1005,
+      style: (feature: any) => {
+        const geometryType = feature.getGeometry()?.getType();
+
+        return new Style({
+          stroke: new Stroke({
+            color: '#2563eb',
+            width: geometryType?.includes('Line') ? 4 : 3,
+          }),
+          fill: new Fill({
+            color: 'rgba(37, 99, 235, 0.25)',
+          }),
+          image: new CircleStyle({
+            radius: 8,
+            fill: new Fill({
+              color: '#2563eb',
+            }),
+            stroke: new Stroke({
+              color: '#ffffff',
+              width: 2.5,
+            }),
+          }),
+        });
+      },
+    });
+    wfsFeatureLayer.set('id', 'wfs_feature_draft');
+    map.addLayer(wfsFeatureLayer);
 
     // Initialize zoom box layer and source
     const zbSource = new VectorSource();
@@ -1327,7 +1450,7 @@ function Map2DContent() {
       })
     );
 
-    const features = responses
+    let features = responses
       .filter((result): result is PromiseFulfilledResult<any> => result.status === 'fulfilled')
       .flatMap((result) => {
         const payload = result.value;
@@ -1337,6 +1460,28 @@ function Map2DContent() {
         return payload?.type === 'Feature' ? [payload] : [];
       })
       .filter((feature) => feature?.geometry);
+
+    // Fallback: Query GeoServer directly via /datasets/${datasetId}/features/?ids=...
+    if (features.length === 0 && featureIds.length > 0) {
+      try {
+        const res = await apiRequest(`/datasets/${encodeURIComponent(datasetId)}/features/?ids=${encodeURIComponent(featureIds.join(','))}&page_size=${featureIds.length}`);
+        if (res.ok) {
+          const json = await res.json();
+          if (json && Array.isArray(json.data)) {
+            features = json.data
+              .filter((row: any) => row.geometry)
+              .map((row: any) => ({
+                type: 'Feature',
+                id: row.id,
+                geometry: row.geometry,
+                properties: row,
+              }));
+          }
+        }
+      } catch (wfsErr) {
+        console.warn('GeoServer WFS fallback failed in fetchFeatureCollectionByIds:', wfsErr);
+      }
+    }
 
     return {
       type: 'FeatureCollection',
@@ -1355,8 +1500,17 @@ function Map2DContent() {
     }
 
     const geojsonFormat = new GeoJSON();
+    const extractFirstNum = (coords: any): number | null => {
+      if (!coords) return null;
+      if (Array.isArray(coords) && typeof coords[0] === 'number') return coords[0];
+      if (Array.isArray(coords) && Array.isArray(coords[0])) return extractFirstNum(coords[0]);
+      return null;
+    };
+    const firstCoord = extractFirstNum(featureCollection.features[0]?.geometry?.coordinates);
+    const isAlreadyProjected = firstCoord !== null && Math.abs(firstCoord) > 180;
+
     const features = geojsonFormat.readFeatures(featureCollection, {
-      dataProjection: 'EPSG:4326',
+      dataProjection: isAlreadyProjected ? 'EPSG:3857' : 'EPSG:4326',
       featureProjection: 'EPSG:3857'
     });
 
@@ -1506,7 +1660,7 @@ function Map2DContent() {
     if (cqlFilter) olLayer.set('cql_filter_string', cqlFilter);
   }, []);
 
-  const addLayerToMap = useCallback(async (dataset: any) => {
+  const addLayerToMap = useCallback(async (dataset: any, protocolOverride?: 'WMS' | 'WFS' | 'WMTS' | 'WCS') => {
     if (olLayersRef.current[dataset.id]) {
       notification.warning({
         message: 'Layer Already Added',
@@ -1521,22 +1675,238 @@ function Map2DContent() {
     const nextZIndex = addedLayers.length + 1;
     let newOlLayer: any = null;
 
-    const geoserverWmsUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '') + '/wms';
+    const isWmsDisabled = servicesConfig.wms?.enabled === false;
+    const isWfsDisabled = servicesConfig.wfs?.enabled === false;
+    const isVectorLayer = dataset.data_type === 'VECTOR';
+    const isWcsLayer = dataset.service_used === 'WCS' || fullDataset.metadata?.service === 'WCS';
+
+    // Determine protocol: user selected override or smart auto-detection
+    const chosenProtocol: 'WMS' | 'WFS' | 'WMTS' | 'WCS' = protocolOverride || (
+      dataset.service_used === 'WMTS' || fullDataset.metadata?.service === 'WMTS' ? 'WMTS' :
+      isWcsLayer ? 'WCS' :
+      isWmsDisabled && isVectorLayer && !isWfsDisabled ? 'WFS' :
+      isWmsDisabled && !isVectorLayer ? 'WCS' :
+      isWmsDisabled && isWfsDisabled ? 'WMTS' : 'WMS'
+    );
+
+    const isWmtsLayer = chosenProtocol === 'WMTS';
+    const isWfsLayer = chosenProtocol === 'WFS';
+    const isWcsLayerFinal = chosenProtocol === 'WCS';
+    const geoserverBaseUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
     const geoserverAuth = user?.geoserverAuth;
-    newOlLayer = new TileLayer({
-      source: new TileWMS({
-        url: geoserverWmsUrl,
-        params: {
-          'LAYERS': dataset.name,
-          'TILED': true,
+
+    if (isWmtsLayer) {
+      const tms = fullDataset.metadata?.tileMatrixSet || 'EPSG:900913';
+      const formats: string[] = fullDataset.metadata?.formats || [];
+      const hasMvtSupport = Boolean(
+        fullDataset.metadata?.isVectorTile ||
+        formats.some((f: string) => {
+          const fl = f.toLowerCase();
+          return fl.includes('mapbox-vector-tile') || fl.includes('x-protobuf') || fl.includes('pbf');
+        })
+      );
+
+      if (hasMvtSupport) {
+        // GeoServer MVT Mapbox Vector Tiles via WMTS (when Vector Tiles extension is enabled)
+        newOlLayer = new VectorTileLayer({
+          source: new VectorTileSource({
+            format: new MVT(),
+            url: `${geoserverBaseUrl}/gwc/service/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&LAYER=${encodeURIComponent(dataset.name)}&STYLE=&TILEMATRIX=${tms}:{z}&TILEMATRIXSET=${tms}&FORMAT=application/vnd.mapbox-vector-tile&TILECOL={x}&TILEROW={y}`,
+            tileLoadFunction: (tile: any, url: string) => {
+              tile.setLoader((extent: any, resolution: any, projection: any) => {
+                const reqHeaders: Record<string, string> = {};
+                if (geoserverAuth) reqHeaders['Authorization'] = geoserverAuth;
+                fetch(url, { headers: reqHeaders })
+                  .then(r => {
+                    if (!r.ok) throw new Error(`VectorTile HTTP ${r.status}`);
+                    return r.arrayBuffer();
+                  })
+                  .then(data => {
+                    const format = tile.getFormat();
+                    const features = format.readFeatures(data, {
+                      extent: extent,
+                      featureProjection: projection,
+                    });
+                    tile.setFeatures(features);
+                  })
+                  .catch(err => {
+                    console.warn(`[WMTS MVT ${dataset.name}] Tile load error:`, err);
+                  });
+              });
+            },
+          }),
+          zIndex: nextZIndex,
+          style: (feature: any) => {
+            const geomType = feature.getGeometry()?.getType();
+            return new Style({
+              stroke: new Stroke({
+                color: '#2563eb',
+                width: geomType?.includes('Line') ? 3 : 2,
+              }),
+              fill: new Fill({
+                color: 'rgba(37, 99, 235, 0.25)',
+              }),
+              image: new CircleStyle({
+                radius: 6,
+                fill: new Fill({ color: '#2563eb' }),
+                stroke: new Stroke({ color: '#ffffff', width: 2 }),
+              }),
+            });
+          },
+        });
+      } else {
+        // Calculate layer's geographical extent in EPSG:3857 so OpenLayers only requests valid tiles
+        let layerExtent: [number, number, number, number] | undefined = undefined;
+        const rawBbox = fullDataset.metadata?.bbox;
+        if (rawBbox && Array.isArray(rawBbox) && rawBbox.length === 4) {
+          const minX = Math.max(-180, Math.min(180, Number(rawBbox[0])));
+          const minY = Math.max(-85.05, Math.min(85.05, Number(rawBbox[1])));
+          const maxX = Math.max(-180, Math.min(180, Number(rawBbox[2])));
+          const maxY = Math.max(-85.05, Math.min(85.05, Number(rawBbox[3])));
+          if (!isNaN(minX) && !isNaN(minY) && !isNaN(maxX) && !isNaN(maxY) && minX < maxX && minY < maxY) {
+            const minC = fromLonLat([minX, minY]);
+            const maxC = fromLonLat([maxX, maxY]);
+            layerExtent = [minC[0], minC[1], maxC[0], maxC[1]];
+          }
+        }
+
+        const proj = getProjection('EPSG:3857')!;
+        const projExtent = proj.getExtent();
+        const size = getWidth(projExtent) / 256;
+        const resolutions = new Array(22);
+        const matrixIds = new Array(22);
+        for (let z = 0; z < 22; ++z) {
+          resolutions[z] = size / Math.pow(2, z);
+          matrixIds[z] = tms.includes(':') ? `${tms}:${z}` : (tms === 'EPSG:900913' || tms === 'EPSG:3857' ? `EPSG:900913:${z}` : `${z}`);
+        }
+        const wmtsTileGrid = new WMTSTileGrid({
+          origin: getTopLeft(projExtent),
+          resolutions,
+          matrixIds,
+        });
+
+        newOlLayer = new TileLayer({
+          extent: layerExtent,
+          source: new WMTS({
+            url: `${geoserverBaseUrl}/gwc/service/wmts`,
+            layer: dataset.name,
+            matrixSet: tms,
+            format: 'image/png',
+            projection: proj,
+            tileGrid: wmtsTileGrid,
+            style: dataset.activeStyle || dataset.styles?.[0]?.name || '',
+            wrapX: true,
+            tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
+          }),
+          zIndex: nextZIndex,
+        });
+      }
+    } else if (isWfsLayer && isVectorLayer) {
+      // Direct WFS Vector loader
+      const vectorSource = new VectorSource({
+        format: new GeoJSON(),
+        loader: function (extent, resolution, projection, success, failure) {
+          const projCode = projection.getCode() || 'EPSG:3857';
+          const wfsUrl = `${geoserverBaseUrl}/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=${encodeURIComponent(dataset.name)}&outputFormat=application/json&srsname=${projCode}&bbox=${extent.join(',')},${projCode}`;
+          const reqHeaders: Record<string, string> = {};
+          if (geoserverAuth) reqHeaders['Authorization'] = geoserverAuth;
+
+          fetch(wfsUrl, { headers: reqHeaders })
+            .then(async (res) => {
+              if (!res.ok) throw new Error(`WFS HTTP ${res.status}`);
+              const text = await res.text();
+              if (text.includes('ExceptionReport') || text.includes('ServiceException')) {
+                throw new Error('WFS Exception');
+              }
+              return JSON.parse(text);
+            })
+            .then((data) => {
+              const features = new GeoJSON().readFeatures(data, {
+                dataProjection: projCode,
+                featureProjection: projCode,
+              });
+              vectorSource.addFeatures(features);
+              if (success) success(features);
+            })
+            .catch(() => {
+              const fallbackUrl = `${geoserverBaseUrl}/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=${encodeURIComponent(dataset.name)}&outputFormat=application/json&maxFeatures=5000`;
+              fetch(fallbackUrl, { headers: reqHeaders })
+                .then(r => r.json())
+                .then((data) => {
+                  const features = new GeoJSON().readFeatures(data, {
+                    dataProjection: 'EPSG:4326',
+                    featureProjection: projCode,
+                  });
+                  vectorSource.addFeatures(features);
+                  if (success) success(features);
+                })
+                .catch((e) => {
+                  console.warn(`[WFS Layer ${dataset.name}] Vector load failed:`, e);
+                  if (failure) failure();
+                });
+            });
         },
-        serverType: 'geoserver',
-        transition: 200,
-        tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
-      }),
-      zIndex: nextZIndex,
-      preload: 2,
-    });
+      });
+
+      newOlLayer = new VectorLayer({
+        source: vectorSource,
+        zIndex: nextZIndex,
+        style: (feature: any) => {
+          const geomType = feature.getGeometry()?.getType();
+          return new Style({
+            stroke: new Stroke({
+              color: '#2563eb',
+              width: geomType?.includes('Line') ? 3 : 2,
+              lineJoin: 'round',
+              lineCap: 'round',
+            }),
+            fill: new Fill({
+              color: 'rgba(37, 99, 235, 0.25)',
+            }),
+            image: new CircleStyle({
+              radius: 6,
+              fill: new Fill({ color: '#2563eb' }),
+              stroke: new Stroke({ color: '#ffffff', width: 2 }),
+            }),
+          });
+        },
+      });
+    } else if (isWcsLayerFinal && (!isVectorLayer || isWcsLayer)) {
+      // WCS GetCoverage raster coverage loader
+      const rawBbox = fullDataset.metadata?.bbox || [-180, -85, 180, 85];
+      const minX = Math.max(-179.99, Number(rawBbox[0]) || -180);
+      const minY = Math.max(-85.05, Number(rawBbox[1]) || -85);
+      const maxX = Math.min(179.99, Number(rawBbox[2]) || 180);
+      const maxY = Math.min(85.05, Number(rawBbox[3]) || 85);
+      const projExtent = [...fromLonLat([minX, minY]), ...fromLonLat([maxX, maxY])];
+
+      const wcsCoverageUrl = `${geoserverBaseUrl}/ows?service=WCS&version=1.0.0&request=GetCoverage&coverage=${encodeURIComponent(dataset.name)}&crs=EPSG:3857&bbox=${projExtent.join(',')}&width=1024&height=1024&format=image/png`;
+
+      newOlLayer = new ImageLayer({
+        source: new ImageStatic({
+          url: wcsCoverageUrl,
+          imageExtent: projExtent,
+        }),
+        zIndex: nextZIndex,
+      });
+    } else {
+      const geoserverWmsUrl = geoserverBaseUrl + '/wms';
+      newOlLayer = new TileLayer({
+        source: new TileWMS({
+          url: geoserverWmsUrl,
+          params: {
+            'LAYERS': dataset.name,
+            'TILED': true,
+            '_t': Date.now(),
+          },
+          serverType: 'geoserver',
+          transition: 200,
+          tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
+        }),
+        zIndex: nextZIndex,
+        preload: 2,
+      });
+    }
 
     if (newOlLayer) {
       newOlLayer.setOpacity(1.0);
@@ -1546,6 +1916,31 @@ function Map2DContent() {
       }
       mapInstance.current?.addLayer(newOlLayer);
       olLayersRef.current[dataset.id] = newOlLayer;
+
+      // Automatically fly and fit the map viewport to the layer's bbox so it is immediately visible
+      const rawBbox = fullDataset.metadata?.bbox;
+      if (rawBbox && Array.isArray(rawBbox) && rawBbox.length === 4) {
+        const isWorldExtent = rawBbox[0] <= -179 && rawBbox[1] <= -89 && rawBbox[2] >= 179 && rawBbox[3] >= 89;
+        if (!isWorldExtent && !isNaN(rawBbox[0]) && !isNaN(rawBbox[1]) && !isNaN(rawBbox[2]) && !isNaN(rawBbox[3])) {
+          try {
+            const minX = Math.max(-180, Math.min(180, Number(rawBbox[0])));
+            const minY = Math.max(-85.05, Math.min(85.05, Number(rawBbox[1])));
+            const maxX = Math.max(-180, Math.min(180, Number(rawBbox[2])));
+            const maxY = Math.max(-85.05, Math.min(85.05, Number(rawBbox[3])));
+            const transformedExtent = [
+              ...fromLonLat([minX, minY]),
+              ...fromLonLat([maxX, maxY]),
+            ];
+            mapInstance.current?.getView().fit(transformedExtent, {
+              padding: [60, 60, 60, 60],
+              duration: 800,
+              maxZoom: 16,
+            });
+          } catch (fitErr) {
+            console.warn('[Map] Could not auto-fit to layer bbox:', fitErr);
+          }
+        }
+      }
       setAddedLayers(prev => [...prev, {
         id: dataset.id,
         name: fullDataset.name || dataset.name,
@@ -1557,7 +1952,13 @@ function Map2DContent() {
         activeStyle: dataset.styles?.[0]?.name || '',
         bbox: fullDataset.metadata?.bbox,
         nativeCRS: fullDataset.metadata?.crs || fullDataset.metadata?.nativeCRS || fullDataset.crs || 'EPSG:4326',
+        protocol: chosenProtocol,
       }]);
+      notification.success({
+        message: 'Layer Added',
+        description: `"${fullDataset.name || dataset.name}" added via ${chosenProtocol}.`,
+        placement: 'topRight',
+      });
     } else {
       notification.error({
         message: 'Error',
@@ -1565,7 +1966,7 @@ function Map2DContent() {
         placement: 'topRight'
       });
     }
-  }, [addedLayers.length, notification, user?.geoserverAuth, user?.geoserverUrl]);
+  }, [addedLayers.length, notification, user?.geoserverAuth, user?.geoserverUrl, servicesConfig]);
 
   const handleFuzzySearch = useCallback(async (layerId: string, keywords: string[]) => {
     if (!layerId) {
@@ -1851,22 +2252,202 @@ function Map2DContent() {
         const styleData = migrateStyleConfig(layerData.style_json);
         const layerOpacity = layerData.opacity ?? styleData.opacity ?? 1.0;
         const layerActiveStyle = layerData.activeStyle || layerData.style_json?.activeStyle || styleData.activeStyle || '';
-        const geoserverWmsUrl = geoserverUrl + '/wms';
 
-        const newOlLayer = new TileLayer({
-          source: new TileWMS({
-            url: geoserverWmsUrl,
-            params: {
-              'LAYERS': layerName,
-              ...(layerActiveStyle ? { 'STYLES': layerActiveStyle } : {}),
-              'TILED': true,
+        const isWmsDisabled = servicesConfig.wms?.enabled === false;
+        let newOlLayer: any;
+
+        if (isWmsDisabled && layerData.type !== 'RASTER') {
+          const vectorSource = new VectorSource({
+            format: new GeoJSON(),
+            loader: function (extent, resolution, projection, success, failure) {
+              const projCode = projection.getCode() || 'EPSG:3857';
+              const wfsUrl = `${geoserverUrl}/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=${encodeURIComponent(layerName)}&outputFormat=application/json&srsname=${projCode}&bbox=${extent.join(',')},${projCode}`;
+              const reqHeaders: Record<string, string> = {};
+              if (geoserverAuth) reqHeaders['Authorization'] = geoserverAuth;
+
+              fetch(wfsUrl, { headers: reqHeaders })
+                .then(r => r.json())
+                .then(data => {
+                  const features = new GeoJSON().readFeatures(data, {
+                    dataProjection: projCode,
+                    featureProjection: projCode,
+                  });
+                  vectorSource.addFeatures(features);
+                  if (success) success(features);
+                })
+                .catch(() => {
+                  const fallbackUrl = `${geoserverUrl}/ows?service=WFS&version=1.1.0&request=GetFeature&typeName=${encodeURIComponent(layerName)}&outputFormat=application/json&maxFeatures=5000`;
+                  fetch(fallbackUrl, { headers: reqHeaders })
+                    .then(r => r.json())
+                    .then(data => {
+                      const features = new GeoJSON().readFeatures(data, {
+                        dataProjection: 'EPSG:4326',
+                        featureProjection: projCode,
+                      });
+                      vectorSource.addFeatures(features);
+                      if (success) success(features);
+                    })
+                    .catch(e => {
+                      console.warn(`[WFS Layer ${layerName}] Vector restore load failed:`, e);
+                      if (failure) failure();
+                    });
+                });
             },
-            serverType: 'geoserver',
-            transition: 0,
-            tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
-          }),
-          zIndex: zIndex++,
-        });
+          });
+
+          newOlLayer = new VectorLayer({
+            source: vectorSource,
+            zIndex: zIndex++,
+            style: (feature: any) => {
+              const geomType = feature.getGeometry()?.getType();
+              return new Style({
+                stroke: new Stroke({
+                  color: '#2563eb',
+                  width: geomType?.includes('Line') ? 3 : 2,
+                  lineJoin: 'round',
+                  lineCap: 'round',
+                }),
+                fill: new Fill({
+                  color: 'rgba(37, 99, 235, 0.25)',
+                }),
+                image: new CircleStyle({
+                  radius: 6,
+                  fill: new Fill({ color: '#2563eb' }),
+                  stroke: new Stroke({ color: '#ffffff', width: 2 }),
+                }),
+              });
+            },
+          });
+        } else if (layerData.service_used === 'WMTS' || layerData.metadata?.service === 'WMTS') {
+          const tms = layerData.metadata?.tileMatrixSet || 'EPSG:900913';
+          if (layerData.metadata?.isVectorTile) {
+            newOlLayer = new VectorTileLayer({
+              source: new VectorTileSource({
+                format: new MVT(),
+                url: `${geoserverUrl}/gwc/service/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&LAYER=${encodeURIComponent(layerName)}&STYLE=&TILEMATRIX=${tms}:{z}&TILEMATRIXSET=${tms}&FORMAT=application/vnd.mapbox-vector-tile&TILECOL={x}&TILEROW={y}`,
+                tileLoadFunction: (tile: any, url: string) => {
+                  tile.setLoader((extent: any, resolution: any, projection: any) => {
+                    const reqHeaders: Record<string, string> = {};
+                    if (geoserverAuth) reqHeaders['Authorization'] = geoserverAuth;
+                    fetch(url, { headers: reqHeaders })
+                      .then(r => {
+                        if (!r.ok) throw new Error(`VectorTile HTTP ${r.status}`);
+                        return r.arrayBuffer();
+                      })
+                      .then(data => {
+                        const format = tile.getFormat();
+                        const features = format.readFeatures(data, {
+                          extent: extent,
+                          featureProjection: projection,
+                        });
+                        tile.setFeatures(features);
+                      })
+                      .catch(err => {
+                        console.warn(`[WMTS MVT restore ${layerName}] Tile load error:`, err);
+                      });
+                  });
+                },
+              }),
+              zIndex: zIndex++,
+              style: (feature: any) => {
+                const geomType = feature.getGeometry()?.getType();
+                return new Style({
+                  stroke: new Stroke({
+                    color: '#2563eb',
+                    width: geomType?.includes('Line') ? 3 : 2,
+                  }),
+                  fill: new Fill({
+                    color: 'rgba(37, 99, 235, 0.25)',
+                  }),
+                  image: new CircleStyle({
+                    radius: 6,
+                    fill: new Fill({ color: '#2563eb' }),
+                    stroke: new Stroke({ color: '#ffffff', width: 2 }),
+                  }),
+                });
+              },
+            });
+          } else {
+            const proj = getProjection('EPSG:3857')!;
+            const projExtent = proj.getExtent();
+            const size = getWidth(projExtent) / 256;
+            const resolutions = new Array(22);
+            const matrixIds = new Array(22);
+            for (let z = 0; z < 22; ++z) {
+              resolutions[z] = size / Math.pow(2, z);
+              matrixIds[z] = tms.includes(':') ? `${tms}:${z}` : (tms === 'EPSG:900913' || tms === 'EPSG:3857' ? `EPSG:900913:${z}` : `${z}`);
+            }
+            const wmtsTileGrid = new WMTSTileGrid({
+              origin: getTopLeft(projExtent),
+              resolutions,
+              matrixIds,
+            });
+
+            const restoreBbox = layersBboxMap.get(layerId) || layersBboxMap.get(layerName) || layerData.metadata?.bbox;
+            let restoreExtent: [number, number, number, number] | undefined = undefined;
+            if (restoreBbox && Array.isArray(restoreBbox) && restoreBbox.length === 4) {
+              const minX = Math.max(-180, Math.min(180, Number(restoreBbox[0])));
+              const minY = Math.max(-85.05, Math.min(85.05, Number(restoreBbox[1])));
+              const maxX = Math.max(-180, Math.min(180, Number(restoreBbox[2])));
+              const maxY = Math.max(-85.05, Math.min(85.05, Number(restoreBbox[3])));
+              if (!isNaN(minX) && !isNaN(minY) && !isNaN(maxX) && !isNaN(maxY) && minX < maxX && minY < maxY) {
+                const minC = fromLonLat([minX, minY]);
+                const maxC = fromLonLat([maxX, maxY]);
+                restoreExtent = [minC[0], minC[1], maxC[0], maxC[1]];
+              }
+            }
+
+            newOlLayer = new TileLayer({
+              extent: restoreExtent,
+              source: new WMTS({
+                url: `${geoserverUrl}/gwc/service/wmts`,
+                layer: layerName,
+                matrixSet: tms,
+                format: 'image/png',
+                projection: proj,
+                tileGrid: wmtsTileGrid,
+                style: layerData.activeStyle || '',
+                wrapX: true,
+                tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
+              }),
+              zIndex: zIndex++,
+            });
+          }
+        } else if (isWmsDisabled && layerData.type === 'RASTER') {
+          const layerBbox = layersBboxMap.get(layerId) || layersBboxMap.get(layerName) || [-180, -85, 180, 85];
+          const minX = Math.max(-179.99, Number(layerBbox[0]) || -180);
+          const minY = Math.max(-85.05, Number(layerBbox[1]) || -85);
+          const maxX = Math.min(179.99, Number(layerBbox[2]) || 180);
+          const maxY = Math.min(85.05, Number(layerBbox[3]) || 85);
+          const projExtent = [...fromLonLat([minX, minY]), ...fromLonLat([maxX, maxY])];
+
+          const wcsCoverageUrl = `${geoserverUrl}/ows?service=WCS&version=1.0.0&request=GetCoverage&coverage=${encodeURIComponent(layerName)}&crs=EPSG:3857&bbox=${projExtent.join(',')}&width=1024&height=1024&format=image/png`;
+
+          newOlLayer = new ImageLayer({
+            source: new ImageStatic({
+              url: wcsCoverageUrl,
+              imageExtent: projExtent,
+            }),
+            zIndex: zIndex++,
+          });
+        } else {
+          const geoserverWmsUrl = geoserverUrl + '/wms';
+          newOlLayer = new TileLayer({
+            source: new TileWMS({
+              url: geoserverWmsUrl,
+              params: {
+                'LAYERS': layerName,
+                ...(layerActiveStyle ? { 'STYLES': layerActiveStyle } : {}),
+                'TILED': true,
+                '_t': Date.now(),
+              },
+              serverType: 'geoserver',
+              transition: 0,
+              tileLoadFunction: createWmsTileLoadFunction(geoserverAuth),
+            }),
+            zIndex: zIndex++,
+          });
+        }
 
         newOlLayer.setOpacity(layerOpacity);
         newOlLayer.set('name', layerName);
@@ -1906,6 +2487,8 @@ function Map2DContent() {
       }
 
       setAddedLayers(layersListState);
+      const firstVectorLayer = layersListState.find(l => l.type === 'VECTOR');
+      setSelectedWfsLayerId(firstVectorLayer ? firstVectorLayer.id : '');
 
       // Restore map center & zoom from saved mapDetail
       if (mapDetail && mapDetail.center_lon != null && mapDetail.center_lat != null && mapDetail.zoom != null) {
@@ -1970,6 +2553,12 @@ function Map2DContent() {
       if (response.ok) {
         const updatedMap = await response.json();
         setMapDetail(updatedMap);
+        if (updatedMap?.slug && typeof window !== 'undefined') {
+          const currentPath = window.location.pathname;
+          if (currentPath.startsWith('/map/')) {
+            window.history.replaceState(null, '', `/map/${updatedMap.slug}`);
+          }
+        }
         notification.success({
           message: 'Success',
           description: 'Map details updated successfully.',
@@ -1991,6 +2580,14 @@ function Map2DContent() {
   };
 
   const handleSaveMapWorkspace = async () => {
+    if (isQuick) {
+      notification.info({
+        message: 'Quick Map Mode',
+        description: 'Saving workspaces is not available in Quick Map mode. Please log in to save workspaces.',
+        placement: 'topRight',
+      });
+      return;
+    }
     if (!mapId || !mapInstance.current) return;
     try {
       const view = mapInstance.current.getView();
@@ -2574,7 +3171,10 @@ function Map2DContent() {
       const res = await apiRequest('/datasets/');
       if (!res.ok) throw new Error(`GeoServer returned status: ${res.status}`);
       const layers = await res.json();
+      const capService = (res.headers.get('X-Capabilities-Service') || (layers[0]?.service_used) || 'WMS') as any;
+      setActiveCatalogService(capService);
       setDatasetsList(layers);
+
     } catch (err: any) {
       console.error('Failed to load layers from GeoServer capabilities:', err);
       notification.error({
@@ -2588,12 +3188,12 @@ function Map2DContent() {
   }, [notification]);
 
   useEffect(() => {
-    if (token) {
+    if ((token || isQuick) && isAddLayerModalOpen) {
       queueMicrotask(() => {
         fetchDatasetsForModal();
       });
     }
-  }, [token, isAddLayerModalOpen, fetchDatasetsForModal]);
+  }, [token, isQuick, isAddLayerModalOpen, fetchDatasetsForModal]);
 
 
 
@@ -2852,6 +3452,7 @@ function Map2DContent() {
             params: {
               'LAYERS': layerName,
               'TILED': true,
+              '_t': Date.now(),
             },
             serverType: 'geoserver',
             transition: 200,
@@ -4150,7 +4751,17 @@ function Map2DContent() {
     if (olLayer) {
       const source = olLayer.getSource();
       if (source && typeof (source as any).updateParams === 'function') {
-        (source as any).updateParams({ 'STYLES': styleName });
+        (source as any).updateParams({ 'STYLES': styleName, '_t': Date.now() });
+        source.refresh();
+      } else if (source && typeof (source as any).createFromWMTSTemplate === 'function') {
+        (source as any).style_ = styleName;
+        const urls = (source as any).urls || [(source as any).url_].filter(Boolean);
+        if (urls.length > 0 && typeof (source as any).setTileUrlFunction === 'function') {
+          (source as any).setTileUrlFunction(
+            createFromTileUrlFunctions(urls.map((source as any).createFromWMTSTemplate.bind(source)))
+          );
+        }
+        source.refresh();
       }
     }
   };
@@ -4225,10 +4836,450 @@ function Map2DContent() {
     }
   };
 
+  const stopWfsDraw = useCallback(() => {
+    if (wfsDrawRef.current && mapInstance.current) {
+      mapInstance.current.removeInteraction(wfsDrawRef.current);
+      wfsDrawRef.current = null;
+    }
+    wfsDrawActiveRef.current = false;
+    const viewport = mapInstance.current?.getViewport();
+    if (viewport) viewport.style.cursor = 'default';
+  }, []);
+
+  const startWfsDraw = useCallback(async (layerId: string) => {
+    if (!mapInstance.current || !layerId) return;
+
+    stopWfsDraw();
+    stopMeasurement();
+    stopDrawingAnnotation();
+    stopQueryDraw();
+
+    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverAuth = user?.geoserverAuth;
+
+    const targetAddedLayer = addedLayers.find(l => l.id === layerId || l.name === layerId);
+    const layerKnownCrs = targetAddedLayer?.nativeCRS;
+
+    try {
+      const schema = await fetchWfsLayerSchema(layerId, geoserverUrl, geoserverAuth, layerKnownCrs);
+      setWfsLayerSchema(schema);
+
+      const initialAttrs: Record<string, any> = {};
+      schema.attributes.forEach(attr => {
+        initialAttrs[attr.name] = '';
+      });
+      setNewFeatureValues(initialAttrs);
+      setNewFeatureGeometry(null);
+      setIsAddFeatureActive(true);
+
+      let drawType: any = 'Point';
+      if (schema.geomType.includes('Polygon')) drawType = 'Polygon';
+      else if (schema.geomType.includes('Line')) drawType = 'LineString';
+      else drawType = 'Point';
+
+      if (wfsFeatureSourceRef.current) {
+        wfsFeatureSourceRef.current.clear();
+      }
+
+      const draw = new Draw({
+        source: wfsFeatureSourceRef.current || undefined,
+        type: drawType,
+      });
+
+      wfsDrawRef.current = draw;
+      wfsDrawActiveRef.current = true;
+
+      const viewport = mapInstance.current.getViewport();
+      if (viewport) viewport.style.cursor = 'crosshair';
+
+      draw.on('drawend', (evt) => {
+        const geom = evt.feature.getGeometry();
+        if (!geom) return;
+
+        const mapProj = mapInstance.current?.getView().getProjection().getCode() || 'EPSG:3857';
+        const layerProj = schema.srsName || layerKnownCrs || 'EPSG:4326';
+
+        const geojsonFormat = new GeoJSON();
+        let geomObj: any = geojsonFormat.writeGeometryObject(geom, {
+          dataProjection: layerProj,
+          featureProjection: mapProj,
+        });
+
+        if (schema.geomType === 'MultiPolygon' && geomObj.type === 'Polygon') {
+          geomObj = {
+            type: 'MultiPolygon',
+            coordinates: [geomObj.coordinates],
+          };
+        } else if (schema.geomType === 'MultiLineString' && geomObj.type === 'LineString') {
+          geomObj = {
+            type: 'MultiLineString',
+            coordinates: [geomObj.coordinates],
+          };
+        } else if (schema.geomType === 'MultiPoint' && geomObj.type === 'Point') {
+          geomObj = {
+            type: 'MultiPoint',
+            coordinates: [geomObj.coordinates],
+          };
+        }
+
+        setNewFeatureGeometry(geomObj);
+
+        // Keep wfsDrawActiveRef true briefly to prevent the double-click or final click from firing handleMapClick
+        setTimeout(() => {
+          stopWfsDraw();
+        }, 300);
+      });
+
+      mapInstance.current.addInteraction(draw);
+    } catch (err: any) {
+      notification.error({
+        message: 'Schema Discovery Failed',
+        description: err?.message || 'Could not fetch layer schema for drawing.',
+      });
+    }
+  }, [stopWfsDraw, stopMeasurement, stopDrawingAnnotation, stopQueryDraw, user?.geoserverUrl, user?.geoserverAuth, addedLayers, notification]);
+
+  const handleCreateFeature = async () => {
+    if (!newFeatureGeometry) {
+      notification.warning({
+        message: 'Geometry Required',
+        description: 'Please click or draw on the map to place the geometry first.',
+      });
+      return;
+    }
+
+    if (!selectedWfsLayerId || !wfsLayerSchema) return;
+
+    setIsWfsSaving(true);
+    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverAuth = user?.geoserverAuth;
+
+    try {
+      // If the layer schema has MAPCOLOR9 (e.g. ne:countries) and not specified, default to '1' so GeoServer renders fill
+      const finalAttrs = { ...newFeatureValues };
+      if (!finalAttrs.MAPCOLOR9 && wfsLayerSchema.attributes.some(a => a.name === 'MAPCOLOR9')) {
+        finalAttrs.MAPCOLOR9 = '1';
+      }
+
+      const xml = buildInsertXml({
+        workspace: wfsLayerSchema.workspace,
+        layerName: wfsLayerSchema.layerName,
+        targetNamespace: wfsLayerSchema.targetNamespace,
+        geomFieldName: wfsLayerSchema.geomFieldName,
+        geomType: wfsLayerSchema.geomType,
+        srsName: wfsLayerSchema.srsName || 'http://www.opengis.net/gml/srs/epsg.xml#4326',
+        geometry: newFeatureGeometry,
+        attributes: finalAttrs,
+      });
+
+      const result = await executeWfsTransaction(geoserverUrl, xml, wfsLayerSchema.workspace, geoserverAuth);
+
+      if (result.success) {
+        const geomToHighlight = newFeatureGeometry;
+        notification.success({
+          message: 'Feature Created',
+          description: `Successfully inserted new feature into ${selectedWfsLayerId}.`,
+        });
+
+        let olLayer = olLayersRef.current[selectedWfsLayerId];
+        if (!olLayer && selectedWfsLayerId) {
+          const matchKey = Object.keys(olLayersRef.current).find(key =>
+            key === selectedWfsLayerId ||
+            key.endsWith(`:${selectedWfsLayerId}`) ||
+            (selectedWfsLayerId.includes(':') && key === selectedWfsLayerId.split(':').pop())
+          );
+          if (matchKey) olLayer = olLayersRef.current[matchKey];
+        }
+        if (olLayer) {
+          const src = olLayer.getSource ? olLayer.getSource() : null;
+          if (src) {
+            const isVectorSource = typeof src.getFeatures === "function";
+            if (isVectorSource && geomToHighlight) {
+              try {
+                const geojsonFormat = new GeoJSON();
+                const mapProj = mapInstance.current?.getView().getProjection().getCode() || "EPSG:3857";
+                const layerProj = wfsLayerSchema?.srsName || "EPSG:4326";
+                const olGeom = geojsonFormat.readGeometry(geomToHighlight, {
+                  dataProjection: layerProj,
+                  featureProjection: mapProj,
+                });
+                const newFeat = new Feature({ geometry: olGeom || undefined, ...newFeatureValues });
+                const insertedFid = result.insertedFids?.[0];
+                if (insertedFid) {
+                  newFeat.setId(insertedFid);
+                  newFeat.set("fid", insertedFid);
+                }
+                src.addFeature(newFeat);
+              } catch (addErr) {
+                console.warn("Could not add new feature directly to vector source:", addErr);
+              }
+            } else if (!isVectorSource && typeof (src as any).updateParams === "function") {
+              try { (src as any).updateParams({ _t: Date.now() }); } catch {}
+            }
+            if (typeof olLayer.changed === "function") {
+              olLayer.changed();
+            }
+          }
+        }
+        setIsAddFeatureActive(false);
+        setNewFeatureGeometry(null);
+        setNewFeatureValues({});
+        stopWfsDraw();
+        wfsFeatureSourceRef.current?.clear();
+
+        // Immediately highlight the newly created feature so the boundary polygon is visible on the map
+        if (highlightSourceRef.current && geomToHighlight) {
+          try {
+            const geojsonFormat = new GeoJSON();
+            const mapProj = mapInstance.current?.getView().getProjection().getCode() || 'EPSG:3857';
+            const layerProj = wfsLayerSchema.srsName || 'EPSG:4326';
+            const olGeom = geojsonFormat.readGeometry(geomToHighlight, {
+              dataProjection: layerProj,
+              featureProjection: mapProj,
+            });
+            if (olGeom) {
+              highlightSourceRef.current.clear();
+              highlightSourceRef.current.addFeature(new Feature({ geometry: olGeom }));
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        // Display new feature details in the information panel
+        const insertedFid = result.insertedFids?.[0] || `${selectedWfsLayerId}.new`;
+        const newRows = Object.entries(newFeatureValues).map(([key, val]) => ({
+          key,
+          attribute: key,
+          value: typeof val === 'object' ? JSON.stringify(val) : String(val)
+        }));
+        setInfoData([{
+          id: insertedFid,
+          fid: insertedFid,
+          layerId: selectedWfsLayerId,
+          layerName: selectedWfsLayerId,
+          geometry: geomToHighlight,
+          properties: newFeatureValues,
+          title: `${selectedWfsLayerId} - ${newFeatureValues.name || newFeatureValues.title || insertedFid}`,
+          rows: newRows,
+        }]);
+        setLeftPanelMode('info');
+        setIsLeftPanelOpen(true);
+      } else {
+        notification.error({
+          message: 'Transaction Failed',
+          description: result.errorMessage || 'Failed to create feature in GeoServer.',
+        });
+      }
+    } catch (err: any) {
+      notification.error({
+        message: 'Error Creating Feature',
+        description: err?.message || 'An unexpected error occurred.',
+      });
+    } finally {
+      setIsWfsSaving(false);
+    }
+  };
+
+  const handleSaveUpdateFeature = async (feature: any) => {
+    const targetLayerId = feature.layerId || selectedWfsLayerId;
+    if (!targetLayerId) {
+      notification.error({ message: 'Error', description: 'Could not identify target layer.' });
+      return;
+    }
+
+    setIsWfsSaving(true);
+    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverAuth = user?.geoserverAuth;
+
+    try {
+      const schema = await fetchWfsLayerSchema(targetLayerId, geoserverUrl, geoserverAuth);
+
+      const xml = buildUpdateXml({
+        workspace: schema.workspace,
+        layerName: schema.layerName,
+        targetNamespace: schema.targetNamespace,
+        geomFieldName: schema.geomFieldName,
+        srsName: schema.srsName || 'EPSG:4326',
+        fid: feature.fid || feature.id,
+        updatedAttributes: editValues,
+      });
+
+      const result = await executeWfsTransaction(geoserverUrl, xml, schema.workspace, geoserverAuth);
+
+      if (result.success) {
+        notification.success({
+          message: 'Feature Updated',
+          description: `Feature ${feature.fid || feature.id} updated successfully.`,
+        });
+
+        setInfoData(prev =>
+          prev.map(f => {
+            if (f.id === feature.id) {
+              const updatedRows = f.rows.map((r: any) => ({
+                ...r,
+                value: editValues[r.attribute] !== undefined ? String(editValues[r.attribute]) : r.value,
+              }));
+              return { ...f, rows: updatedRows, properties: { ...f.properties, ...editValues } };
+            }
+            return f;
+          })
+        );
+
+        let olLayer = olLayersRef.current[targetLayerId];
+        if (!olLayer && targetLayerId) {
+          const matchKey = Object.keys(olLayersRef.current).find(key =>
+            key === targetLayerId ||
+            key.endsWith(`:${targetLayerId}`) ||
+            (targetLayerId.includes(':') && key === targetLayerId.split(':').pop())
+          );
+          if (matchKey) olLayer = olLayersRef.current[matchKey];
+        }
+        if (olLayer) {
+          const src = olLayer.getSource ? olLayer.getSource() : null;
+          const targetFid = String(feature.fid || feature.id || "");
+          if (src) {
+            const isVectorSource = typeof src.getFeatures === "function";
+            if (isVectorSource && targetFid) {
+              try {
+                const allFeats = src.getFeatures();
+                const match = allFeats.find((f: any) =>
+                  String(f.getId?.() || "") === targetFid ||
+                  String(f.get?.("fid") || "") === targetFid ||
+                  String(f.get?.("id") || "") === targetFid
+                );
+                if (match) {
+                  Object.entries(editValues).forEach(([k, v]) => {
+                    match.set(k, v);
+                  });
+                }
+              } catch (editErr) {
+                console.warn("Could not update feature attributes directly:", editErr);
+              }
+            } else if (!isVectorSource && typeof (src as any).updateParams === "function") {
+              try { (src as any).updateParams({ _t: Date.now() }); } catch {}
+            }
+            if (typeof olLayer.changed === "function") {
+              olLayer.changed();
+            }
+          }
+        }
+        setEditingFeatureId(null);
+        setEditValues({});
+      } else {
+        notification.error({
+          message: 'Update Failed',
+          description: result.errorMessage || 'Failed to update feature.',
+        });
+      }
+    } catch (err: any) {
+      notification.error({
+        message: 'Error Updating Feature',
+        description: err?.message || 'An unexpected error occurred.',
+      });
+    } finally {
+      setIsWfsSaving(false);
+    }
+  };
+
+  const handleDeleteFeature = async (feature: any) => {
+    const targetLayerId = feature.layerId || selectedWfsLayerId;
+    if (!targetLayerId) {
+      notification.error({ message: 'Error', description: 'Could not identify target layer.' });
+      return;
+    }
+
+    setIsWfsSaving(true);
+    const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverAuth = user?.geoserverAuth;
+
+    try {
+      const schema = await fetchWfsLayerSchema(targetLayerId, geoserverUrl, geoserverAuth);
+
+      const xml = buildDeleteXml({
+        workspace: schema.workspace,
+        layerName: schema.layerName,
+        targetNamespace: schema.targetNamespace,
+        geomFieldName: schema.geomFieldName,
+        fid: feature.fid || feature.id,
+      });
+
+      const result = await executeWfsTransaction(geoserverUrl, xml, schema.workspace, geoserverAuth);
+
+      if (result.success) {
+        notification.success({
+          message: 'Feature Deleted',
+          description: `Feature ${feature.fid || feature.id} deleted successfully.`,
+        });
+
+        setInfoData(prev => prev.filter(f => f.id !== feature.id));
+
+        const deletedFid = String(feature.fid || feature.id || "");
+        wfsFeatureSourceRef.current?.clear();
+        highlightSourceRef.current?.clear();
+
+        // Remove feature from all active vector & tile layers on the map
+        const layersToScan = Array.from(new Set([
+          ...(mapInstance.current ? mapInstance.current.getLayers().getArray() : []),
+          ...Object.values(olLayersRef.current || {})
+        ]));
+
+        layersToScan.forEach((layer: any) => {
+          if (!layer) return;
+          const src = layer.getSource ? layer.getSource() : null;
+          if (src && typeof src.removeFeature === "function" && typeof src.getFeatures === "function") {
+            try {
+              const allFeats = src.getFeatures();
+              const matches = allFeats.filter((f: any) => {
+                const fId = String(f.getId?.() || "");
+                const fFid = String(f.get?.("fid") || "");
+                const f_id = String(f.get?.("id") || "");
+                return (
+                  fId === deletedFid ||
+                  fFid === deletedFid ||
+                  f_id === deletedFid ||
+                  (deletedFid && (fId.endsWith(`.${deletedFid}`) || deletedFid.endsWith(`.${fId}`) || fId.endsWith(deletedFid) || deletedFid.endsWith(fId)))
+                );
+              });
+              matches.forEach((m: any) => {
+                src.removeFeature(m);
+              });
+              if (matches.length > 0 && typeof layer.changed === "function") {
+                layer.changed();
+              }
+            } catch (delErr) {
+              console.warn("Could not remove feature directly from layer:", delErr);
+            }
+          } else if (src && typeof (src as any).updateParams === "function") {
+            try { (src as any).updateParams({ _t: Date.now() }); } catch {}
+          }
+        });
+      } else {
+        notification.error({
+          message: 'Delete Failed',
+          description: result.errorMessage || 'Failed to delete feature.',
+        });
+      }
+    } catch (err: any) {
+      notification.error({
+        message: 'Error Deleting Feature',
+        description: err?.message || 'An unexpected error occurred.',
+      });
+    } finally {
+      setIsWfsSaving(false);
+    }
+  };
+
   const toggleInfoActive = () => {
     if (isLeftPanelOpen && leftPanelMode === 'info') {
       setIsLeftPanelOpen(false);
       setInfoData([]);
+      setEditingFeatureId(null);
+      setIsAddFeatureActive(false);
+      setNewFeatureGeometry(null);
+      stopWfsDraw();
+      wfsFeatureSourceRef.current?.clear();
+      highlightSourceRef.current?.clear();
     } else {
       setLeftPanelMode('info');
       setIsLeftPanelOpen(true);
@@ -4247,7 +5298,7 @@ function Map2DContent() {
     const map = mapInstance.current;
 
     const handleMapClick = async (evt: any) => {
-      if (activePanel === 'measurement' || activePanel === 'annotation' || queryDrawRef.current || wpsDrawingActive) return;
+      if (activePanel === 'measurement' || activePanel === 'annotation' || queryDrawRef.current || wpsDrawingActive || wfsDrawActiveRef.current || isAddFeatureActive) return;
 
       const coord = toLonLat(evt.coordinate);
       const lon = coord[0];
@@ -4259,9 +5310,10 @@ function Map2DContent() {
         setEditLat(lat.toFixed(6));
       }
 
-      // 1. Query client-side vector features
+      // 1. Query client-side vector features (ignore highlight and drawing layers)
       const featuresList: { feature: any; layer: any }[] = [];
       map.forEachFeatureAtPixel(evt.pixel, (feature, layer) => {
+        if (layer === highlightLayerRef.current) return;
         const id = feature.getId()?.toString() || '';
         if (!id.startsWith('measure_') && !id.startsWith('annotation_')) {
           featuresList.push({ feature, layer });
@@ -4282,8 +5334,23 @@ function Map2DContent() {
         const nameAttr = props.name || props.title || props.id || feature.getId() || `Feature #${index + 1}`;
         const titleStr = layerName ? `${layerName} - ${nameAttr}` : String(nameAttr);
 
+        const geom = feature.getGeometry();
+        let geomObj: any = null;
+        if (geom) {
+          const geojsonFormat = new GeoJSON();
+          geomObj = geojsonFormat.writeGeometryObject(geom, {
+            dataProjection: 'EPSG:4326',
+            featureProjection: 'EPSG:3857',
+          });
+        }
+
         return {
           id: feature.getId()?.toString() || `f_${index}_${Date.now()}`,
+          fid: feature.getId()?.toString(),
+          layerId: layerName,
+          layerName,
+          geometry: geomObj,
+          properties: props,
           title: titleStr,
           rows: tableRows
         };
@@ -4291,7 +5358,8 @@ function Map2DContent() {
 
       // 2. Query visible WMS layers using GetFeatureInfo
       const wmsInfos: any[] = [];
-      const visibleWmsLayers = addedLayers.filter(l => l.visible);
+      const isWmsDisabled = servicesConfig.wms?.enabled === false;
+      const visibleWmsLayers = isWmsDisabled ? [] : addedLayers.filter(l => l.visible);
 
       const view = map.getView();
       const viewResolution = view.getResolution();
@@ -4311,7 +5379,8 @@ function Map2DContent() {
               projection,
               {
                 'INFO_FORMAT': 'application/json',
-                'FEATURE_COUNT': '5'
+                'FEATURE_COUNT': '5',
+                'BUFFER': '1',
               }
             );
 
@@ -4350,7 +5419,15 @@ function Map2DContent() {
                   if (contentType.includes('application/json') || contentType.includes('text/json')) {
                     const data = await res.json();
                     if (data && data.features && data.features.length > 0) {
-                      data.features.forEach((feature: any, idx: number) => {
+                      const clickCoordLonLat = transform(evt.coordinate, mapCRS, 'EPSG:4326') as [number, number];
+                      const clickCoordMap = evt.coordinate as [number, number];
+
+                      // Filter features: only accept if click coordinate is strictly inside the polygon
+                      const matchedFeatures = data.features.filter((feature: any) =>
+                        isPointInsideGeometry(clickCoordLonLat, clickCoordMap, feature.geometry)
+                      );
+
+                      matchedFeatures.forEach((feature: any, idx: number) => {
                         const props = feature.properties || {};
                         const rows = Object.entries(props).map(([key, val]: [string, any]) => ({
                           key,
@@ -4361,6 +5438,11 @@ function Map2DContent() {
                         const nameAttr = props.name || props.title || props.id || feature.id || `Feature #${idx + 1}`;
                         wmsInfos.push({
                           id: feature.id || `wms_${layer.id}_${idx}_${Date.now()}`,
+                          fid: feature.id,
+                          layerId: layer.id,
+                          layerName: layer.name,
+                          geometry: feature.geometry,
+                          properties: props,
                           title: `${layer.name} - ${nameAttr}`,
                           rows
                         });
@@ -4380,6 +5462,70 @@ function Map2DContent() {
       });
 
       await Promise.all(wmsPromises);
+
+      // 2b. Spatial fallback: If pixel-based WMS GetFeatureInfo returned nothing (e.g. transparent fill or unstyled polygons),
+      // perform a precision spatial WFS BBOX query around the click coordinate for visible vector layers
+      if (wmsInfos.length === 0 && parsedFeatures.length === 0) {
+        const clickCoordLonLat = transform(evt.coordinate, mapCRS, 'EPSG:4326') as [number, number];
+        const clickCoordMap = evt.coordinate as [number, number];
+        const lon = clickCoordLonLat[0];
+        const lat = clickCoordLonLat[1];
+        const res = viewResolution || 10;
+        // Tight buffer (~1.5 pixels) to avoid matching distant features
+        const deltaLon = Math.max(0.00001, (res * 1.5) / 111320);
+        const deltaLat = Math.max(0.00001, (res * 1.5) / 111320);
+        const minX = Math.max(-180, lon - deltaLon);
+        const maxX = Math.min(180, lon + deltaLon);
+        const minY = Math.max(-90, lat - deltaLat);
+        const maxY = Math.min(90, lat + deltaLat);
+
+        for (const layer of visibleWmsLayers) {
+          if (layer.type === 'RASTER') continue;
+          try {
+            const targetLayerId = layer.name || layer.id;
+            const spatialRes = await apiRequest(`/datasets/${encodeURIComponent(targetLayerId)}/features/?bbox=${minX},${minY},${maxX},${maxY}&page_size=5`);
+            if (spatialRes.ok) {
+              const spatialJson = await spatialRes.json();
+              if (spatialJson && Array.isArray(spatialJson.data) && spatialJson.data.length > 0) {
+                const validFeatures = spatialJson.data.filter((f: any) =>
+                  f && typeof f === 'object' && f.id &&
+                  f.attribute !== 'Layer Name' &&
+                  f.attribute !== 'Service Type' &&
+                  f.attribute !== 'WFS Status' &&
+                  !('WFS Status' in f) &&
+                  (f.geometry || Object.keys(f).some(k => k !== 'id' && k !== 'attribute' && k !== 'value')) &&
+                  isPointInsideGeometry(clickCoordLonLat, clickCoordMap, f.geometry)
+                );
+
+                validFeatures.forEach((feature: any, idx: number) => {
+                  const props = { ...feature };
+                  delete props.geometry;
+                  delete props.geometry_type;
+                  const rows = Object.entries(props).map(([key, val]: [string, any]) => ({
+                    key,
+                    attribute: key,
+                    value: typeof val === 'object' ? JSON.stringify(val) : String(val)
+                  }));
+                  const nameAttr = props.name || props.title || props.id || feature.id || `Feature #${idx + 1}`;
+                  wmsInfos.push({
+                    id: feature.id || `spatial_${layer.id}_${idx}_${Date.now()}`,
+                    fid: feature.id,
+                    layerId: layer.id,
+                    layerName: layer.name,
+                    geometry: feature.geometry,
+                    properties: props,
+                    title: `${layer.name} - ${nameAttr}`,
+                    rows
+                  });
+                });
+                if (validFeatures.length > 0) break;
+              }
+            }
+          } catch (spatialErr) {
+            console.warn(`Spatial fallback failed for layer ${layer.name}:`, spatialErr);
+          }
+        }
+      }
 
       // 3. Query visible on-the-fly raster layers (in-memory GeoTIFF buffer / ImageLayer)
       const rasterInfos: any[] = [];
@@ -4441,13 +5587,30 @@ function Map2DContent() {
       const allResults = [...parsedFeatures, ...rasterInfos, ...wmsInfos];
       setInfoData(allResults);
       if (allResults.length > 0) {
+        const firstVector = allResults.find(f => f.layerId);
+        if (firstVector && firstVector.layerId) {
+          setSelectedWfsLayerId(firstVector.layerId);
+        }
+
+        // Clear any previous selection highlight so the map doesn't produce flickering duplicate border overlays
+        if (highlightSourceRef.current) {
+          highlightSourceRef.current.clear();
+        }
+
         if (activePanel === 'gotoXY') {
           // Do not close the go to xy panel and also do not open the features details panel.
           // The results are populated in infoData so they can be viewed via the info button.
-        } else {
+        } else if (isLeftPanelOpen && leftPanelMode === 'info') {
+          // If user already opened the info panel, keep it open with the updated details
           setLeftPanelMode('info');
-          setIsLeftPanelOpen(true);
-          setActivePanel(null); // Close right floating overlays so there's no conflict
+        }
+      } else {
+        // When clicking empty space with no features, clear highlight
+        if (highlightSourceRef.current) {
+          highlightSourceRef.current.clear();
+        }
+        if (isLeftPanelOpen && leftPanelMode === 'info') {
+          setIsLeftPanelOpen(false);
         }
       }
     };
@@ -4456,7 +5619,7 @@ function Map2DContent() {
 
     const viewport = map.getViewport();
     if (viewport) {
-      viewport.style.cursor = 'help'; // Keep cursor as help so the user knows clicking queries features
+      viewport.style.cursor = 'default';
     }
 
     return () => {
@@ -4465,7 +5628,7 @@ function Map2DContent() {
         viewport.style.cursor = 'default';
       }
     };
-  }, [addedLayers, gisAccessToken, token, activePanel, wpsDrawingActive, isMobile, user?.geoserverAuth]);
+  }, [addedLayers, gisAccessToken, token, activePanel, wpsDrawingActive, isMobile, user?.geoserverAuth, isAddFeatureActive]);
 
   // Cleanup measurement, annotation, and query drawing on panel change
   useEffect(() => {
@@ -4477,6 +5640,7 @@ function Map2DContent() {
         stopDrawingAnnotation();
       }
       stopQueryDraw();
+      stopWfsDraw();
       if (activePanel !== 'wps-analysis') {
         if (wpsDrawSourceRef.current) {
           wpsDrawSourceRef.current.clear();
@@ -4486,6 +5650,10 @@ function Map2DContent() {
       if (activePanel && activePanel !== 'gotoXY') {
         setIsLeftPanelOpen(false);
         setInfoData([]);
+        setEditingFeatureId(null);
+        setIsAddFeatureActive(false);
+        setNewFeatureGeometry(null);
+        highlightSourceRef.current?.clear();
         setSelectedAnalysisWorkflow(null);
       }
     });
@@ -4505,6 +5673,93 @@ function Map2DContent() {
 
 
 
+
+  // Get visible feature IDs by querying backend with current viewport bbox for a specific layer
+  const getVisibleFeatureIdsForLayer = useCallback(async (layerId: string): Promise<string[]> => {
+    if (!mapInstance.current || !layerId) return [];
+
+    try {
+      if (layerId.startsWith('wps_result_')) {
+        const olLayer = olLayersRef.current[layerId];
+        if (olLayer && typeof olLayer.getSource === 'function') {
+          const source = olLayer.getSource();
+          const extent = mapInstance.current.getView().calculateExtent(mapInstance.current.getSize());
+          const visibleFeatures = source.getFeaturesInExtent ? source.getFeaturesInExtent(extent) : source.getFeatures();
+          return visibleFeatures.map((f: any, idx: number) => {
+            return String(f.getId?.() || f.get?.('ogc_fid') || f.get?.('fid') || f.get?.('id') || idx);
+          });
+        }
+      }
+
+      // Get the current map extent in EPSG:3857 (Web Mercator)
+      const extent = mapInstance.current.getView().calculateExtent(mapInstance.current.getSize());
+
+      // Convert extent to EPSG:4326 (lat/lon) for backend
+      const bottomLeft = toLonLat([extent[0], extent[1]]);
+      const topRight = toLonLat([extent[2], extent[3]]);
+
+      // Build bbox parameter: minLon,minLat,maxLon,maxLat
+      const bbox = `${bottomLeft[0]},${bottomLeft[1]},${topRight[0]},${topRight[1]}`;
+
+      // Query backend for features within this bounding box (PostGIS does spatial filtering)
+      const response = await apiRequest(
+        `/datasets/${layerId}/features/?bbox=${bbox}&page_size=10000`
+      );
+
+      if (!response.ok) {
+        // Fallback: extract visible features from OpenLayers layer if WFS server query fails/disabled
+        const olLayer = olLayersRef.current[layerId];
+        if (olLayer && typeof olLayer.getSource === 'function') {
+          const source = olLayer.getSource();
+          const visibleFeatures = source.getFeaturesInExtent ? source.getFeaturesInExtent(extent) : (source.getFeatures ? source.getFeatures() : []);
+          return visibleFeatures.map((f: any, idx: number) => {
+            return String(f.getId?.() || f.get?.('ogc_fid') || f.get?.('fid') || f.get?.('id') || idx);
+          });
+        }
+        console.error('Failed to fetch features in viewport extent');
+        return [];
+      }
+
+      const data = await response.json();
+      const features = data.data || [];
+
+      // Extract feature IDs
+      const featureIds = features.map((feature: any) => {
+        return String(feature.ogc_fid || feature.fid || feature.id);
+      }).filter((id: string) => id);
+
+      return Array.from(new Set<string>(featureIds));
+    } catch (err) {
+      console.error('Error getting visible features from viewport extent:', err);
+      return [];
+    }
+  }, []);
+
+  // Get visible feature IDs for attribute table active dataset
+  const getVisibleFeatureIds = useCallback(async (): Promise<string[]> => {
+    if (!attributeTableDataset) return [];
+    return getVisibleFeatureIdsForLayer(attributeTableDataset.id);
+  }, [attributeTableDataset, getVisibleFeatureIdsForLayer]);
+
+  // Get current viewport geographic bounding box and pixel dimensions
+  const getViewportBboxAndSize = useCallback((): { bbox: [number, number, number, number]; size: [number, number] } | null => {
+    if (!mapInstance.current) return null;
+    try {
+      const size = mapInstance.current.getSize() || [1920, 1080];
+      const extent = mapInstance.current.getView().calculateExtent(size);
+      const bottomLeft = toLonLat([extent[0], extent[1]]);
+      const topRight = toLonLat([extent[2], extent[3]]);
+      return {
+        bbox: [bottomLeft[0], bottomLeft[1], topRight[0], topRight[1]],
+        size: [size[0], size[1]]
+      };
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Access specific OpenLayers layer instance by ID
+  const getOlLayer = useCallback((layerId: string) => olLayersRef.current[layerId], []);
 
   const scaleItems = [
     { key: '2500', label: '1 : 2,500', onClick: () => setScale(2500) },
@@ -4572,46 +5827,6 @@ function Map2DContent() {
         description: err.message || 'Could not zoom to selected features',
         placement: 'topRight',
       });
-    }
-  };
-
-  // Get visible feature IDs by querying backend with current viewport bbox
-  const getVisibleFeatureIds = async (): Promise<string[]> => {
-    if (!mapInstance.current || !attributeTableDataset) return [];
-
-    try {
-      // Get the current map extent in EPSG:3857 (Web Mercator)
-      const extent = mapInstance.current.getView().calculateExtent(mapInstance.current.getSize());
-
-      // Convert extent to EPSG:4326 (lat/lon) for backend
-      const bottomLeft = toLonLat([extent[0], extent[1]]);
-      const topRight = toLonLat([extent[2], extent[3]]);
-
-      // Build bbox parameter: minLon,minLat,maxLon,maxLat
-      const bbox = `${bottomLeft[0]},${bottomLeft[1]},${topRight[0]},${topRight[1]}`;
-
-      // Query backend for features within this bounding box (PostGIS does spatial filtering)
-      const response = await apiRequest(
-        `/datasets/${attributeTableDataset.id}/features/?bbox=${bbox}&page_size=10000`
-      );
-
-      if (!response.ok) {
-        console.error('Failed to fetch features in viewport extent');
-        return [];
-      }
-
-      const data = await response.json();
-      const features = data.data || [];
-
-      // Extract feature IDs
-      const featureIds = features.map((feature: any) => {
-        return String(feature.ogc_fid || feature.fid || feature.id);
-      }).filter((id: string) => id);
-
-      return Array.from(new Set<string>(featureIds));
-    } catch (err) {
-      console.error('Error getting visible features from viewport extent:', err);
-      return [];
     }
   };
 
@@ -4884,11 +6099,13 @@ function Map2DContent() {
         <div className="flex items-center gap-2 md:gap-3.5 min-w-0">
           <div
             onClick={() => {
-              if (!(isPublicMap && !token)) {
+              if (isQuick) {
+                router.push('/login');
+              } else if (!(isPublicMap && !token)) {
                 router.push('/overview');
               }
             }}
-            className={`flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 ${!(isPublicMap && !token) ? 'cursor-pointer hover:opacity-85' : 'cursor-default'} transition-opacity`}
+            className={`flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 ${isQuick || !(isPublicMap && !token) ? 'cursor-pointer hover:opacity-85' : 'cursor-default'} transition-opacity`}
           >
             {/* Primary Logo (VistaBridge) */}
             {siteConfig.logo && (
@@ -4915,9 +6132,9 @@ function Map2DContent() {
           <Divider type="vertical" className="h-5 sm:h-6 bg-gray-200 !m-0 shrink-0" />
           <div className="flex items-center gap-1 md:gap-2 min-w-0">
             <Title level={5} className="!m-0 truncate font-extrabold text-gray-800 leading-tight" style={isMobile ? { fontSize: '13px', margin: 0 } : { margin: 0 }}>
-              {mapDetail?.name || 'Untitled 2D Map'}
+              {isQuick ? 'Quick Map' : (mapDetail?.name || 'Untitled 2D Map')}
             </Title>
-            {!(isPublicMap && !token) && !isMobile && (
+            {!(isPublicMap && !token) && !isQuick && !isMobile && (
               <Tooltip title="Edit Map Details">
                 <Button
                   type="text"
@@ -4938,7 +6155,14 @@ function Map2DContent() {
 
         {/* Right Section: Action Buttons */}
         <div className="flex items-center gap-1.5 md:gap-2 shrink-0">
-          {mapDetail?.share && !isMobile && (
+          {isQuick ? (
+            <Tag
+              color="purple"
+              className="text-[10px] font-bold uppercase tracking-wider rounded px-2.5 py-0.5 border-none mr-1.5"
+            >
+              Quick Map
+            </Tag>
+          ) : mapDetail?.share && !isMobile && (
             <Tag
               color={
                 mapDetail.share === 'PUBLIC' ? 'green' :
@@ -4949,7 +6173,7 @@ function Map2DContent() {
               {mapDetail.share}
             </Tag>
           )}
-          {!(isPublicMap && !token) && (
+          {!(isPublicMap && !token) && !isQuick && (
             <Tooltip title="Share Map">
               <Button
                 type="text"
@@ -4970,7 +6194,7 @@ function Map2DContent() {
               />
             </Tooltip>
           )}
-          {!(isPublicMap && !token) && (
+          {!(isPublicMap && !token) && !isQuick && (
             <Tooltip title="Save Map">
               <Button
                 type="text"
@@ -4981,9 +6205,23 @@ function Map2DContent() {
               />
             </Tooltip>
           )}
-          <PrintComponent mapInstance={mapInstance.current} addedLayers={addedLayers} />
+          <PrintComponent
+            mapInstance={mapInstance.current}
+            addedLayers={addedLayers}
+            mapId={mapDetail?.id || identifier || mapId}
+          />
           {!isMobile && <Divider type="vertical" className="h-6 bg-gray-100 !m-0" />}
-          {!(isPublicMap && !token) && (
+          {isQuick ? (
+            <Tooltip title="Exit to Login">
+              <Button
+                type="text"
+                icon={<ArrowLeft size={isMobile ? 16 : 18} className="text-gray-500 hover:text-primary transition-colors" />}
+                onClick={() => router.push('/login')}
+                className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
+                style={{ width: isMobile ? 32 : 40, height: isMobile ? 32 : 40 }}
+              />
+            </Tooltip>
+          ) : !(isPublicMap && !token) && (
             <Tooltip title="Back to Manage Maps">
               <Button
                 type="text"
@@ -5068,9 +6306,8 @@ function Map2DContent() {
                     style={{ transform: `rotate(${rotationDeg}deg)` }}
                   />
                 }
-                className={`flex items-center justify-center hover:bg-gray-50 rounded-xl relative ${
-                  rotationDeg !== 0 ? 'bg-blue-50/60' : ''
-                }`}
+                className={`flex items-center justify-center hover:bg-gray-50 rounded-xl relative ${rotationDeg !== 0 ? 'bg-blue-50/60' : ''
+                  }`}
                 style={{ width: 42, height: 42 }}
               />
               {rotationDeg !== 0 && (
@@ -5204,7 +6441,7 @@ function Map2DContent() {
 
         {/* Left panel (for Info Popup results / Vector Styling) */}
         {isLeftPanelOpen && (
-          <div className="absolute md:relative left-0 bottom-0 md:top-0 h-[50vh] md:h-full w-full md:w-[20%] md:min-w-[280px] bg-white border-t md:border-t-0 md:border-r border-gray-150 shadow-2xl md:shadow-lg z-40 flex flex-col rounded-t-2xl md:rounded-t-none animate-slide-up md:animate-slide-left transition-all duration-300" style={{ display: isMobile && isDrawing ? 'none' : 'flex' }}>
+          <div className="absolute md:relative left-0 bottom-0 md:top-0 h-[50vh] md:h-full w-full md:w-[340px] md:min-w-[340px] md:max-w-[400px] bg-white border-t md:border-t-0 md:border-r border-gray-150 shadow-2xl md:shadow-lg z-40 flex flex-col rounded-t-2xl md:rounded-t-none animate-slide-up md:animate-slide-left transition-all duration-300" style={{ display: isMobile && isDrawing ? 'none' : 'flex' }}>
             {isMobile && (
               <div className="w-12 h-1 bg-gray-200 rounded-full mx-auto my-2.5 shrink-0" />
             )}
@@ -5226,52 +6463,320 @@ function Map2DContent() {
                   setIsLeftPanelOpen(false);
                   setInfoData([]);
                   setSelectedStyleLayer(null);
+                  setEditingFeatureId(null);
+                  setIsAddFeatureActive(false);
+                  setNewFeatureGeometry(null);
+                  stopWfsDraw();
+                  highlightSourceRef.current?.clear();
                 }}
                 className="flex items-center justify-center rounded-full text-gray-400 hover:text-gray-600"
               />
             </div>
 
             {leftPanelMode === 'info' ? (
-              <div className="flex-grow overflow-y-auto p-4 flex flex-col gap-3">
+              <div className="flex-grow overflow-y-auto p-4 flex flex-col gap-4">
+                {/* Layer Selection and Add Feature Toolbar */}
+                <div className="flex flex-col gap-2.5 bg-gray-50/90 p-3 rounded-xl border border-gray-200">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] uppercase font-bold text-gray-500 tracking-wider">
+                      Target Vector Layer
+                    </span>
+                    {addedLayers.filter(l => l.type === 'VECTOR').length > 0 && (
+                      <span className="text-[10px] text-gray-400 font-medium">
+                        {addedLayers.filter(l => l.type === 'VECTOR').length} vector layer{addedLayers.filter(l => l.type === 'VECTOR').length > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
+                  {(() => {
+                    const activeVectorLayers = addedLayers.filter(l => l.type === 'VECTOR');
+                    const hasSelected = activeVectorLayers.some(l => l.id === selectedWfsLayerId || l.name === selectedWfsLayerId);
+                    const currentVal = hasSelected ? selectedWfsLayerId : (activeVectorLayers[0]?.id || undefined);
+
+                    return (
+                      <>
+                        <Select
+                          size="middle"
+                          value={currentVal}
+                          disabled={activeVectorLayers.length === 0}
+                          onChange={(val) => {
+                            setSelectedWfsLayerId(val);
+                            setIsAddFeatureActive(false);
+                            stopWfsDraw();
+                            highlightSourceRef.current?.clear();
+                          }}
+                          className="w-full text-xs font-semibold"
+                          placeholder={activeVectorLayers.length === 0 ? "No vector layers on map" : "Select vector layer"}
+                          popupMatchSelectWidth={false}
+                          options={activeVectorLayers.map(l => ({ label: l.name, value: l.id }))}
+                        />
+                        <Button
+                          type={isAddFeatureActive ? 'default' : 'primary'}
+                          disabled={activeVectorLayers.length === 0}
+                          icon={isAddFeatureActive ? <X size={14} /> : <Plus size={14} />}
+                          onClick={() => {
+                            if (isAddFeatureActive) {
+                              setIsAddFeatureActive(false);
+                              setNewFeatureGeometry(null);
+                              stopWfsDraw();
+                              wfsFeatureSourceRef.current?.clear();
+                              highlightSourceRef.current?.clear();
+                            } else {
+                              const targetId = currentVal;
+                              if (!targetId) {
+                                notification.warning({
+                                  message: 'No Vector Layer',
+                                  description: 'Please add a vector layer to the map first before inserting features.',
+                                });
+                                return;
+                              }
+                              setSelectedWfsLayerId(targetId);
+                              startWfsDraw(targetId);
+                            }
+                          }}
+                          className={`w-full text-xs font-medium flex items-center justify-center gap-1.5 h-8 ${isAddFeatureActive ? 'border-red-300 text-red-600 hover:text-red-700 hover:border-red-400' : ''}`}
+                        >
+                          {isAddFeatureActive ? 'Cancel Adding Feature' : 'Add Feature'}
+                        </Button>
+                        {activeVectorLayers.length === 0 && (
+                          <span className="text-[11px] text-gray-400 italic">
+                            Only vector layers saved on this map can be edited.
+                          </span>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+
+                {/* Add Feature Card (Form with identical ATTRIBUTE | VALUE structure) */}
+                {isAddFeatureActive && (
+                  <div className="flex flex-col gap-2 p-3 bg-blue-50/40 border border-blue-200 rounded-xl animate-in fade-in duration-200">
+                    <div className="text-xs font-extrabold text-blue-900 border-b border-blue-200 pb-1.5 flex items-center justify-between">
+                      <span className="flex items-center gap-1.5 truncate">
+                        <Plus size={14} className="text-blue-600 shrink-0" />
+                        <span className="truncate">New Feature - {selectedWfsLayerId}</span>
+                      </span>
+                      <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 shrink-0">
+                        {newFeatureGeometry ? '✓ Geometry Drawn' : 'Click Map to Draw'}
+                      </span>
+                    </div>
+
+                    {!newFeatureGeometry ? (
+                      <div className="text-[11px] text-blue-700 bg-blue-100/60 p-2.5 rounded-lg flex items-center gap-2">
+                        <MapPin size={15} className="shrink-0 text-blue-600 animate-bounce" />
+                        <span>Click on the map to place or draw the <strong>{wfsLayerSchema?.geomType || 'geometry'}</strong>.</span>
+                      </div>
+                    ) : (
+                      <div className="text-[10px] text-emerald-700 bg-emerald-50 border border-emerald-200 p-2 rounded-lg flex items-center justify-between">
+                        <span className="flex items-center gap-1.5">
+                          <Check size={13} className="text-emerald-600" />
+                          <span>Geometry: <strong>{newFeatureGeometry.type}</strong> captured</span>
+                        </span>
+                        <Button
+                          type="link"
+                          size="small"
+                          onClick={() => {
+                            setNewFeatureGeometry(null);
+                            wfsFeatureSourceRef.current?.clear();
+                            highlightSourceRef.current?.clear();
+                            if (selectedWfsLayerId) startWfsDraw(selectedWfsLayerId);
+                          }}
+                          className="text-[10px] p-0 h-auto text-emerald-800 underline"
+                        >
+                          Redraw
+                        </Button>
+                      </div>
+                    )}
+
+                    {wfsLayerSchema && wfsLayerSchema.attributes.length > 0 ? (
+                      <div className="border border-gray-150 rounded-lg overflow-hidden bg-white text-[11px]">
+                        <table className="w-full border-collapse">
+                          <thead>
+                            <tr className="bg-gray-100/50 border-b border-gray-150">
+                              <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px] w-2/5">Attribute</th>
+                              <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px]">Value</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {wfsLayerSchema.attributes.map((attr, aIdx) => (
+                              <tr key={attr.name} className={aIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50/20'}>
+                                <td className="px-2.5 py-1.5 border-b border-gray-100 font-semibold text-gray-700 break-words max-w-[85px]">
+                                  {attr.name}
+                                </td>
+                                <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600">
+                                  <Input
+                                    size="small"
+                                    placeholder={`Enter ${attr.name}`}
+                                    value={newFeatureValues[attr.name] ?? ''}
+                                    onChange={(e) =>
+                                      setNewFeatureValues(prev => ({ ...prev, [attr.name]: e.target.value }))
+                                    }
+                                    className="text-[11px] h-7"
+                                  />
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="text-[10px] text-gray-400 italic py-1">Loading schema attributes...</div>
+                    )}
+
+                    <div className="flex items-center justify-end gap-2 pt-1 border-t border-blue-200">
+                      <Button
+                        size="small"
+                        onClick={() => {
+                          setIsAddFeatureActive(false);
+                          setNewFeatureGeometry(null);
+                          stopWfsDraw();
+                          wfsFeatureSourceRef.current?.clear();
+                          highlightSourceRef.current?.clear();
+                        }}
+                        className="text-xs h-7"
+                      >
+                        Cancel
+                      </Button>
+                      <Button
+                        type="primary"
+                        size="small"
+                        disabled={!newFeatureGeometry}
+                        loading={isWfsSaving}
+                        onClick={handleCreateFeature}
+                        className="text-xs h-7 bg-primary"
+                      >
+                        Create Feature
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Identified Existing Features List */}
                 {infoData.length > 0 ? (
-                  <div className="flex flex-col gap-5">
+                  <div className="flex flex-col gap-4">
                     <div className="text-[10px] uppercase font-bold text-gray-400">
                       Found {infoData.length} Feature{infoData.length > 1 ? 's' : ''}
                     </div>
-                    {infoData.map((feature) => (
-                      <div key={feature.id} className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-150 rounded-xl">
-                        <div className="text-xs font-extrabold text-gray-700 border-b border-gray-200 pb-1.5 flex items-center justify-between">
-                          <span className="truncate">{feature.title}</span>
-                        </div>
-                        {feature.rows.length > 0 ? (
-                          <div className="border border-gray-150 rounded-lg overflow-hidden bg-white text-[11px]">
-                            <table className="w-full border-collapse">
-                              <thead>
-                                <tr className="bg-gray-100/50 border-b border-gray-150">
-                                  <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px] w-2/5">Attribute</th>
-                                  <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px]">Value</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {feature.rows.map((row: any, rIdx: number) => (
-                                  <tr key={row.key} className={rIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50/20'}>
-                                    <td className="px-2.5 py-1.5 border-b border-gray-100 font-semibold text-gray-700 break-words max-w-[85px]">{row.attribute}</td>
-                                    <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600 font-mono text-[10px] break-all">{row.value}</td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
+                    {infoData.map((feature) => {
+                      const isEditing = editingFeatureId === feature.id;
+                      const canEdit = !!feature.fid;
+
+                      return (
+                        <div key={feature.id} className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-150 rounded-xl">
+                          <div className="text-xs font-extrabold text-gray-700 border-b border-gray-200 pb-1.5 flex items-center justify-between">
+                            <span className="truncate flex-1 pr-2" title={feature.title}>{feature.title}</span>
+                            {canEdit && !isEditing && (
+                              <div className="flex items-center gap-1 shrink-0">
+                                <Tooltip title="Edit Attributes">
+                                  <Button
+                                    type="text"
+                                    size="small"
+                                    icon={<Edit2 size={13} className="text-gray-500 hover:text-primary" />}
+                                    onClick={() => {
+                                      setEditingFeatureId(feature.id);
+                                      const initialVals: Record<string, any> = {};
+                                      feature.rows.forEach((r: any) => {
+                                        initialVals[r.attribute] = r.value;
+                                      });
+                                      setEditValues(initialVals);
+                                    }}
+                                    className="w-6 h-6 flex items-center justify-center p-0 rounded-lg hover:bg-gray-200"
+                                  />
+                                </Tooltip>
+                                <Tooltip title="Delete Feature">
+                                  <Popconfirm
+                                    title="Delete Feature"
+                                    description={`Are you sure you want to delete ${feature.fid || 'this feature'} from GeoServer?`}
+                                    onConfirm={() => handleDeleteFeature(feature)}
+                                    okText="Delete"
+                                    cancelText="Cancel"
+                                    okButtonProps={{ danger: true }}
+                                  >
+                                    <Button
+                                      type="text"
+                                      size="small"
+                                      icon={<Trash2 size={13} className="text-gray-400 hover:text-red-500" />}
+                                      className="w-6 h-6 flex items-center justify-center p-0 rounded-lg hover:bg-red-50"
+                                    />
+                                  </Popconfirm>
+                                </Tooltip>
+                              </div>
+                            )}
+                            {isEditing && (
+                              <span className="text-[10px] text-amber-700 bg-amber-100/70 border border-amber-300 px-1.5 py-0.5 rounded font-medium">
+                                Editing
+                              </span>
+                            )}
                           </div>
-                        ) : (
-                          <div className="text-[10px] text-gray-400 italic">No attributes.</div>
-                        )}
-                      </div>
-                    ))}
+
+                          {feature.rows.length > 0 ? (
+                            <div className="border border-gray-150 rounded-lg overflow-hidden bg-white text-[11px]">
+                              <table className="w-full border-collapse">
+                                <thead>
+                                  <tr className="bg-gray-100/50 border-b border-gray-150">
+                                    <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px] w-5/12">Attribute</th>
+                                    <th className="px-2.5 py-1.5 text-left font-bold text-gray-500 uppercase tracking-wider text-[10px]">Value</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {feature.rows.map((row: any, rIdx: number) => (
+                                    <tr key={row.key} className={rIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50/20'}>
+                                      <td className="px-2.5 py-1.5 border-b border-gray-100 font-semibold text-gray-700 break-words w-5/12">{row.attribute}</td>
+                                      <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600 font-mono text-[10px]">
+                                        {isEditing ? (
+                                          <Input
+                                            size="small"
+                                            value={editValues[row.attribute] ?? row.value}
+                                            onChange={(e) =>
+                                              setEditValues(prev => ({ ...prev, [row.attribute]: e.target.value }))
+                                            }
+                                            className="text-[10px] h-6 px-1.5"
+                                          />
+                                        ) : (
+                                          <span className="break-words">{row.value}</span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ) : (
+                            <div className="text-[10px] text-gray-400 italic">No attributes.</div>
+                          )}
+
+                          {isEditing && (
+                            <div className="flex items-center justify-end gap-2 pt-1 border-t border-gray-200">
+                              <Button
+                                size="small"
+                                onClick={() => {
+                                  setEditingFeatureId(null);
+                                  setEditValues({});
+                                }}
+                                className="text-xs h-7"
+                              >
+                                Cancel
+                              </Button>
+                              <Button
+                                type="primary"
+                                size="small"
+                                loading={isWfsSaving}
+                                onClick={() => handleSaveUpdateFeature(feature)}
+                                className="text-xs h-7 bg-primary"
+                              >
+                                Save Changes
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
                   </div>
                 ) : (
-                  <div className="text-center py-8 text-gray-400 text-xs italic">
-                    No feature selected. Click on a vector or raster layer on the map.
-                  </div>
+                  !isAddFeatureActive && (
+                    <div className="text-center py-8 text-gray-400 text-xs italic">
+                      No feature selected. Click on a vector layer on the map or click &quot;Add Feature&quot;.
+                    </div>
+                  )
                 )}
               </div>
             ) : (
@@ -5485,9 +6990,8 @@ function Map2DContent() {
                         style={{ transform: `rotate(${rotationDeg}deg)` }}
                       />
                     }
-                    className={`bg-white/95 border shadow-md hover:bg-white flex items-center justify-center ${
-                      rotationDeg !== 0 ? 'border-primary/50 bg-blue-50/50' : 'border-gray-200/80'
-                    }`}
+                    className={`bg-white/95 border shadow-md hover:bg-white flex items-center justify-center ${rotationDeg !== 0 ? 'border-primary/50 bg-blue-50/50' : 'border-gray-200/80'
+                      }`}
                     style={{ width: 36, height: 36 }}
                   />
                   {rotationDeg !== 0 && (
@@ -5757,6 +7261,9 @@ function Map2DContent() {
                     notification={notification}
                     modal={modal}
                     token={token}
+                    getVisibleFeatureIdsForLayer={getVisibleFeatureIdsForLayer}
+                    getViewportBboxAndSize={getViewportBboxAndSize}
+                    getOlLayer={getOlLayer}
                   />
                 )}
 
@@ -6600,9 +8107,19 @@ function Map2DContent() {
         centered
       >
         <div className="py-2 flex flex-col gap-4" style={{ touchAction: 'pan-y' }}>
-          <Text type="secondary" className="text-xs">
-            Select a GIS dataset from your workspace data store to add it as a visualization layer on the map.
-          </Text>
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <Text type="secondary" className="text-xs">
+              Select a GIS dataset from your workspace data store to add it as a visualization layer on the map.
+            </Text>
+          </div>
+          {activeCatalogService !== 'WMS' && (
+            <div className="bg-amber-50 border border-amber-200/80 rounded-lg p-2.5 text-xs text-amber-800 flex items-center gap-2">
+              <Info size={14} className="text-amber-600 shrink-0" />
+              <span>
+                GeoServer WMS service is disabled. Layers were discovered via <strong>{activeCatalogService === 'HYBRID' ? 'WFS & WCS' : activeCatalogService}</strong> and will render directly via vector features / WCS coverage.
+              </span>
+            </div>
+          )}
           <div className="flex flex-col sm:flex-row gap-2">
             <Input
               placeholder="Search dataset name or ID..."
@@ -6701,7 +8218,16 @@ function Map2DContent() {
                       size="small"
                       type={isAlreadyAdded ? 'default' : 'primary'}
                       disabled={isAlreadyAdded}
-                      onClick={() => addLayerToMap(record)}
+                      onClick={() => {
+                        setProtocolModalDataset(record);
+                        const isVector = record.data_type === 'VECTOR';
+                        const isRaster = record.data_type === 'RASTER';
+                        const defaultProto: 'WMS' | 'WFS' | 'WMTS' | 'WCS' =
+                          servicesConfig.wms?.enabled !== false ? 'WMS' :
+                          (isVector && servicesConfig.wfs?.enabled !== false ? 'WFS' :
+                          (isRaster && servicesConfig.wcs?.enabled !== false ? 'WCS' : 'WMTS'));
+                        setChosenProtocol(defaultProto);
+                      }}
                       className="text-[11px] h-7 rounded-lg font-bold"
                     >
                       {isAlreadyAdded ? 'Added' : 'Add'}
@@ -6712,6 +8238,166 @@ function Map2DContent() {
             ]}
           />
         </div>
+      </Modal>
+
+      {/* Layer Service Selection Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2 text-sm font-bold text-gray-800">
+            <Layers size={16} className="text-primary" />
+            <span>Select Service Protocol</span>
+          </div>
+        }
+        open={!!protocolModalDataset}
+        onCancel={() => setProtocolModalDataset(null)}
+        footer={
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <Button onClick={() => setProtocolModalDataset(null)} size="small" className="rounded-lg text-xs">
+              Cancel
+            </Button>
+            <Button
+              type="primary"
+              size="small"
+              onClick={() => {
+                if (protocolModalDataset) {
+                  addLayerToMap(protocolModalDataset, chosenProtocol);
+                  setProtocolModalDataset(null);
+                }
+              }}
+              className="rounded-lg text-xs font-semibold bg-primary h-8 px-4"
+            >
+              Add via {chosenProtocol}
+            </Button>
+          </div>
+        }
+        width={420}
+        centered
+        destroyOnClose
+      >
+        {protocolModalDataset && (() => {
+          const isVector = protocolModalDataset.data_type === 'VECTOR';
+          const isRaster = protocolModalDataset.data_type === 'RASTER';
+
+          const callableServices: Array<{
+            key: 'WMS' | 'WFS' | 'WMTS' | 'WCS';
+            name: string;
+            fullName: string;
+            badge?: string;
+            badgeColor?: string;
+            desc: string;
+            icon: React.ReactNode;
+          }> = [];
+
+          // WMS (Vector, Raster, Group)
+          if (servicesConfig.wms?.enabled !== false) {
+            callableServices.push({
+              key: 'WMS',
+              name: 'WMS',
+              fullName: 'Web Map Service',
+              badge: 'Recommended',
+              badgeColor: 'text-blue-600 bg-blue-50 border-blue-200',
+              desc: 'Dynamic server-rendered tiles with server styles',
+              icon: <Globe size={16} />,
+            });
+          }
+
+          // WFS (Vector only)
+          if (isVector && servicesConfig.wfs?.enabled !== false) {
+            callableServices.push({
+              key: 'WFS',
+              name: 'WFS',
+              fullName: 'Web Feature Service',
+              badge: 'Features',
+              badgeColor: 'text-purple-600 bg-purple-50 border-purple-200',
+              desc: 'Raw vector geometries & attributes for interaction',
+              icon: <FileJson size={16} />,
+            });
+          }
+
+          // WCS (Raster only)
+          if (isRaster && servicesConfig.wcs?.enabled !== false) {
+            callableServices.push({
+              key: 'WCS',
+              name: 'WCS',
+              fullName: 'Web Coverage Service',
+              badge: 'Coverage',
+              badgeColor: 'text-amber-600 bg-amber-50 border-amber-200',
+              desc: 'Raw multi-band scientific raster coverage data',
+              icon: <Database size={16} />,
+            });
+          }
+
+          // WMTS (Vector, Raster, Group)
+          if (servicesConfig.wmts?.enabled !== false) {
+            callableServices.push({
+              key: 'WMTS',
+              name: 'WMTS',
+              fullName: 'Web Map Tile Service',
+              badge: 'Cached',
+              badgeColor: 'text-emerald-600 bg-emerald-50 border-emerald-200',
+              desc: 'Pre-rendered tile pyramid cache for rapid panning',
+              icon: <Layers size={16} />,
+            });
+          }
+
+          return (
+            <div className="py-1 flex flex-col gap-3">
+              <div className="flex items-center justify-between p-2.5 bg-gray-50 rounded-lg border border-gray-150">
+                <span className="text-xs font-semibold text-gray-800 truncate">{protocolModalDataset.name}</span>
+                <Tag
+                  color={
+                    protocolModalDataset.data_type === 'VECTOR' ? 'blue' :
+                    protocolModalDataset.data_type === 'RASTER' ? 'green' : 'gold'
+                  }
+                  className="text-[10px] font-semibold m-0 border-none px-2 py-0.5"
+                >
+                  {protocolModalDataset.data_type === 'GROUP' ? 'Group' : protocolModalDataset.data_type === 'VECTOR' ? 'Vector' : 'Raster'}
+                </Tag>
+              </div>
+
+              <p className="text-xs text-gray-500 m-0">
+                Choose the service to call for this layer:
+              </p>
+
+              <div className="flex flex-col gap-2">
+                {callableServices.map((svc) => {
+                  const isSelected = chosenProtocol === svc.key;
+                  return (
+                    <div
+                      key={svc.key}
+                      onClick={() => setChosenProtocol(svc.key)}
+                      className={`p-2.5 rounded-lg border cursor-pointer transition-all flex items-center gap-3 ${
+                        isSelected
+                          ? 'border-blue-500 bg-blue-50/50 ring-1 ring-blue-400/30'
+                          : 'border-gray-200 hover:border-gray-300 bg-white'
+                      }`}
+                    >
+                      <div className={`p-2 rounded-lg shrink-0 ${isSelected ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}>
+                        {svc.icon}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs font-bold text-gray-800">{svc.name}</span>
+                            <span className="text-[11px] text-gray-500 font-medium">({svc.fullName})</span>
+                          </div>
+                          {svc.badge && (
+                            <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${svc.badgeColor}`}>
+                              {svc.badge}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-gray-500 m-0 truncate">
+                          {svc.desc}
+                        </p>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
       </Modal>
 
       <Modal
@@ -6739,7 +8425,7 @@ function Map2DContent() {
             <div className="flex gap-2">
               <Input
                 readOnly
-                value={`${typeof window !== 'undefined' ? window.location.protocol : 'http:'}//${typeof window !== 'undefined' ? window.location.host : 'localhost'}${typeof window !== 'undefined' ? window.location.pathname : '/map/2d'}?id=${mapId}`}
+                value={`${typeof window !== 'undefined' ? window.location.protocol : 'http:'}//${typeof window !== 'undefined' ? window.location.host : 'localhost'}/map/${mapDetail?.slug || mapId}`}
                 className="bg-gray-50 border-gray-200 rounded-xl"
               />
               <Button
@@ -6759,20 +8445,23 @@ function Map2DContent() {
   );
 }
 
-function Map2DWrapper() {
+function Map2DWrapper({ isQuickMap }: { isQuickMap?: boolean }) {
+  const pathname = usePathname();
   const searchParams = useSearchParams();
-  const mapId = searchParams.get('id');
-  return <Map2DContent key={mapId || 'new'} />;
+  const params = useParams<{ slug?: string }>();
+  const isQuick = isQuickMap || pathname === '/quick-map';
+  const mapId = isQuick ? 'quick-map' : (params?.slug || searchParams.get('id'));
+  return <Map2DContent key={isQuick ? 'quick-map' : (mapId || 'new')} identifier={mapId || undefined} isQuickMap={isQuick} />;
 }
 
-export default function Map2DPage() {
+export default function Map2DPage({ isQuickMap = false }: { isQuickMap?: boolean }) {
   return (
     <Suspense fallback={
       <div className="flex items-center justify-center min-h-screen bg-gray-50">
         <Spin size="large" description="Loading 2D Map Workspace..." />
       </div>
     }>
-      <Map2DWrapper />
+      <Map2DWrapper isQuickMap={isQuickMap} />
     </Suspense>
   );
 }

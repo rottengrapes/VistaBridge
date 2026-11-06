@@ -35,11 +35,90 @@ echo [OK] Dependencies installed successfully!
 echo.
 
 :DEPS_FOUND
-set "FINAL_GS=http://localhost:8080/geoserver"
+REM -----------------------------------------------------------------------
+REM  Check Existing Database & Configuration
+REM -----------------------------------------------------------------------
+set "ACTIVE_DB=data\geovista.db"
+set "SKIP_CONFIG=0"
+set "DEFAULT_GS=http://localhost:8080/geoserver"
+set "DEFAULT_PORT=3000"
+
+if exist "%ACTIVE_DB%" (
+    REM Read existing settings from SQLite
+    set "EXISTING_GS="
+    for /f "usebackq delims=" %%V in (`node -e "const { createClient } = require('@libsql/client'); async function get() { try { const c = createClient({ url: 'file:data/geovista.db' }); const r = await c.execute({ sql: 'SELECT value FROM app_settings WHERE key = ?', args: ['geoserver_url'] }); console.log(r.rows.length ? r.rows[0].value : 'http://localhost:8080/geoserver'); } catch(e) { console.log('http://localhost:8080/geoserver'); } } get();" 2^>nul`) do (
+        set "EXISTING_GS=%%V"
+    )
+    if "!EXISTING_GS!"=="" set "EXISTING_GS=http://localhost:8080/geoserver"
+
+    set "EXISTING_PORT="
+    for /f "usebackq delims=" %%V in (`node -e "const { createClient } = require('@libsql/client'); async function get() { try { const c = createClient({ url: 'file:data/geovista.db' }); const r = await c.execute({ sql: 'SELECT value FROM app_settings WHERE key = ?', args: ['app_port'] }); console.log(r.rows.length ? r.rows[0].value : '3000'); } catch(e) { console.log('3000'); } } get();" 2^>nul`) do (
+        set "EXISTING_PORT=%%V"
+    )
+    if "!EXISTING_PORT!"=="" set "EXISTING_PORT=3000"
+
+    echo [OK] Existing database detected: %ACTIVE_DB%
+    echo ----------------------------------------------------------------------
+    echo   Current GeoServer: !EXISTING_GS!
+    echo   Current Port:      !EXISTING_PORT!
+    echo ----------------------------------------------------------------------
+    echo.
+    echo What would you like to do?
+    echo   [1] Keep existing settings ^& continue ^(Default - press ENTER^)
+    echo   [2] Change GeoServer URL or Port
+    echo   [3] Reset database ^(Start with a fresh, empty database^)
+    echo.
+    set "SETUP_MODE="
+    set /p "SETUP_MODE=Your choice [1/2/3, default 1]: "
+    if "!SETUP_MODE!"=="" set "SETUP_MODE=1"
+
+    if "!SETUP_MODE!"=="1" (
+        set "FINAL_GS=!EXISTING_GS!"
+        set "APP_PORT=!EXISTING_PORT!"
+        set "SKIP_CONFIG=1"
+        goto AFTER_CONFIG
+    )
+    if "!SETUP_MODE!"=="2" (
+        set "DEFAULT_GS=!EXISTING_GS!"
+        set "DEFAULT_PORT=!EXISTING_PORT!"
+        set "SKIP_CONFIG=0"
+        goto PROMPT_CONFIG
+    )
+    if "!SETUP_MODE!"=="3" (
+        echo.
+        set "CONFIRM_RESET="
+        set /p "CONFIRM_RESET=Are you sure you want to delete %ACTIVE_DB% and all saved maps/dashboards? (y/N): "
+        if /i "!CONFIRM_RESET!"=="y" (
+            del /f /q "%ACTIVE_DB%" >nul 2>&1
+            echo [!] Database deleted. Starting fresh setup...
+            set "SKIP_CONFIG=0"
+            set "DEFAULT_GS=http://localhost:8080/geoserver"
+            set "DEFAULT_PORT=3000"
+            goto PROMPT_CONFIG
+        ) else (
+            echo [*] Database reset cancelled. Keeping existing settings.
+            set "FINAL_GS=!EXISTING_GS!"
+            set "APP_PORT=!EXISTING_PORT!"
+            set "SKIP_CONFIG=1"
+            goto AFTER_CONFIG
+        )
+    )
+    set "FINAL_GS=!EXISTING_GS!"
+    set "APP_PORT=!EXISTING_PORT!"
+    set "SKIP_CONFIG=1"
+    goto AFTER_CONFIG
+) else (
+    echo [!] No existing database found. Initializing first-time setup...
+    echo.
+    goto PROMPT_CONFIG
+)
+
+:PROMPT_CONFIG
+set "FINAL_GS=!DEFAULT_GS!"
 echo ----------------------------------------------------------------------
 echo  GeoServer Configuration
 echo ----------------------------------------------------------------------
-echo Default: http://localhost:8080/geoserver
+echo Default: !DEFAULT_GS!
 set "USER_GS="
 set /p "USER_GS=Enter GeoServer URL (Press ENTER to use default): "
 
@@ -61,7 +140,7 @@ echo ----------------------------------------------------------------------
 echo  Frontend Port Configuration
 echo ----------------------------------------------------------------------
 
-set "APP_PORT=3000"
+set "APP_PORT=!DEFAULT_PORT!"
 
 :PORT_PROMPT
 set "USER_PORT="
@@ -118,36 +197,65 @@ if exist ".env" del /f /q ".env" >nul 2>&1
 if exist ".env.local" del /f /q ".env.local" >nul 2>&1
 if exist ".env.production" del /f /q ".env.production" >nul 2>&1
 
-node -e "const { createClient } = require('@libsql/client'); const crypto = require('crypto'); async function save() { try { const c = createClient({ url: 'file:data/geovista.db' }); await c.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);'); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['geoserver_url', process.argv[1]] }); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING', args: ['tileserv_url', 'http://localhost:7800'] }); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['app_port', process.argv[2]] }); const row = await c.execute({ sql: 'SELECT value FROM app_settings WHERE key = ?', args: ['jwt_secret'] }); if (row.rows.length === 0) { const newKey = crypto.randomBytes(64).toString('base64'); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?)', args: ['jwt_secret', newKey] }); } } catch(e){ console.error(e); } } save();" "!FINAL_GS!" "!APP_PORT!" >nul 2>&1
+node -e "const { createClient } = require('@libsql/client'); const crypto = require('crypto'); async function save() { try { const c = createClient({ url: 'file:data/geovista.db' }); await c.execute('CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);'); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['geoserver_url', process.argv[1]] }); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING', args: ['tileserv_url', 'http://localhost:7800'] }); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value', args: ['app_port', process.argv[2]] }); const row = await c.execute({ sql: 'SELECT value FROM app_settings WHERE key = ?', args: ['jwt_secret'] }); if (row.rows.length === 0) { const newKey = crypto.randomBytes(64).toString('base64'); await c.execute({ sql: 'INSERT INTO app_settings (key, value) VALUES (?, ?)', args: ['jwt_secret', newKey] }); } } catch(e){ console.error('SQLite configuration error:', e.message || e); process.exit(1); } } save();" "!FINAL_GS!" "!APP_PORT!"
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERROR] Could not save configuration to data\geovista.db. Check permissions and try again.
+    pause
+    exit /b 1
+)
 
 echo [OK] Configuration saved directly into SQLite database (data/geovista.db)!
 echo [OK] Zero .env files created - project runs 100%% from SQLite database.
 
+:AFTER_CONFIG
+echo.
 echo [*] Checking GeoServer reachability [!FINAL_GS!]...
 curl.exe -s -I --max-time 5 "!FINAL_GS!/web/" >nul 2>&1
 if %ERRORLEVEL% EQU 0 (
     echo  [OK] GeoServer is ONLINE.
 ) else (
-    echo  [WARN] GeoServer did not respond within 5s at !FINAL_GS!. (Setup will continue)
+    echo  [WARN] GeoServer did not respond within 5s at !FINAL_GS!. [Setup will continue]
 )
+
+REM -----------------------------------------------------------------------
+REM  Smart Production Build Check
+REM -----------------------------------------------------------------------
+set "NEEDS_REBUILD=1"
 
 if exist ".next" (
-    echo [*] Clearing Next.js build cache...
-    rmdir /s /q ".next" >nul 2>&1
+    if "!SKIP_CONFIG!"=="1" (
+        echo.
+        echo [OK] Production build [.next] is already compiled.
+        set "REBUILD_CHOICE="
+        set /p "REBUILD_CHOICE=Do you want to recompile the build? [y/N, default No]: "
+        if /i "!REBUILD_CHOICE!"=="y" (
+            set "NEEDS_REBUILD=1"
+        ) else (
+            set "NEEDS_REBUILD=0"
+        )
+    )
 )
 
-echo.
-echo ======================================================================
-echo [*] Compiling optimized production build (npm run build)...
-echo [*] This removes all development error overlays and maximizes speed.
-echo ======================================================================
-echo.
-call npm run build
-if %ERRORLEVEL% NEQ 0 (
+if "!NEEDS_REBUILD!"=="1" (
+    if exist ".next" (
+        echo [*] Clearing previous Next.js build cache...
+        rmdir /s /q ".next" >nul 2>&1
+    )
+
     echo.
-    echo [ERROR] Build encountered an error! Please check the output above.
-    pause
-    exit /b 1
+    echo ======================================================================
+    echo [*] Compiling optimized production build [npm run build]...
+    echo [*] This removes all development error overlays and maximizes speed.
+    echo ======================================================================
+    echo.
+    call npm run build
+    if %ERRORLEVEL% NEQ 0 (
+        echo.
+        echo [ERROR] Build encountered an error! Please check the output above.
+        pause
+        exit /b 1
+    )
 )
 
 echo.
@@ -156,6 +264,7 @@ echo                  SETUP COMPLETED SUCCESSFULLY!
 echo ======================================================================
 echo Active GeoServer: !FINAL_GS!
 echo Frontend Port:    !APP_PORT!
+echo Database:         data\geovista.db
 echo.
 echo You can start the application anytime by running:
 echo     start.bat

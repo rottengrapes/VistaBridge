@@ -17,6 +17,7 @@ interface User {
   first_name?: string;
   last_name?: string;
   role?: 'ADMIN' | 'USER';
+  roles?: string[];
   geoserverAuth?: string;
   geoserverUrl?: string;
   profile?: {

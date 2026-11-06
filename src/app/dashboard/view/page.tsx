@@ -21,12 +21,14 @@ import {
   Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Trash2,
   BarChart3, PieChart, LineChart, Table, Hash, Map, X, Paintbrush, Info, ImageIcon,
   Printer, Eye, Donut, ScatterChart, TrendingUp, Lock, Unlock, Palette,
-  Globe, Layers, LayoutDashboard
+  Globe, Layers, LayoutDashboard, Share2, Users, Pencil, Shield, RefreshCw, Clock
 } from 'lucide-react';
 import ChartThemePicker from '@/components/dashboard/ChartThemePicker';
-import { useRouter, useSearchParams } from 'next/navigation';
+import ShareDashboardModal from '@/components/dashboard/ShareDashboardModal';
+import { useRouter, useSearchParams, useParams } from 'next/navigation';
 import GeoChartWidget, { type GeoChartConfig } from '@/components/dashboard/widgets/GeoChartWidget';
 import MapWidget, { type MapLayer } from '@/components/dashboard/widgets/MapWidget';
+import { normalizeAllowedUsers, AllowedUserEntry, normalizeAllowedRoles, AllowedRoleEntry, isUserAdmin } from '@/lib/dashboardPermissions';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useDashboardStore } from '@/store/useDashboardStore';
 import { apiRequest } from '@/lib/api';
@@ -38,6 +40,17 @@ import 'react-resizable/css/styles.css';
 import { DndContext, useDraggable, DragEndEvent, useSensor, useSensors, PointerSensor, TouchSensor } from '@dnd-kit/core';
 
 const { Text } = Typography;
+
+const REFRESH_INTERVAL_OPTIONS = [
+  { value: 0, label: 'Auto: Off' },
+  { value: 900, label: '15 mins' },
+  { value: 1800, label: '30 mins' },
+  { value: 3600, label: '1 hr' },
+  { value: 10800, label: '3 hrs' },
+  { value: 21600, label: '6 hrs' },
+  { value: 43200, label: '12 hrs' },
+  { value: 86400, label: '24 hrs' },
+];
 
 interface CanvasWidget {
   id: string;
@@ -378,6 +391,7 @@ const PrintableWidgetInner = ({
   startResizeProps,
   publish,
   setWidgets,
+  onEditWidget,
 }: {
   widget: CanvasWidget;
   isPdfLock: boolean;
@@ -385,6 +399,7 @@ const PrintableWidgetInner = ({
   startResizeProps?: (e: React.MouseEvent | React.TouchEvent, widgetId: string) => void;
   publish: any;
   setWidgets: React.Dispatch<React.SetStateAction<CanvasWidget[]>>;
+  onEditWidget?: (widget: CanvasWidget) => void;
 }) => {
   return (
     <div
@@ -524,6 +539,18 @@ const PrintableWidgetInner = ({
                     </button>
                   </Popover>
                 )}
+              {onEditWidget && (widget.type === 'map' || widget.type === 'geochart') && (
+                <button
+                  className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-primary hover:bg-primary/10 transition-colors cursor-pointer"
+                  title={widget.type === 'map' ? 'Edit Map Layers & Settings' : 'Edit Chart Configuration'}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEditWidget(widget);
+                  }}
+                >
+                  <Pencil size={14} className="pointer-events-none" />
+                </button>
+              )}
               <button
                 className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
                 onTouchEnd={(e) => {
@@ -686,11 +713,12 @@ const clearDashboardExportMode = () => {
 function ViewDashboardContent() {
   const router = useRouter();
   const { notification } = App.useApp();
-  const { token, hydrated } = useAuthStore();
+  const { token, hydrated, user } = useAuthStore();
   const searchParams = useSearchParams();
+  const params = useParams<{ slug?: string }>();
   const { customLogo, fetchAppearance, isLoaded: appearanceLoaded, primaryColor } = useAppearanceStore();
   const themePrimary = primaryColor || siteConfig.colors.primary || '#0284c7';
-  const dashboardId = searchParams.get('id');
+  const dashboardId = params?.slug || searchParams.get('id');
 
   useEffect(() => {
     if (!appearanceLoaded) {
@@ -699,10 +727,10 @@ function ViewDashboardContent() {
   }, [appearanceLoaded, fetchAppearance]);
 
   useEffect(() => {
-    if (hydrated && !token) {
+    if (hydrated && !token && !dashboardId) {
       router.replace('/login');
     }
-  }, [hydrated, token, router]);
+  }, [hydrated, token, router, dashboardId]);
 
   // Disable window scrolling to prevent double scrollbars on medium/large screens
   useEffect(() => {
@@ -923,7 +951,64 @@ function ViewDashboardContent() {
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [isPublic, setIsPublic] = useState(false);
+  const [shareType, setShareType] = useState<'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC'>('PRIVATE');
+  const [allowedUsers, setAllowedUsers] = useState<AllowedUserEntry[]>([]);
+  const [allowedRoles, setAllowedRoles] = useState<AllowedRoleEntry[]>([]);
+  const [dashboardSlug, setDashboardSlug] = useState<string>('');
+  const [canEdit, setCanEdit] = useState<boolean>(false);
+  const [isOwner, setIsOwner] = useState<boolean>(false);
+  const [createdBy, setCreatedBy] = useState<string>('');
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+
+  // Auto-refresh & Data Sync state
+  const [refreshInterval, setRefreshInterval] = useState<number>(0);
+  const triggerRefresh = useDashboardStore((state) => state.triggerRefresh);
+  const isRefreshing = useDashboardStore((state) => state.isRefreshing);
+  const setIsRefreshing = useDashboardStore((state) => state.setIsRefreshing);
+  const lastRefreshedAt = useDashboardStore((state) => state.lastRefreshedAt);
+  const lastRefreshTimeRef = useRef<number>(Date.now());
+
+  const handlePerformRefresh = useCallback(() => {
+    setIsRefreshing(true);
+    triggerRefresh();
+    lastRefreshTimeRef.current = Date.now();
+    setTimeout(() => {
+      setIsRefreshing(false);
+    }, 800);
+  }, [triggerRefresh, setIsRefreshing]);
+
+  // Auto-refresh interval timer with Page Visibility API
+  useEffect(() => {
+    if (!refreshInterval || refreshInterval <= 0) return;
+
+    const intervalMs = refreshInterval * 1000;
+
+    const checkAndRefresh = () => {
+      // If user switched tabs or minimized, pause refresh to save network/CPU
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const elapsed = Date.now() - lastRefreshTimeRef.current;
+      if (elapsed >= intervalMs) {
+        handlePerformRefresh();
+      }
+    };
+
+    const timer = setInterval(checkAndRefresh, 5000);
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        const elapsed = Date.now() - lastRefreshTimeRef.current;
+        if (elapsed >= intervalMs) {
+          handlePerformRefresh();
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [refreshInterval, handlePerformRefresh]);
 
   const handleRenameDashboard = async () => {
     const trimmed = newName.trim();
@@ -938,6 +1023,16 @@ function ViewDashboardContent() {
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+      const updated = await res.json().catch(() => null);
+      if (updated?.slug) {
+        setDashboardSlug(updated.slug);
+        if (typeof window !== 'undefined') {
+          const currentPath = window.location.pathname;
+          if (currentPath.startsWith('/dashboard/')) {
+            window.history.replaceState(null, '', `/dashboard/${updated.slug}`);
+          }
+        }
       }
       notification.success({
         message: 'Dashboard Renamed',
@@ -955,6 +1050,7 @@ function ViewDashboardContent() {
 
   // Right vertical bar and sliding panel states
   const [activePanel, setActivePanel] = useState<string | null>(null);
+  const [editingWidgetId, setEditingWidgetId] = useState<string | null>(null);
 
   // Dataset / layer and map workspace states
   const [availableDatasets, setAvailableDatasets] = useState<any[]>([]);
@@ -1031,11 +1127,7 @@ function ViewDashboardContent() {
     { key: 'max', label: 'Max' },
   ];
 
-  const handleGeoChartLayerChange = async (layerId: string) => {
-    setGeoChartLayerId(layerId);
-    setGeoChartColumns([]);
-    geoChartForm.resetFields(['dimension', 'metric', 'aggregation']);
-    if (!geoChartPresetType) geoChartForm.resetFields(['chartType']);
+  const loadLayerColumns = async (layerId: string) => {
     setGeoChartColsLoading(true);
     try {
       const res = await apiRequest(`/datasets/${layerId}/features/?page_size=1&page=1`);
@@ -1046,12 +1138,22 @@ function ViewDashboardContent() {
         .filter(k => k !== 'geometry_type')
         .map(k => ({ name: k, type: typeof sample[k] === 'number' ? 'number' : 'string' }));
       setGeoChartColumns(cols);
-      if (geoChartPresetType) geoChartForm.setFieldValue('chartType', geoChartPresetType);
+      return cols;
     } catch {
       notification.error({ message: 'Failed to load layer columns' });
+      return [];
     } finally {
       setGeoChartColsLoading(false);
     }
+  };
+
+  const handleGeoChartLayerChange = async (layerId: string) => {
+    setGeoChartLayerId(layerId);
+    setGeoChartColumns([]);
+    geoChartForm.resetFields(['dimension', 'metric', 'aggregation']);
+    if (!geoChartPresetType) geoChartForm.resetFields(['chartType']);
+    await loadLayerColumns(layerId);
+    if (geoChartPresetType) geoChartForm.setFieldValue('chartType', geoChartPresetType);
   };
 
   const handleAddGeoChart = (values: any) => {
@@ -1088,20 +1190,34 @@ function ViewDashboardContent() {
       colorMode: values.themeSettings?.colorMode,
       categoryColors: values.themeSettings?.categoryColors,
     };
-    const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 300) + 16), 0);
-    const widget: CanvasWidget = {
-      id: `gc_${Date.now()}`,
-      type: 'geochart',
-      geoChartConfig: config,
-      title,
-      x: 0,
-      y: nextY,
-      w: chartType === 'kpi' ? 3 : 6,
-      h: chartType === 'kpi' ? 120 : 300,
-    };
-    setWidgets(prev => [...prev, widget]);
-    persistChartAdd(title, chartType, config);
-    notification.success({ message: `"${title}" added to canvas`, duration: 2 });
+
+    if (editingWidgetId) {
+      setWidgets(prev =>
+        prev.map(w =>
+          w.id === editingWidgetId
+            ? { ...w, title, geoChartConfig: config }
+            : w
+        )
+      );
+      notification.success({ message: `"${title}" updated`, duration: 2 });
+      setEditingWidgetId(null);
+    } else {
+      const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 300) + 16), 0);
+      const widget: CanvasWidget = {
+        id: `gc_${Date.now()}`,
+        type: 'geochart',
+        geoChartConfig: config,
+        title,
+        x: 0,
+        y: nextY,
+        w: chartType === 'kpi' ? 3 : 6,
+        h: chartType === 'kpi' ? 120 : 300,
+      };
+      setWidgets(prev => [...prev, widget]);
+      persistChartAdd(title, chartType, config);
+      notification.success({ message: `"${title}" added to canvas`, duration: 2 });
+    }
+
     setActivePanel(null);
     geoChartForm.resetFields();
     setGeoChartLayerId(null);
@@ -1117,22 +1233,31 @@ function ViewDashboardContent() {
 
   // Load dashboard
   useEffect(() => {
-    if (!token || !dashboardId || dashboardId === 'undefined') return;
+    if (!dashboardId || dashboardId === 'undefined') return;
+    if (!hydrated) return;
     if (loadedDashboardIdRef.current === dashboardId) return;
 
     setLoading(true);
-    apiRequest(`/dashboards/${dashboardId}`)
+    apiRequest(`/dashboards/${dashboardId}`, { auth: Boolean(token) })
       .then(async (r) => {
         if (!r.ok) {
           const err = await r.json().catch(() => ({}));
-          // 404 = dashboard doesn't belong to this user — redirect instead of staying on broken page
+          if (r.status === 401) {
+            notification.warning({
+              message: 'Authentication Required',
+              description: 'Please log in to view this shared dashboard.',
+              placement: 'topRight',
+            });
+            router.replace('/login');
+            return null;
+          }
           if (r.status === 404 || r.status === 403) {
             notification.error({
               message: r.status === 403 ? 'Access Denied' : 'Dashboard Not Found',
               description: err.detail || 'This dashboard does not exist or you do not have access to it.',
               placement: 'topRight',
             });
-            router.replace('/dashboard/manage');
+            router.replace(token ? '/dashboard/manage' : '/login');
             return null;
           }
           throw new Error(err.detail || `HTTP ${r.status}`);
@@ -1143,7 +1268,21 @@ function ViewDashboardContent() {
         if (!data) return; // redirected above
         setDashboardName(data.name || 'Dashboard');
         setNewName(data.name || 'Dashboard');
-        setIsPublic(Boolean(data.is_public));
+        const sType = data.share_type || (data.is_public ? 'PUBLIC' : 'PRIVATE');
+        setShareType(sType);
+        setIsPublic(sType === 'PUBLIC' || Boolean(data.is_public));
+        setAllowedUsers(normalizeAllowedUsers(data.allowed_users));
+        setAllowedRoles(normalizeAllowedRoles(data.allowed_roles));
+        setDashboardSlug(data.slug || data.id || '');
+        setCreatedBy(data.created_by || '');
+        if (typeof data.is_owner === 'boolean') {
+          setIsOwner(Boolean(data.is_owner || isUserAdmin(user)));
+        }
+        if (typeof data.can_edit === 'boolean') {
+          setCanEdit(Boolean(data.can_edit || isUserAdmin(user)));
+        }
+        const loadedInterval = Number(data.refresh_interval) || Number(data.content?.refreshInterval) || 0;
+        setRefreshInterval(loadedInterval);
         const rawWidgets = data.content?.widgets || [];
         const needsMigration = rawWidgets.some((w: any) => w.h > 0 && w.h < 25);
         const migratedWidgets = rawWidgets.map((w: any) => {
@@ -1162,7 +1301,7 @@ function ViewDashboardContent() {
         router.replace('/dashboard/manage');
       })
       .finally(() => setLoading(false));
-  }, [dashboardId, token, notification, router]);
+  }, [dashboardId, token, hydrated, notification, router, user?.role]);
 
   // Load vector datasets
   const fetchAvailableDatasets = useCallback(() => {
@@ -1206,12 +1345,25 @@ function ViewDashboardContent() {
       notification.error({ message: 'Cannot save: dashboard was not created yet. Please go back and create it first.', placement: 'topRight' });
       return;
     }
+    if (!canEdit) {
+      notification.warning({
+        message: 'Permission Denied',
+        description: 'You only have view access for this dashboard and cannot save changes.',
+        placement: 'topRight',
+      });
+      return;
+    }
     setSaving(true);
     try {
       const payload = {
         name: dashboardName,
-        is_public: isPublic,
+        is_public: shareType === 'PUBLIC' || isPublic,
+        share_type: shareType,
+        allowed_users: allowedUsers,
+        allowed_roles: allowedRoles,
+        refresh_interval: refreshInterval,
         content: {
+          refreshInterval,
           widgets: widgets.map((w) => ({
             id: w.id,
             type: w.type,
@@ -1584,7 +1736,10 @@ function ViewDashboardContent() {
       color,
       isRaster,
     };
-    setMapConfigLayers([newLayer]);
+    setMapConfigLayers((prev) => {
+      if (prev.some((l) => l.datasetId === vistaId)) return prev;
+      return [...prev, newLayer];
+    });
     if (!mapConfigTitle || mapConfigTitle === 'Map') {
       setMapConfigTitle(name.slice(0, 32));
     }
@@ -1600,27 +1755,76 @@ function ViewDashboardContent() {
       notification.warning({ message: 'Map title cannot be empty or contain only whitespace' });
       return;
     }
-    const id = `map_${Date.now()}`;
-    const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 436) + 16), 0);
-    const newWidget: CanvasWidget = {
-      id,
-      type: 'map',
-      title: cleanTitle,
-      layers: mapConfigLayers,
-      x: 0,
-      y: nextY,
-      w: 8,
-      h: 436,
-    };
-    setWidgets((prev) => [...prev, newWidget]);
+
+    if (editingWidgetId) {
+      setWidgets((prev) =>
+        prev.map((w) =>
+          w.id === editingWidgetId
+            ? { ...w, title: cleanTitle, layers: [...mapConfigLayers] }
+            : w
+        )
+      );
+      notification.success({ message: 'Map widget updated' });
+      setEditingWidgetId(null);
+    } else {
+      const id = `map_${Date.now()}`;
+      const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 436) + 16), 0);
+      const newWidget: CanvasWidget = {
+        id,
+        type: 'map',
+        title: cleanTitle,
+        layers: mapConfigLayers,
+        x: 0,
+        y: nextY,
+        w: 8,
+        h: 436,
+      };
+      setWidgets((prev) => [...prev, newWidget]);
+      notification.success({ message: 'Added map widget to screen' });
+    }
+
     setActivePanel(null);
     setMapConfigLayers([]);
     setSelectedMapOrLayer(null);
     setMapConfigTitle('Map');
-    notification.success({ message: 'Added map widget to screen' });
   };
 
+  const handleStartEditWidget = async (widget: CanvasWidget) => {
+    setEditingWidgetId(widget.id);
 
+    if (widget.type === 'map') {
+      setMapConfigTitle(widget.title || 'Map');
+      setMapConfigLayers(widget.layers ? [...widget.layers] : []);
+      setSelectedMapOrLayer(null);
+      fetchAvailableDatasets();
+      fetchAvailableMaps();
+      setActivePanel('map');
+    } else if (widget.type === 'geochart' && widget.geoChartConfig) {
+      const cfg = widget.geoChartConfig;
+      fetchAvailableDatasets();
+      setGeoChartPresetType(cfg.chartType);
+      setGeoChartLayerId(cfg.layerId);
+      await loadLayerColumns(cfg.layerId);
+      geoChartForm.resetFields();
+      geoChartForm.setFieldsValue({
+        chartType: cfg.chartType,
+        layerId: cfg.layerId,
+        dimension: cfg.dimension,
+        metric: cfg.metric,
+        aggregation: cfg.aggregation || 'count',
+        tableColumns: cfg.tableColumns || [],
+        title: widget.title,
+        themeSettings: {
+          colorTheme: cfg.colorTheme,
+          customColors: cfg.customColors,
+          primaryColor: cfg.primaryColor,
+          colorMode: cfg.colorMode,
+          categoryColors: cfg.categoryColors,
+        },
+      });
+      setActivePanel('geochart');
+    }
+  };
 
   const toggleFullScreen = () => {
     if (!document.fullscreenElement) {
@@ -1641,8 +1845,11 @@ function ViewDashboardContent() {
     if (currentKey === prevKey) {
       setActivePanel(null);
       setGeoChartPresetType(null);
+      setEditingWidgetId(null);
       return;
     }
+
+    setEditingWidgetId(null);
 
     if (isGeoKey) {
       setGeoChartPresetType(panelKey);
@@ -1694,8 +1901,12 @@ function ViewDashboardContent() {
         {/* Left: Logo & Editable Title */}
         <div className="flex items-center gap-1.5 md:gap-3.5 min-w-0 flex-1 overflow-hidden">
           <div
-            onClick={() => router.push('/dashboard/manage')}
-            className="flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 cursor-pointer hover:opacity-85 transition-opacity"
+            onClick={() => {
+              if (!(isPublic && !token)) {
+                router.push('/dashboard/manage');
+              }
+            }}
+            className={`flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 ${!(isPublic && !token) ? 'cursor-pointer hover:opacity-85' : 'cursor-default'} transition-opacity`}
           >
             {/* Primary Logo (VistaBridge) */}
             {siteConfig.logo && (
@@ -1726,23 +1937,33 @@ function ViewDashboardContent() {
           <div className="flex items-center gap-1 md:gap-2 min-w-0 overflow-hidden">
             <Title
               level={5}
-              className="!m-0 truncate font-extrabold text-xs md:text-sm text-gray-800 leading-tight cursor-pointer hover:text-primary transition-colors"
+              className={`!m-0 truncate font-extrabold text-xs md:text-sm text-gray-800 leading-tight ${isOwner ? 'cursor-pointer hover:text-primary transition-colors' : 'cursor-default'}`}
               onClick={() => {
-                setNewName(dashboardName);
-                setRenameModalOpen(true);
+                if (isOwner) {
+                  setNewName(dashboardName);
+                  setRenameModalOpen(true);
+                }
               }}
             >
               {dashboardName}
             </Title>
             {!isEditingPrintLayout && (
-              <Tooltip title="Rename Dashboard">
+              <Tooltip title={isOwner ? "Rename Dashboard" : "Only owner or admin can rename this dashboard"}>
                 <Button
                   type="text"
                   size="small"
-                  icon={<Edit2 size={12} className="text-gray-400 hover:text-gray-600 transition-colors" />}
+                  disabled={!isOwner}
+                  icon={
+                    <Edit2
+                      size={12}
+                      className={isOwner ? "text-gray-400 hover:text-gray-600 transition-colors" : "text-gray-300 cursor-not-allowed"}
+                    />
+                  }
                   onClick={() => {
-                    setNewName(dashboardName);
-                    setRenameModalOpen(true);
+                    if (isOwner) {
+                      setNewName(dashboardName);
+                      setRenameModalOpen(true);
+                    }
                   }}
                   className="flex items-center justify-center rounded-md shrink-0"
                   style={{ width: 22, height: 22 }}
@@ -1752,24 +1973,100 @@ function ViewDashboardContent() {
           </div>
 
           {/* Visibility tag */}
-          <Tag
-            color={isPublic ? 'green' : 'orange'}
-            className="text-[8px] md:text-[10px] font-bold uppercase tracking-wider rounded px-1.5 md:px-2.5 py-0.5 border-none cursor-pointer shrink-0"
-            onClick={() => setIsShareModalOpen(true)}
-          >
-            {isPublic ? 'PUBLIC' : 'PRIVATE'}
-          </Tag>
+          <Tooltip title={isOwner ? 'Click to configure dashboard access and sharing' : 'Click to view sharing options & copy link'}>
+            <Tag
+              color={
+                shareType === 'PUBLIC' ? 'green' :
+                shareType === 'ROLES' ? 'blue' :
+                shareType === 'USERS' ? 'blue' :
+                'orange'
+              }
+              className={`text-[8px] md:text-[10px] font-bold uppercase tracking-wider rounded px-1.5 md:px-2.5 py-0.5 border-none shrink-0 inline-flex items-center gap-1 ${Boolean(token) ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}`}
+              onClick={() => {
+                if (token) setIsShareModalOpen(true);
+              }}
+            >
+              {shareType === 'PUBLIC' && <><Globe size={10} /> PUBLIC</>}
+              {shareType === 'ROLES' && <><Shield size={10} /> ROLES ({allowedRoles.length})</>}
+              {shareType === 'USERS' && <><Users size={10} /> USERS ({allowedUsers.length})</>}
+              {shareType === 'PRIVATE' && <><Lock size={10} /> PRIVATE</>}
+            </Tag>
+          </Tooltip>
         </div>
 
         {/* Right Section: actions — compacted on mobile */}
         <div className="flex items-center gap-0.5 md:gap-2 shrink-0">
-          {/* Save — hidden when editing print layout */}
+          {/* Refresh Now Button */}
           {!isEditingPrintLayout && (
-            <Tooltip title="Save Changes">
+            <Tooltip title={`Last synced: ${new Date(lastRefreshedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} • Click to reload fresh data from GeoServer`}>
               <Button
                 type="text"
-                icon={<Save size={16} className="text-gray-500 hover:text-primary transition-colors" />}
-                onClick={handleSaveDashboard}
+                disabled={isRefreshing}
+                icon={
+                  <RefreshCw
+                    size={16}
+                    className={`transition-all ${isRefreshing ? 'animate-spin text-primary' : 'text-gray-500 hover:text-primary'}`}
+                  />
+                }
+                onClick={handlePerformRefresh}
+                className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
+                style={{ width: 34, height: 34 }}
+              />
+            </Tooltip>
+          )}
+
+          {/* Auto-Refresh Dropdown */}
+          {!isEditingPrintLayout && (
+            <div className="hidden sm:flex items-center">
+              <Select
+                size="small"
+                value={refreshInterval}
+                onChange={(val) => {
+                  setRefreshInterval(val);
+                  if (canEdit) {
+                    const opt = REFRESH_INTERVAL_OPTIONS.find(o => o.value === val);
+                    notification.info({
+                      message: 'Auto-Refresh Updated',
+                      description: val > 0 ? `Auto-refresh set to ${opt?.label}. Click Save to persist this setting.` : 'Auto-refresh turned off. Click Save to persist.',
+                      placement: 'topRight',
+                      duration: 3
+                    });
+                  }
+                }}
+                disabled={!canEdit}
+                className="w-28 text-xs font-medium"
+                suffixIcon={<Clock size={11} className="text-gray-400" />}
+                options={REFRESH_INTERVAL_OPTIONS}
+              />
+            </div>
+          )}
+
+          {/* Share — available to all authenticated users with access */}
+          {Boolean(token) && (
+            <Tooltip title={isOwner ? "Share & Permissions" : "Share & Copy Link"}>
+              <Button
+                type="text"
+                icon={<Share2 size={16} className="text-gray-500 hover:text-primary transition-colors" />}
+                onClick={() => setIsShareModalOpen(true)}
+                className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
+                style={{ width: 34, height: 34 }}
+              />
+            </Tooltip>
+          )}
+
+          {/* Save — hidden when editing print layout */}
+          {!isEditingPrintLayout && (
+            <Tooltip title={canEdit ? "Save Changes" : "View-only access (saving disabled)"}>
+              <Button
+                type="text"
+                disabled={!canEdit}
+                icon={
+                  <Save
+                    size={16}
+                    className={canEdit ? "text-gray-500 hover:text-primary transition-colors" : "text-gray-300 cursor-not-allowed"}
+                  />
+                }
+                onClick={canEdit ? handleSaveDashboard : undefined}
                 loading={saving}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 34, height: 34 }}
@@ -1967,18 +2264,22 @@ function ViewDashboardContent() {
             </Tooltip>
           </Popover>
 
-          <Divider type="vertical" className="h-5 bg-gray-100 !m-0" />
+          {!(isPublic && !token) && (
+            <Divider type="vertical" className="h-5 bg-gray-100 !m-0" />
+          )}
 
-          {/* Back */}
-          <Tooltip title="Back to Manage">
-            <Button
-              type="text"
-              icon={<ArrowLeft size={16} className="text-gray-500 hover:text-primary transition-colors" />}
-              onClick={() => router.push('/dashboard/manage')}
-              className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
-              style={{ width: 34, height: 34 }}
-            />
-          </Tooltip>
+          {/* Back: disabled/hidden for public link viewers without token */}
+          {!(isPublic && !token) && (
+            <Tooltip title="Back to Manage">
+              <Button
+                type="text"
+                icon={<ArrowLeft size={16} className="text-gray-500 hover:text-primary transition-colors" />}
+                onClick={() => router.push('/dashboard/manage')}
+                className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
+                style={{ width: 34, height: 34 }}
+              />
+            </Tooltip>
+          )}
 
         </div>
       </header>
@@ -2236,6 +2537,7 @@ function ViewDashboardContent() {
                               isPdfLock={isPdfLock}
                               publish={publish}
                               setWidgets={setWidgets}
+                              onEditWidget={canEdit ? handleStartEditWidget : undefined}
                             />
                           </DraggableWidget>
                         ))}
@@ -2249,8 +2551,8 @@ function ViewDashboardContent() {
                       rowHeight={1}
                       margin={[0, 0]}
                       bounded={true}
-                      isDraggable={!isPdfLock && !isMobile}
-                      isResizable={!isPdfLock && !isMobile}
+                      isDraggable={!isPdfLock && !isMobile && canEdit}
+                      isResizable={!isPdfLock && !isMobile && canEdit}
                       draggableHandle=".drag-handle"
                       draggableCancel=".no-drag, button, input, textarea, select, .ant-popover, .ant-select"
                       onDragStart={() => {
@@ -2332,12 +2634,12 @@ function ViewDashboardContent() {
                                   className="flex items-center justify-between px-3 py-2 border-b border-gray-100 rounded-t-2xl shrink-0 bg-white relative z-20"
                                 >
                                   <div
-                                    className={`flex items-center gap-2 min-w-0 flex-grow ${!isLocked
+                                    className={`flex items-center gap-2 min-w-0 flex-grow ${!isLocked && canEdit
                                       ? 'drag-handle cursor-grab active:cursor-grabbing'
                                       : 'cursor-default'
                                       }`}
                                   >
-                                    {!isPdfLock && !isLocked && (
+                                    {!isPdfLock && !isLocked && canEdit && (
                                       <div className="flex flex-col gap-[3px] shrink-0">
                                         {[0, 1, 2].map((i) => (
                                           <div key={i} className="flex gap-[3px]">
@@ -2350,7 +2652,7 @@ function ViewDashboardContent() {
                                     <span className="text-[12px] font-bold text-gray-700 truncate">{widget.title}</span>
                                   </div>
 
-                                  {!isPdfLock && (
+                                  {!isPdfLock && canEdit && (
                                     <div
                                       className="flex items-center gap-1 shrink-0 pointer-events-auto no-drag"
                                       onMouseDown={(e) => e.stopPropagation()}
@@ -2457,6 +2759,19 @@ function ViewDashboardContent() {
                                           </Popover>
                                         )}
 
+                                      {(widget.type === 'map' || widget.type === 'geochart') && (
+                                        <button
+                                          className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-primary hover:bg-primary/10 transition-colors cursor-pointer"
+                                          title={widget.type === 'map' ? 'Edit Map Layers & Settings' : 'Edit Chart Configuration'}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleStartEditWidget(widget);
+                                          }}
+                                        >
+                                          <Pencil size={14} className="pointer-events-none" />
+                                        </button>
+                                      )}
+
                                       <button
                                         className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
                                         onTouchEnd={(e) => {
@@ -2522,14 +2837,14 @@ function ViewDashboardContent() {
               <div className="p-4 border-b border-gray-100 flex items-center justify-between shrink-0 bg-white">
                 <span className="text-[12px] font-bold text-gray-700 uppercase tracking-wider">
                   {activePanel === 'text' && 'Add Text Note'}
-                  {activePanel === 'map' && 'Configure Map Widget'}
-                  {activePanel === 'geochart' && `Add ${GEO_CHART_TYPES.find(c => c.key === geoChartPresetType)?.label ?? 'Chart'}`}
+                  {activePanel === 'map' && (editingWidgetId ? 'Edit Map Widget' : 'Configure Map Widget')}
+                  {activePanel === 'geochart' && (editingWidgetId ? `Edit ${GEO_CHART_TYPES.find(c => c.key === geoChartPresetType)?.label ?? 'Chart'}` : `Add ${GEO_CHART_TYPES.find(c => c.key === geoChartPresetType)?.label ?? 'Chart'}`)}
                 </span>
                 <Button
                   type="text"
                   size="small"
                   icon={<X size={14} className="text-gray-400" />}
-                  onClick={() => { setActivePanel(null); setGeoChartPresetType(null); }}
+                  onClick={() => { setActivePanel(null); setGeoChartPresetType(null); setEditingWidgetId(null); }}
                   className="flex items-center justify-center hover:bg-gray-100 rounded-lg"
                   style={{ width: 24, height: 24 }}
                 />
@@ -3202,7 +3517,7 @@ function ViewDashboardContent() {
                           className="w-full rounded-xl font-bold border-none h-9 text-xs mt-2"
                           style={{ backgroundColor: themePrimary }}
                         >
-                          Add Chart to Canvas
+                          {editingWidgetId ? 'Save Chart Changes' : 'Add Chart to Canvas'}
                         </Button>
                       </>
                     )}
@@ -3210,7 +3525,7 @@ function ViewDashboardContent() {
                 )}
 
                 {/* ── Saved Charts Library ─────────────────────────────── */}
-                {activePanel === 'geochart' && filteredCharts.length > 0 && (
+                {activePanel === 'geochart' && !editingWidgetId && filteredCharts.length > 0 && (
                   <div className="mt-4 flex flex-col gap-2">
                     <div className="flex items-center justify-between">
                       <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Saved {getPluralChartLabel(geoChartPresetType)} ({filteredCharts.length})</label>
@@ -3417,7 +3732,7 @@ function ViewDashboardContent() {
                       className="w-full rounded-xl font-bold bg-primary border-none text-[11px] h-9 flex items-center justify-center gap-1.5 shadow-sm mt-2"
                       style={{ backgroundColor: themePrimary }}
                     >
-                      Add Map Widget
+                      {editingWidgetId ? 'Save Map Changes' : 'Add Map Widget'}
                     </Button>
                   </div>
                 )}
@@ -3430,8 +3745,8 @@ function ViewDashboardContent() {
 
         </div>
 
-        {/* Mobile floating bottom toolbar — 3 clean tabs: Map | Charts | Text */}
-        {isMobile && !isEditingPrintLayout && (
+        {/* Mobile floating bottom toolbar — 3 clean tabs: Map | Charts | Text (only when user can edit) */}
+        {canEdit && isMobile && !isEditingPrintLayout && (
           <div className="absolute bottom-3 left-0 right-0 flex flex-col items-center z-30 pointer-events-none">
 
             {/* Chart type picker — appears above the toolbar when Charts is tapped */}
@@ -3541,111 +3856,111 @@ function ViewDashboardContent() {
           <div className="flex flex-col items-center gap-4 w-full">
 
             {/* Widget templates shortcut icons */}
-            <Tooltip title="Add Map Widget" placement="left">
+            <Tooltip title={canEdit ? "Add Map Widget" : "Add Map Widget (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<Map size={20} className={`transition-colors ${activePanel === 'map' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('map')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<Map size={20} className={`transition-colors ${canEdit ? (activePanel === 'map' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('map')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Pie Chart" placement="left">
+            <Tooltip title={canEdit ? "Add Pie Chart" : "Add Pie Chart (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<PieChart size={20} className={`transition-colors ${geoChartPresetType === 'pie' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('pie')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<PieChart size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'pie' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('pie')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Bar Chart" placement="left">
+            <Tooltip title={canEdit ? "Add Bar Chart" : "Add Bar Chart (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<BarChart3 size={20} className={`transition-colors ${geoChartPresetType === 'bar' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('bar')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<BarChart3 size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'bar' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('bar')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Line Chart" placement="left">
+            <Tooltip title={canEdit ? "Add Line Chart" : "Add Line Chart (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<LineChart size={20} className={`transition-colors ${geoChartPresetType === 'line' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('line')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<LineChart size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'line' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('line')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Table Grid" placement="left">
+            <Tooltip title={canEdit ? "Add Table Grid" : "Add Table Grid (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<Table size={20} className={`transition-colors ${geoChartPresetType === 'table' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('table')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<Table size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'table' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('table')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add KPI Widget" placement="left">
+            <Tooltip title={canEdit ? "Add KPI Widget" : "Add KPI Widget (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<Hash size={20} className={`transition-colors ${geoChartPresetType === 'kpi' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('kpi')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<Hash size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'kpi' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('kpi')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Scatter Plot" placement="left">
+            <Tooltip title={canEdit ? "Add Scatter Plot" : "Add Scatter Plot (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<ScatterChart size={20} className={`transition-colors ${geoChartPresetType === 'scatter' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('scatter')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<ScatterChart size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'scatter' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('scatter')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Donut Chart" placement="left">
+            <Tooltip title={canEdit ? "Add Donut Chart" : "Add Donut Chart (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<Donut size={20} className={`transition-colors ${geoChartPresetType === 'donut' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('donut')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<Donut size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'donut' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('donut')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Area Chart" placement="left">
+            <Tooltip title={canEdit ? "Add Area Chart" : "Add Area Chart (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<TrendingUp size={20} className={`transition-colors ${geoChartPresetType === 'area' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('area')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<TrendingUp size={20} className={`transition-colors ${canEdit ? (geoChartPresetType === 'area' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('area')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
             </Tooltip>
 
-            <Tooltip title="Add Rich Text Box" placement="left">
+            <Tooltip title={canEdit ? "Add Rich Text Box" : "Add Rich Text Box (View-only mode)"} placement="left">
               <Button
                 type="text"
-                disabled={isEditingPrintLayout}
-                icon={<FileText size={20} className={`transition-colors ${activePanel === 'text' ? 'text-primary' : 'text-gray-500 hover:text-primary'}`} />}
-                onClick={() => handleToolbarClick('text')}
+                disabled={!canEdit || isEditingPrintLayout}
+                icon={<FileText size={20} className={`transition-colors ${canEdit ? (activePanel === 'text' ? 'text-primary' : 'text-gray-500 hover:text-primary') : 'text-gray-300 cursor-not-allowed'}`} />}
+                onClick={() => canEdit && handleToolbarClick('text')}
                 className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
                 style={{ width: 42, height: 42 }}
               />
@@ -3695,45 +4010,25 @@ function ViewDashboardContent() {
       </Modal>
 
       {/* Share Dashboard Modal */}
-      <Modal
-        title="Dashboard Access Control"
-        open={isShareModalOpen}
-        onCancel={() => setIsShareModalOpen(false)}
-        footer={null}
-        centered
-        width={440}
-        className="rounded-2xl"
-      >
-        <div className="flex flex-col gap-4 pt-3 pb-2">
-          <div>
-            <label className="text-[10px] font-bold uppercase tracking-widest text-gray-400 block mb-2">
-              Visibility Level
-            </label>
-            <Select
-              className="w-full h-11"
-              value={isPublic ? 'PUBLIC' : 'PRIVATE'}
-              onChange={(val) => setIsPublic(val === 'PUBLIC')}
-              options={[
-                { label: 'Private (Only you can access)', value: 'PRIVATE' },
-                { label: 'Public (Anyone with link can view)', value: 'PUBLIC' }
-              ]}
-            />
-          </div>
-          <div className="flex justify-end pt-3 border-t border-gray-100 mt-2">
-            <Button
-              type="primary"
-              onClick={() => {
-                setIsShareModalOpen(false);
-                handleSaveDashboard();
-              }}
-              style={{ backgroundColor: themePrimary, border: 'none' }}
-              className="rounded-xl font-bold h-10 px-6"
-            >
-              Save Access Level
-            </Button>
-          </div>
-        </div>
-      </Modal>
+      {dashboardId && (
+        <ShareDashboardModal
+          open={isShareModalOpen}
+          onClose={() => setIsShareModalOpen(false)}
+          dashboardId={dashboardId}
+          dashboardTitle={dashboardName}
+          dashboardSlug={dashboardSlug}
+          createdBy={createdBy}
+          initialShareType={shareType}
+          initialAllowedUsers={allowedUsers}
+          initialAllowedRoles={allowedRoles}
+          onShareUpdated={({ share_type, allowed_users, allowed_roles }) => {
+            setShareType(share_type as any);
+            setIsPublic(share_type === 'PUBLIC');
+            setAllowedUsers(allowed_users || []);
+            setAllowedRoles(allowed_roles || []);
+          }}
+        />
+      )}
 
 
 

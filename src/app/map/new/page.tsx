@@ -136,9 +136,8 @@ export default function NewMapPage() {
       });
       setFormOpen(false);
 
-      // Redirect to the created workspace view: e.g. /map/2d?id=uuid
-      // Using window.location.href ensures a fresh lifecycle without stale map/layer state across browsers
-      window.location.href = `${selectedTemplate?.link || '/map/2d'}?id=${mapData.id}`;
+      // Redirect directly to the slug route (e.g. /map/urban_body)
+      window.location.href = `/map/${mapData.slug || mapData.id}`;
     } catch (err: unknown) {
       notification.error({
         message: 'Error',
@@ -280,7 +279,11 @@ export default function NewMapPage() {
               }
             ]}
           >
-            <Input maxLength={32} placeholder="e.g. San Francisco Roads Plan" className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold" />
+            <Input
+              maxLength={32}
+              placeholder="e.g. San Francisco Roads Plan"
+              className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold"
+            />
           </Form.Item>
 
           <Form.Item

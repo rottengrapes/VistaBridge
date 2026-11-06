@@ -12,6 +12,7 @@ import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
 import { setCachedJwtSecret } from './jwt';
+import { slugify } from './slug';
 
 // Singleton database connection instance kept in memory
 let clientInstance: Client | null = null;
@@ -64,7 +65,7 @@ function autoParseJson(row: any): any {
 function translateSqlForSqlite(sql: string): string {
   return sql
     .replace(/::[a-zA-Z0-9_]+(\[\])?/g, '') // remove postgres casts (e.g. ::text[])
-    .replace(/\bNOW\(\)/gi, 'CURRENT_TIMESTAMP'); // map NOW() to CURRENT_TIMESTAMP
+    .replace(/\bNOW\(\)/gi, "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"); // map NOW() to ISO-8601 UTC timestamp
 }
 
 // Runs a query on SQLite, serializes parameters (objects to JSON, booleans to 1/0),
@@ -138,6 +139,7 @@ export async function initDb() {
     await client.batch([
       `CREATE TABLE IF NOT EXISTS map_workspaces (
         id TEXT PRIMARY KEY,
+        slug TEXT,
         name TEXT NOT NULL,
         description TEXT,
         share TEXT DEFAULT 'PRIVATE',
@@ -191,6 +193,7 @@ export async function initDb() {
       )`,
       `CREATE TABLE IF NOT EXISTS dashboards (
         id TEXT PRIMARY KEY,
+        slug TEXT,
         name TEXT NOT NULL,
         description TEXT DEFAULT '',
         is_public INTEGER DEFAULT 0,
@@ -198,8 +201,12 @@ export async function initDb() {
         tags TEXT DEFAULT '[]',
         version INTEGER DEFAULT 1,
         thumbnail TEXT,
+        share_type TEXT DEFAULT 'PRIVATE',
+        allowed_users TEXT DEFAULT '[]',
+        allowed_roles TEXT DEFAULT '[]',
         created_by TEXT,
         geoserver_url TEXT DEFAULT '',
+        refresh_interval INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`,
@@ -232,6 +239,20 @@ export async function initDb() {
         theme_color TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      `CREATE TABLE IF NOT EXISTS map_print_templates (
+        id TEXT PRIMARY KEY,
+        map_id TEXT REFERENCES map_workspaces(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        layout TEXT NOT NULL,
+        page_size TEXT NOT NULL,
+        dpi INTEGER DEFAULT 150,
+        positions TEXT NOT NULL,
+        styles TEXT NOT NULL,
+        page_elements TEXT,
+        created_by TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`
     ], 'write');
 
@@ -261,10 +282,17 @@ export async function initDb() {
       { table: 'dashboards', col: 'description', type: "TEXT DEFAULT ''" },
       { table: 'dashboards', col: 'is_public', type: 'INTEGER DEFAULT 0' },
       { table: 'dashboards', col: 'geoserver_url', type: "TEXT DEFAULT ''" },
+      { table: 'dashboards', col: 'share_type', type: "TEXT DEFAULT 'PRIVATE'" },
+      { table: 'dashboards', col: 'allowed_users', type: "TEXT DEFAULT '[]'" },
+      { table: 'dashboards', col: 'allowed_roles', type: "TEXT DEFAULT '[]'" },
       { table: 'dashboard_charts', col: 'geoserver_url', type: "TEXT DEFAULT ''" },
       { table: 'user_profiles', col: 'geoserver_url', type: "TEXT DEFAULT ''" },
+      { table: 'user_profiles', col: 'geoserver_roles', type: "TEXT DEFAULT '[]'" },
       { table: 'goto_xy_points', col: 'map_id', type: 'TEXT' },
       { table: 'goto_xy_points', col: 'zoom', type: 'REAL' },
+      { table: 'map_workspaces', col: 'slug', type: 'TEXT' },
+      { table: 'dashboards', col: 'slug', type: 'TEXT' },
+      { table: 'dashboards', col: 'refresh_interval', type: 'INTEGER DEFAULT 0' },
     ];
 
     for (const m of migrations) {
@@ -277,6 +305,92 @@ export async function initDb() {
       } catch {
         // Safe to ignore if column already exists
       }
+    }
+
+    // ------------------------------------------------------------------------
+    // STEP 1.5: Backfill unique slugs for legacy records and create unique indexes
+    // ------------------------------------------------------------------------
+    try {
+      // 1. Backfill map_workspaces
+      const mapsWithoutSlug = await client.execute(
+        "SELECT id, name FROM map_workspaces WHERE slug IS NULL OR TRIM(slug) = ''"
+      );
+      if (mapsWithoutSlug.rows && mapsWithoutSlug.rows.length > 0) {
+        const existingMapSlugsRes = await client.execute(
+          "SELECT slug FROM map_workspaces WHERE slug IS NOT NULL AND TRIM(slug) != ''"
+        );
+        const usedSlugs = new Set((existingMapSlugsRes.rows || []).map((r: any) => String(r.slug).toLowerCase()));
+
+        for (const row of mapsWithoutSlug.rows as any[]) {
+          const base = slugify(String(row.name || 'map')) || 'map';
+          let candidate = base;
+          let counter = 1;
+          while (usedSlugs.has(candidate)) {
+            candidate = `${base}_${counter++}`;
+          }
+          usedSlugs.add(candidate);
+          await client.execute({
+            sql: "UPDATE map_workspaces SET slug = ? WHERE id = ?",
+            args: [candidate, row.id],
+          });
+        }
+      }
+      await client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_map_workspaces_slug ON map_workspaces(slug)");
+
+      // 2. Backfill dashboards
+      const dashWithoutSlug = await client.execute(
+        "SELECT id, name FROM dashboards WHERE slug IS NULL OR TRIM(slug) = ''"
+      );
+      if (dashWithoutSlug.rows && dashWithoutSlug.rows.length > 0) {
+        const existingDashSlugsRes = await client.execute(
+          "SELECT slug FROM dashboards WHERE slug IS NOT NULL AND TRIM(slug) != ''"
+        );
+        const usedSlugs = new Set((existingDashSlugsRes.rows || []).map((r: any) => String(r.slug).toLowerCase()));
+
+        for (const row of dashWithoutSlug.rows as any[]) {
+          const base = slugify(String(row.name || 'dashboard')) || 'dashboard';
+          let candidate = base;
+          let counter = 1;
+          while (usedSlugs.has(candidate)) {
+            candidate = `${base}_${counter++}`;
+          }
+          usedSlugs.add(candidate);
+          await client.execute({
+            sql: "UPDATE dashboards SET slug = ? WHERE id = ?",
+            args: [candidate, row.id],
+          });
+        }
+      }
+      await client.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dashboards_slug ON dashboards(slug)");
+    } catch (slugErr) {
+      console.error('[db.ts] Error migrating slugs:', slugErr);
+    }
+
+    // ------------------------------------------------------------------------
+    // STEP 1.6: Normalize legacy timestamps to uniform ISO-8601 UTC strings
+    // ------------------------------------------------------------------------
+    // Converts legacy SQLite CURRENT_TIMESTAMP "YYYY-MM-DD HH:MM:SS" into ISO-8601
+    // "YYYY-MM-DDTHH:MM:SS.000Z" so browsers and dayjs calculate timezone offsets accurately.
+    try {
+      await client.batch([
+        `UPDATE dashboards 
+         SET created_at = replace(created_at, ' ', 'T') || '.000Z' 
+         WHERE created_at IS NOT NULL AND created_at NOT LIKE '%Z' AND created_at LIKE '____-__-__ __:__:__'`,
+        `UPDATE dashboards 
+         SET updated_at = replace(updated_at, ' ', 'T') || '.000Z' 
+         WHERE updated_at IS NOT NULL AND updated_at NOT LIKE '%Z' AND updated_at LIKE '____-__-__ __:__:__'`,
+        `UPDATE map_workspaces 
+         SET created_at = replace(created_at, ' ', 'T') || '.000Z' 
+         WHERE created_at IS NOT NULL AND created_at NOT LIKE '%Z' AND created_at LIKE '____-__-__ __:__:__'`,
+        `UPDATE map_workspaces 
+         SET updated_at = replace(updated_at, ' ', 'T') || '.000Z' 
+         WHERE updated_at IS NOT NULL AND updated_at NOT LIKE '%Z' AND updated_at LIKE '____-__-__ __:__:__'`,
+        `UPDATE dashboard_charts 
+         SET created_at = replace(created_at, ' ', 'T') || '.000Z' 
+         WHERE created_at IS NOT NULL AND created_at NOT LIKE '%Z' AND created_at LIKE '____-__-__ __:__:__'`,
+      ], 'write');
+    } catch (tsErr) {
+      console.warn('[db.ts] Timestamp migration warning:', tsErr);
     }
 
     // ------------------------------------------------------------------------

@@ -330,6 +330,7 @@ export default function GeoChartWidget({ widgetId: _widgetId, config }: Props) {
   const activeMapDatasetIds = useDashboardStore((state) => state.activeMapDatasetIds);
   const isPdfLock = useDashboardStore((state) => state.isPdfLock);
   const mapsSettled = useDashboardStore((state) => state.mapsSettled);
+  const refreshTrigger = useDashboardStore((state) => state.refreshTrigger);
 
   const normalizeId = (id?: string) => (id && id.includes(':') ? id.split(':')[1] : id || '');
 
@@ -419,6 +420,9 @@ export default function GeoChartWidget({ widgetId: _widgetId, config }: Props) {
     setLoadingFeatures(true);
     try {
       let url = `/datasets/${layerId}/features/?page_size=999999&page=1`;
+      if (refreshTrigger > 0) {
+        url += `&_t=${refreshTrigger}`;
+      }
       if (isLayerInMap && activeBbox && !isFullExtent) {
         url += `&bbox=${activeBbox.join(',')}`;
         console.log(`[BBOX DEBUG] 🛰️ Fetching features with BBOX for layer "${layerId}":`, {
@@ -440,7 +444,7 @@ export default function GeoChartWidget({ widgetId: _widgetId, config }: Props) {
       // Fallback: if BBOX query returned 0 features, fetch the full dataset
       if (rows.length === 0 && isLayerInMap && activeBbox && !isFullExtent) {
         console.log(`[BBOX DEBUG] 🔄 BBOX query returned 0 features. Falling back to fetching full dataset for layer "${layerId}"...`);
-        const fallbackUrl = `/datasets/${layerId}/features/?page_size=999999&page=1`;
+        const fallbackUrl = `/datasets/${layerId}/features/?page_size=999999&page=1${refreshTrigger > 0 ? `&_t=${refreshTrigger}` : ''}`;
         const fallbackRes = await apiRequest(fallbackUrl);
         if (fallbackRes.ok) {
           const fallbackJson = await fallbackRes.json();
@@ -468,14 +472,17 @@ export default function GeoChartWidget({ widgetId: _widgetId, config }: Props) {
       setFetchError('');
     } catch (e: any) {
       console.error(`[BBOX DEBUG] ❌ Error fetching features for layer "${layerId}":`, e.message);
-      setFetchError(e.message);
-      setAllFeatures([]);
-      setTotalRecords(0);
+      // Stale-While-Revalidate: Keep existing data visible if a background refresh fails
+      if (allFeatures.length === 0) {
+        setFetchError(e.message);
+        setAllFeatures([]);
+        setTotalRecords(0);
+      }
     } finally {
       setHasLoadedOnce(true);
       setLoadingFeatures(false);
     }
-  }, [layerId, isLayerInMap, activeBbox, isFullExtent, isPdfLock, readyToLoad]);
+  }, [layerId, isLayerInMap, activeBbox, isFullExtent, isPdfLock, readyToLoad, refreshTrigger]);
 
   useEffect(() => {
     if (readyToLoad) {
@@ -483,7 +490,7 @@ export default function GeoChartWidget({ widgetId: _widgetId, config }: Props) {
         load();
       });
     }
-  }, [load, readyToLoad]);
+  }, [load, readyToLoad, refreshTrigger]);
 
   const displayData = useMemo(() => {
     if (!readyToLoad || !hasLoadedOnce || (loadingFeatures && allFeatures.length === 0)) {

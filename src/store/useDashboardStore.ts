@@ -43,6 +43,13 @@ interface DashboardState {
   isPdfLock: boolean;
   mapsSettled: boolean;
 
+  // Auto-refresh & Data Sync state
+  refreshTrigger: number;
+  isRefreshing: boolean;
+  lastRefreshedAt: number;
+  triggerRefresh: () => void;
+  setIsRefreshing: (refreshing: boolean) => void;
+
   // Event bus: keeps track of widget callback functions
   _listeners: Map<string, Set<Listener>>;
 
@@ -77,7 +84,18 @@ export const useDashboardStore = create<DashboardState>((set, get) => ({
   mapLayersRegistry: {},
   isPdfLock: false,
   mapsSettled: false,
+  refreshTrigger: 0,
+  isRefreshing: false,
+  lastRefreshedAt: Date.now(),
   _listeners: new Map(),
+
+  triggerRefresh: () => {
+    set({ refreshTrigger: Date.now(), lastRefreshedAt: Date.now() });
+  },
+
+  setIsRefreshing: (isRefreshing) => {
+    set({ isRefreshing });
+  },
 
   setMapsSettled: (mapsSettled) => {
     set({ mapsSettled });

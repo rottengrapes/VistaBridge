@@ -34,9 +34,12 @@ export async function GET(request: Request) {
       );
     }
 
+    const mapCheck = await pool.query('SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [mapId]);
+    const resolvedMapId = mapCheck.rows.length > 0 ? mapCheck.rows[0].id : mapId;
+
     const result = await pool.query(
       'SELECT id, map_id, geometry, label, type, created_at FROM map_annotations WHERE map_id = $1 ORDER BY created_at ASC',
-      [mapId]
+      [resolvedMapId]
     );
 
     // Map database keys to frontend keys if needed (map_id -> map)
@@ -72,13 +75,16 @@ export async function POST(request: Request) {
       );
     }
 
+    const mapCheck = await pool.query('SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [map]);
+    const resolvedMapId = mapCheck.rows.length > 0 ? mapCheck.rows[0].id : map;
+
     // Insert or update on conflict
     await pool.query(
       `INSERT INTO map_annotations (id, map_id, geometry, label, type)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (id) 
        DO UPDATE SET geometry = $3, label = $4, type = $5`,
-      [id, map, JSON.stringify(geometry), label || '', type]
+      [id, resolvedMapId, JSON.stringify(geometry), label || '', type]
     );
 
     return NextResponse.json({ success: true }, { status: 201 });

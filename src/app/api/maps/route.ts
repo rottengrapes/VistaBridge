@@ -13,6 +13,7 @@ import crypto from 'crypto';
 import { pool, initDb } from '@/lib/db';
 import { verifyJwt } from '@/lib/jwt';
 import { getAppSetting } from '@/lib/settings';
+import { validateSlug, slugify } from '@/lib/slug';
 
 let dbInitialized = false;
 
@@ -81,12 +82,13 @@ export async function GET(request: Request) {
            OR geoserver_url IS NULL 
            OR LOWER(RTRIM(geoserver_url, '/')) = LOWER(RTRIM($2, '/'))
          ) 
-       ORDER BY created_at DESC`,
+       ORDER BY updated_at DESC, created_at DESC`,
       [user.username, geoserverUrl]
     );
     
     const workspaces = result.rows.map(row => ({
       id: row.id,
+      slug: row.slug || row.id,
       name: row.name,
       description: row.description || '',
       share: row.share || 'PRIVATE',
@@ -170,6 +172,34 @@ export async function POST(request: Request) {
       );
     }
 
+    let finalSlug = '';
+    if (typeof body.slug === 'string' && body.slug.trim()) {
+      const validation = validateSlug(body.slug, 'map');
+      if (!validation.valid) {
+        return NextResponse.json({ detail: validation.error }, { status: 400 });
+      }
+      finalSlug = validation.cleaned!;
+
+      const existing = await pool.query('SELECT id FROM map_workspaces WHERE LOWER(slug) = $1', [finalSlug.toLowerCase()]);
+      if (existing.rows.length > 0) {
+        return NextResponse.json(
+          { detail: `Slug "${finalSlug}" is already taken. Please choose another unique slug.` },
+          { status: 409 }
+        );
+      }
+    } else {
+      const baseSlug = slugify(trimmedName) || 'map';
+      const existingRes = await pool.query("SELECT slug FROM map_workspaces WHERE slug IS NOT NULL AND TRIM(slug) != ''");
+      const usedSlugs = new Set((existingRes.rows || []).map((r: any) => String(r.slug).toLowerCase()));
+
+      let candidate = baseSlug;
+      let counter = 1;
+      while (usedSlugs.has(candidate.toLowerCase())) {
+        candidate = `${baseSlug}_${counter++}`;
+      }
+      finalSlug = candidate;
+    }
+
     const id = crypto.randomUUID();
     const desc = (description || '').trim();
     const sh = share || 'PRIVATE';
@@ -223,13 +253,14 @@ export async function POST(request: Request) {
       : JSON.stringify([]);
 
     await pool.query(
-      `INSERT INTO map_workspaces (id, name, description, share, type, center_lon, center_lat, zoom, basemap_id, created_at, updated_at, layers, created_by, geoserver_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-      [id, trimmedName, desc, sh, type, finalLon, finalLat, finalZoom, finalBasemap, now, now, finalLayers, user.username, geoserverUrl]
+      `INSERT INTO map_workspaces (id, slug, name, description, share, type, center_lon, center_lat, zoom, basemap_id, created_at, updated_at, layers, created_by, geoserver_url)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      [id, finalSlug, trimmedName, desc, sh, type, finalLon, finalLat, finalZoom, finalBasemap, now, now, finalLayers, user.username, geoserverUrl]
     );
 
     const newMap = {
       id,
+      slug: finalSlug,
       name: trimmedName,
       description: desc,
       share: sh,

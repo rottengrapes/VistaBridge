@@ -12,11 +12,12 @@
 
 import React, { useState, useEffect, Suspense } from 'react';
 import { Form, Input, Button, Card, Typography, App, Spin, ConfigProvider } from 'antd';
-import { User, Lock, ExternalLink } from 'lucide-react';
+import { User, Lock, ExternalLink, Compass } from 'lucide-react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { siteConfig } from '@/config/site-config';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useAppearanceStore } from '@/store/useAppearanceStore';
+import { useGeoServerServicesStore } from '@/store/useGeoServerServicesStore';
 
 const { Title, Text, Link } = Typography;
 
@@ -24,6 +25,7 @@ function LoginForm() {
   const { notification } = App.useApp();
   const [loading, setLoading] = useState(false);
   const { token, hydrated, setAuth } = useAuthStore();
+  const servicesStore = useGeoServerServicesStore();
   const {
     customLogo,
     productName,
@@ -132,6 +134,48 @@ function LoginForm() {
 
       // Re-fetch appearance for this logged-in user so personal theme color loads
       fetchAppearance();
+
+      // Internally detect what services the user's GeoServer supports (WMS, WFS, WMTS, etc.)
+      try {
+        const checkRes = await fetch('/api/geoserver/services/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            geoserverUrl,
+            username: values.username,
+            password: values.password,
+          }),
+        });
+        if (checkRes.ok) {
+          const checkData = await checkRes.json();
+          const s = checkData.services || {};
+          const isWmsAvailable = !!s.wms?.available;
+          const isWfsAvailable = !!s.wfs?.available;
+          const isWmtsAvailable = !!s.wmts?.available;
+          const isWcsAvailable = !!s.wcs?.available;
+          const isWpsAvailable = !!s.wps?.available;
+
+          // Automatically select the best service to call for capabilities
+          let autoCapabilitiesMode: 'WMS' | 'WFS' | 'WMTS' | 'ALL' = 'WMS';
+          if (!isWmsAvailable && isWfsAvailable) {
+            autoCapabilitiesMode = 'WFS';
+          } else if (!isWmsAvailable && !isWfsAvailable && isWmtsAvailable) {
+            autoCapabilitiesMode = 'WMTS';
+          }
+
+          servicesStore.setConfig({
+            wms: { enabled: isWmsAvailable, version: s.wms?.version || '1.3.0' },
+            wfs: { enabled: isWfsAvailable, version: s.wfs?.version || '1.1.0' },
+            wmts: { enabled: isWmtsAvailable, version: s.wmts?.version || '1.0.0' },
+            wcs: { enabled: isWcsAvailable, version: s.wcs?.version || '2.0.1' },
+            wps: { enabled: isWpsAvailable, version: s.wps?.version || '1.0.0' },
+            capabilitiesMode: autoCapabilitiesMode,
+            defaultLayerService: isWmsAvailable ? 'WMS' : (isWmtsAvailable ? 'WMTS' : 'WMS'),
+          });
+        }
+      } catch (checkErr) {
+        console.warn('Internal service detection fallback:', checkErr);
+      }
 
       notification.success({
         title: 'Authentication successful',
@@ -295,6 +339,20 @@ function LoginForm() {
                   </Button>
                 </Form.Item>
               </Form>
+
+              <div className="relative my-4 flex items-center justify-center">
+                <div className="w-full border-t border-gray-100" />
+                <span className="absolute bg-white px-3 text-xs text-gray-400 font-semibold uppercase tracking-wider">or</span>
+              </div>
+
+              <Button
+                type="default"
+                onClick={() => router.push('/quick-map')}
+                className="w-full h-12 rounded-xl text-base font-bold border-gray-200 hover:border-gray-300 bg-gray-50/80 hover:bg-gray-100/80 text-gray-700 transition-all flex items-center justify-center gap-2 cursor-pointer shadow-xs"
+              >
+                <Compass size={18} className="text-gray-500" />
+                <span>Quick Map</span>
+              </Button>
             </ConfigProvider>
           </Card>
 

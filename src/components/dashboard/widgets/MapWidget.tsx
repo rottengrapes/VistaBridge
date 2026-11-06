@@ -59,6 +59,26 @@ export default function MapWidget({ widgetId, layers = [] }: Props) {
   const highlightLayerRef = useRef<any>(null);
   const [ready, setReady] = useState(false);
   const { setActiveMapDatasetIds, subscribe, updateMapBboxes } = useDashboardStore();
+  const refreshTrigger = useDashboardStore((state) => state.refreshTrigger);
+
+  // Auto-refresh: reload OpenLayers tile/vector sources on refreshTrigger
+  useEffect(() => {
+    if (!ready || !mapInstance.current || refreshTrigger === 0) return;
+    try {
+      Object.values(olLayersRef.current).forEach((olLayer: any) => {
+        const source = olLayer?.getSource?.();
+        if (source) {
+          if (typeof source.updateParams === 'function') {
+            source.updateParams({ _t: refreshTrigger });
+          } else if (typeof source.refresh === 'function') {
+            source.refresh();
+          }
+        }
+      });
+    } catch (err) {
+      console.warn('[MapWidget] Error refreshing map layers:', err);
+    }
+  }, [refreshTrigger, ready]);
 
   const isInitialZoomingRef = useRef(layers.length > 0);
   const updateBboxRef = useRef<() => void>(() => {});

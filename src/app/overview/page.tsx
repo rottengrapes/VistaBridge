@@ -12,8 +12,9 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
+import { useGeoServerServicesStore } from '@/store/useGeoServerServicesStore';
 import { Spin, Typography, Card } from 'antd';
-import { User as UserIcon, Layers, Globe, Layers3 } from 'lucide-react';
+import { User as UserIcon, Layers, Globe, Layers3, Server, CheckCircle2, XCircle, RefreshCw } from 'lucide-react';
 import DashboardLayout from '@/components/layout/DashboardLayout';
 
 const { Title, Text } = Typography;
@@ -43,6 +44,7 @@ interface GeoserverOverviewData {
 export default function OverviewPage() {
   const router = useRouter();
   const { user, token, hydrated } = useAuthStore();
+  const services = useGeoServerServicesStore();
   const [geoserverData, setGeoserverData] = useState<GeoserverOverviewData | null>(null);
   const [geoserverLoading, setGeoserverLoading] = useState(true);
 
@@ -140,6 +142,39 @@ export default function OverviewPage() {
           }
         }
 
+        // Also probe and synchronize active service capabilities
+        try {
+          const checkRes = await fetch('/api/geoserver/services/check');
+          if (checkRes.ok) {
+            const checkData = await checkRes.json();
+            const s = checkData.services || {};
+            const isWmsAvailable = !!s.wms?.available;
+            const isWfsAvailable = !!s.wfs?.available;
+            const isWmtsAvailable = !!s.wmts?.available;
+            const isWcsAvailable = !!s.wcs?.available;
+            const isWpsAvailable = !!s.wps?.available;
+
+            let autoCapabilitiesMode: 'WMS' | 'WFS' | 'WMTS' | 'ALL' = 'WMS';
+            if (!isWmsAvailable && isWfsAvailable) {
+              autoCapabilitiesMode = 'WFS';
+            } else if (!isWmsAvailable && !isWfsAvailable && isWmtsAvailable) {
+              autoCapabilitiesMode = 'WMTS';
+            }
+
+            services.setConfig({
+              wms: { enabled: isWmsAvailable, version: s.wms?.version || '1.3.0' },
+              wfs: { enabled: isWfsAvailable, version: s.wfs?.version || '1.1.0' },
+              wmts: { enabled: isWmtsAvailable, version: s.wmts?.version || '1.0.0' },
+              wcs: { enabled: isWcsAvailable, version: s.wcs?.version || '2.0.1' },
+              wps: { enabled: isWpsAvailable, version: s.wps?.version || '1.0.0' },
+              capabilitiesMode: autoCapabilitiesMode,
+              defaultLayerService: isWmsAvailable ? 'WMS' : (isWmtsAvailable ? 'WMTS' : 'WMS'),
+            });
+          }
+        } catch (servicesErr) {
+          console.warn('Overview services check:', servicesErr);
+        }
+
         setGeoserverData({
           geoserverConnected,
           workspaces: workspacesList,
@@ -224,7 +259,7 @@ export default function OverviewPage() {
           </Card>
         </div>
 
-        {/* Second Row: Layer Groups Card aligned under column 1 */}
+        {/* Second Row: Layer Groups Card and GeoServer Services & Capabilities Card */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Card 4: Layer Groups */}
           <Card variant="borderless" className="shadow-sm rounded-3xl hover:shadow-md transition-all group bg-white border border-gray-100/55 p-5">
@@ -237,6 +272,75 @@ export default function OverviewPage() {
               </div>
               <div className="w-12 h-12 bg-teal-50 text-teal-600 rounded-2xl flex items-center justify-center group-hover:scale-110 transition-transform shadow-sm">
                 <Layers3 size={24} />
+              </div>
+            </div>
+          </Card>
+
+          {/* Card 5: GeoServer Services & Capabilities Overview (Spans 2 columns) */}
+          <Card variant="borderless" className="shadow-sm rounded-3xl hover:shadow-md transition-all bg-white border border-gray-100/55 p-5 md:col-span-2">
+            <div className="flex flex-col h-full justify-between gap-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-9 h-9 bg-blue-50 text-blue-600 rounded-xl flex items-center justify-center">
+                    <Server size={18} />
+                  </div>
+                  <div>
+                    <span className="text-xs uppercase font-bold tracking-widest block text-gray-400">Active GeoServer Services</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Service Badges Grid */}
+              <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 pt-2 border-t border-gray-100">
+                <div className={`p-2.5 rounded-xl border flex flex-col gap-1 ${services.wms.enabled ? 'bg-emerald-50/50 border-emerald-200' : 'bg-gray-50 border-gray-200 opacity-60'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-gray-800">WMS</span>
+                    {services.wms.enabled ? <CheckCircle2 size={13} className="text-emerald-600" /> : <XCircle size={13} className="text-gray-400" />}
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    {services.wms.enabled ? `v${services.wms.version} Active` : 'Disabled'}
+                  </span>
+                </div>
+
+                <div className={`p-2.5 rounded-xl border flex flex-col gap-1 ${services.wfs.enabled ? 'bg-emerald-50/50 border-emerald-200' : 'bg-gray-50 border-gray-200 opacity-60'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-gray-800">WFS</span>
+                    {services.wfs.enabled ? <CheckCircle2 size={13} className="text-emerald-600" /> : <XCircle size={13} className="text-gray-400" />}
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    {services.wfs.enabled ? `v${services.wfs.version} Active` : 'Disabled'}
+                  </span>
+                </div>
+
+                <div className={`p-2.5 rounded-xl border flex flex-col gap-1 ${services.wmts.enabled ? 'bg-emerald-50/50 border-emerald-200' : 'bg-gray-50 border-gray-200 opacity-60'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-gray-800">WMTS</span>
+                    {services.wmts.enabled ? <CheckCircle2 size={13} className="text-emerald-600" /> : <XCircle size={13} className="text-gray-400" />}
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    {services.wmts.enabled ? `v${services.wmts.version} Active` : 'Disabled'}
+                  </span>
+                </div>
+
+                <div className={`p-2.5 rounded-xl border flex flex-col gap-1 ${services.wcs.enabled ? 'bg-emerald-50/50 border-emerald-200' : 'bg-gray-50 border-gray-200 opacity-60'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-gray-800">WCS</span>
+                    {services.wcs.enabled ? <CheckCircle2 size={13} className="text-emerald-600" /> : <XCircle size={13} className="text-gray-400" />}
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    {services.wcs.enabled ? `v${services.wcs.version} Active` : 'Disabled'}
+                  </span>
+                </div>
+
+                <div className={`p-2.5 rounded-xl border flex flex-col gap-1 ${services.wps.enabled ? 'bg-emerald-50/50 border-emerald-200' : 'bg-gray-50 border-gray-200 opacity-60'}`}>
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-gray-800">WPS</span>
+                    {services.wps.enabled ? <CheckCircle2 size={13} className="text-emerald-600" /> : <XCircle size={13} className="text-gray-400" />}
+                  </div>
+                  <span className="text-[10px] text-gray-500 font-medium">
+                    {services.wps.enabled ? `v${services.wps.version} Active` : 'Disabled'}
+                  </span>
+                </div>
               </div>
             </div>
           </Card>

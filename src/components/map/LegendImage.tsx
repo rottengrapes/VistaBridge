@@ -13,6 +13,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { useAuthStore } from '@/store/useAuthStore';
+import { useGeoServerServicesStore } from '@/store/useGeoServerServicesStore';
 
 interface LegendImageProps {
   url: string;
@@ -21,10 +22,18 @@ interface LegendImageProps {
 
 export default function LegendImage({ url, notification }: LegendImageProps) {
   const { user } = useAuthStore();
+  const { wms } = useGeoServerServicesStore();
   const [src, setSrc] = useState<string>('');
   const [loading, setLoading] = useState(true);
 
+  const isWmsDisabled = wms?.enabled === false;
+
   useEffect(() => {
+    if (isWmsDisabled) {
+      setLoading(false);
+      return;
+    }
+
     let active = true;
     let objectUrl = '';
 
@@ -73,6 +82,15 @@ export default function LegendImage({ url, notification }: LegendImageProps) {
 
   if (loading) {
     return <div className="text-xs text-gray-400 py-4 text-center">Loading legend...</div>;
+  }
+
+  if (isWmsDisabled) {
+    return (
+      <div className="text-[11px] text-gray-500 py-2.5 px-3 bg-gray-50/80 rounded border border-gray-200/50 flex items-center gap-2">
+        <span className="w-2.5 h-2.5 rounded-full bg-blue-500 shrink-0" />
+        <span>Vector Layer (WMS legend unavailable)</span>
+      </div>
+    );
   }
 
   if (!src) {

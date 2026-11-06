@@ -16,6 +16,7 @@
 import { NextResponse } from 'next/server';
 import { pool, initDb } from '@/lib/db';
 import { verifyJwt } from '@/lib/jwt';
+import { validateSlug, slugify } from '@/lib/slug';
 
 // Ensure SQLite tables are initialized before handling queries
 let dbInitialized = false;
@@ -53,10 +54,10 @@ export async function GET(
       );
     }
 
-    const result = await pool.query('SELECT * FROM map_workspaces WHERE id = $1', [id]);
+    const result = await pool.query('SELECT * FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [id]);
     if (result.rows.length === 0) {
       return NextResponse.json(
-        { detail: `Map workspace with ID "${id}" not found.` },
+        { detail: `Map workspace "${id}" not found.` },
         { status: 404 }
       );
     }
@@ -82,6 +83,7 @@ export async function GET(
 
     const map = {
       id: row.id,
+      slug: row.slug || row.id,
       name: row.name,
       description: row.description || '',
       share: row.share || 'PRIVATE',
@@ -137,17 +139,19 @@ export async function PATCH(
     }
 
     const body = await request.json();
-    const { name, description, share, center_lon, center_lat, zoom, basemap_id, layers } = body;
+    const { name, slug, description, share, center_lon, center_lat, zoom, basemap_id, layers } = body;
 
-    const selectResult = await pool.query('SELECT * FROM map_workspaces WHERE id = $1', [id]);
+    const selectResult = await pool.query('SELECT * FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [id]);
     if (selectResult.rows.length === 0) {
       return NextResponse.json(
-        { detail: `Map workspace with ID "${id}" not found.` },
+        { detail: `Map workspace "${id}" not found.` },
         { status: 404 }
       );
     }
 
     const existing = selectResult.rows[0];
+    const internalId = existing.id;
+
     if (existing.created_by && existing.created_by !== user.username) {
       return NextResponse.json(
         { detail: 'You do not have permission to update this workspace.' },
@@ -185,6 +189,40 @@ export async function PATCH(
       updatedName = trimmedName;
     }
 
+    let updatedSlug = existing.slug;
+    if (slug !== undefined) {
+      const validation = validateSlug(slug, 'map');
+      if (!validation.valid) {
+        return NextResponse.json({ detail: validation.error }, { status: 400 });
+      }
+      const newSlug = validation.cleaned!;
+      const conflict = await pool.query(
+        'SELECT id FROM map_workspaces WHERE LOWER(slug) = LOWER($1) AND id != $2',
+        [newSlug, internalId]
+      );
+      if (conflict.rows.length > 0) {
+        return NextResponse.json(
+          { detail: `Slug "${newSlug}" is already in use by another workspace.` },
+          { status: 409 }
+        );
+      }
+      updatedSlug = newSlug;
+    } else if (name !== undefined && updatedName !== existing.name) {
+      // Auto-update slug on rename
+      const baseSlug = slugify(updatedName) || 'map';
+      const existingRes = await pool.query(
+        "SELECT slug FROM map_workspaces WHERE slug IS NOT NULL AND TRIM(slug) != '' AND id != $1",
+        [internalId]
+      );
+      const usedSlugs = new Set((existingRes.rows || []).map((r: any) => String(r.slug).toLowerCase()));
+      let candidate = baseSlug;
+      let counter = 1;
+      while (usedSlugs.has(candidate.toLowerCase())) {
+        candidate = `${baseSlug}_${counter++}`;
+      }
+      updatedSlug = candidate;
+    }
+
     const updatedDesc = description !== undefined ? (typeof description === 'string' ? description.trim() : description) : existing.description;
     const updatedShare = share !== undefined ? share : existing.share;
     const updatedCenterLon = center_lon !== undefined ? center_lon : existing.center_lon;
@@ -199,8 +237,8 @@ export async function PATCH(
     await pool.query(
       `UPDATE map_workspaces 
        SET name = $1, description = $2, share = $3, center_lon = $4, center_lat = $5, 
-           zoom = $6, basemap_id = $7, layers = $8, updated_at = $9 
-       WHERE id = $10`,
+           zoom = $6, basemap_id = $7, layers = $8, updated_at = $9, slug = $10 
+       WHERE id = $11`,
       [
         updatedName,
         updatedDesc,
@@ -211,12 +249,14 @@ export async function PATCH(
         updatedBasemapId,
         JSON.stringify(parsedLayers),
         updatedTime,
-        id
+        updatedSlug,
+        internalId
       ]
     );
 
     const updatedMap = {
-      id,
+      id: internalId,
+      slug: updatedSlug || internalId,
       name: updatedName,
       description: updatedDesc || '',
       share: updatedShare || 'PRIVATE',
@@ -263,10 +303,10 @@ export async function DELETE(
       );
     }
 
-    const selectResult = await pool.query('SELECT * FROM map_workspaces WHERE id = $1', [id]);
+    const selectResult = await pool.query('SELECT * FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [id]);
     if (selectResult.rows.length === 0) {
       return NextResponse.json(
-        { detail: `Map workspace with ID "${id}" not found.` },
+        { detail: `Map workspace "${id}" not found.` },
         { status: 404 }
       );
     }
@@ -279,7 +319,7 @@ export async function DELETE(
       );
     }
 
-    await pool.query('DELETE FROM map_workspaces WHERE id = $1', [id]);
+    await pool.query('DELETE FROM map_workspaces WHERE id = $1', [existing.id]);
     return NextResponse.json({ success: true });
   } catch (err) {
     console.error('Failed to delete map workspace:', err);

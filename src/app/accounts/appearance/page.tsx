@@ -38,6 +38,7 @@ import {
 import DashboardLayout from '@/components/layout/DashboardLayout';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useAppearanceStore } from '@/store/useAppearanceStore';
+import { isUserAdmin } from '@/lib/dashboardPermissions';
 import { siteConfig } from '@/config/site-config';
 import basemapsConfig from '@/config/basemap.config.json';
 
@@ -210,7 +211,7 @@ export default function AppearancePage() {
       router.replace('/login');
       return;
     }
-    const isAdmin = user?.role === 'ADMIN' || user?.username === 'admin';
+    const isAdmin = isUserAdmin(user);
     if (!isAdmin) {
       notification.warning({
         message: 'Access Restricted',
@@ -525,7 +526,7 @@ export default function AppearancePage() {
     }
   };
 
-  const isAdmin = user?.role === 'ADMIN' || user?.username === 'admin';
+  const isAdmin = isUserAdmin(user);
 
   if (!hydrated || !user || !isAdmin) {
     return (

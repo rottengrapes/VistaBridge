@@ -15,8 +15,8 @@
 /* eslint-disable @next/next/no-img-element */
 import 'ol/ol.css';
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { Modal, Button, Input, Select, Checkbox, Radio, Tooltip, App } from 'antd';
-import { Printer, Download, Map as MapIcon } from 'lucide-react';
+   import { Modal, Button, Input, Select, Checkbox, Radio, Tooltip, App, Popconfirm } from 'antd';
+import { Printer, Download, Map as MapIcon, Save, Trash2, Plus, Bookmark, Settings } from 'lucide-react';
 import Map from 'ol/Map';
 import View from 'ol/View';
 import TileLayer from 'ol/layer/Tile';
@@ -342,9 +342,32 @@ interface GeoServerLayerState {
   activeStyle?: string;
 }
 
+export interface SavedPrintTemplate {
+  id: string;
+  mapId?: string | null;
+  name: string;
+  layout: 'portrait' | 'landscape';
+  pageSize: 'A4' | 'A3' | 'Letter';
+  dpi: number;
+  positions: any;
+  styles: any;
+  pageElements?: {
+    includeGraticule?: boolean;
+    includeLegend?: boolean;
+    includeNorthArrow?: boolean;
+    includeOfficeUse?: boolean;
+    includeScale?: boolean;
+    zOrder?: string[];
+  } | null;
+  createdBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 interface PrintComponentProps {
   mapInstance: Map | null;
   addedLayers?: GeoServerLayerState[];
+  mapId?: string;
 }
 
 interface PrintSettings {
@@ -355,7 +378,7 @@ interface PrintSettings {
   includeGraticule: boolean;
   layout: 'portrait' | 'landscape';
   format: 'pdf' | 'jpeg';
-  template: 'template1' | 'template2' | 'template3' | 'template4' | 'custom';
+  template: 'template1' | 'template2' | 'template3' | 'template4' | 'custom' | string;
   includeLegend: boolean;
   includeNorthArrow: boolean;
   includeOfficeUse: boolean;
@@ -531,6 +554,124 @@ function buildLegendUrl(layerName: string, styleName: string): string {
   });
   return `${GEOSERVER_BASE}/wms?${params.toString()}`;
 }
+
+function generateVectorLegendDataUrl(
+  layerName: string,
+  matchingLayer?: any,
+  olLayer?: any
+): { dataUrl: string; width: number; height: number } {
+  if (typeof document === 'undefined') {
+    return { dataUrl: '', width: 120, height: 24 };
+  }
+
+  let geomType = 'Polygon';
+  let strokeColor = '#2563eb';
+  let fillColor = 'rgba(37, 99, 235, 0.25)';
+  let label = 'Polygon';
+
+  if (olLayer && typeof olLayer.getSource === 'function') {
+    try {
+      const src = olLayer.getSource();
+      if (src && typeof src.getFeatures === 'function') {
+        const features = src.getFeatures();
+        if (features.length > 0) {
+          const firstGeom = features[0]?.getGeometry()?.getType();
+          if (firstGeom) geomType = firstGeom;
+        }
+      }
+    } catch {}
+  }
+
+  if (olLayer && typeof olLayer.getStyle === 'function') {
+    try {
+      const styleVal = olLayer.getStyle();
+      let resolvedStyle = styleVal;
+      if (typeof styleVal === 'function') {
+        const src = olLayer.getSource?.();
+        const feat = src?.getFeatures?.()?.[0];
+        if (feat) {
+          resolvedStyle = styleVal(feat, 1);
+        }
+      }
+      if (Array.isArray(resolvedStyle)) resolvedStyle = resolvedStyle[0];
+      if (resolvedStyle) {
+        const stroke = resolvedStyle.getStroke?.();
+        if (stroke && stroke.getColor?.()) strokeColor = String(stroke.getColor());
+        const fill = resolvedStyle.getFill?.();
+        if (fill && fill.getColor?.()) fillColor = String(fill.getColor());
+      }
+    } catch {}
+  }
+
+  const matchingType = (matchingLayer?.type || '').toLowerCase();
+  const lowerGeom = geomType.toLowerCase();
+  const lowerName = (layerName || '').toLowerCase();
+
+  if (lowerGeom.includes('point') || matchingType.includes('point') || lowerName.includes('point')) {
+    geomType = 'Point';
+    label = 'Point';
+  } else if (lowerGeom.includes('line') || matchingType.includes('line') || lowerName.includes('line') || lowerName.includes('road')) {
+    geomType = 'LineString';
+    label = 'Line';
+  } else {
+    geomType = 'Polygon';
+    label = 'Polygon';
+  }
+
+  const width = 120;
+  const height = 24;
+  const scale = 2;
+  const canvas = document.createElement('canvas');
+  canvas.width = width * scale;
+  canvas.height = height * scale;
+  const ctx = canvas.getContext('2d');
+
+  if (ctx) {
+    ctx.scale(scale, scale);
+
+    if (geomType === 'Point') {
+      ctx.beginPath();
+      ctx.arc(12, 12, 5.5, 0, 2 * Math.PI);
+      ctx.fillStyle = strokeColor;
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#ffffff';
+      ctx.stroke();
+    } else if (geomType === 'LineString') {
+      ctx.beginPath();
+      ctx.moveTo(4, 12);
+      ctx.lineTo(22, 12);
+      ctx.lineWidth = 3;
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = strokeColor;
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      if ((ctx as any).roundRect) {
+        (ctx as any).roundRect(4, 4, 18, 15, 3);
+      } else {
+        ctx.rect(4, 4, 18, 15);
+      }
+      ctx.fillStyle = fillColor || 'rgba(37, 99, 235, 0.25)';
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = strokeColor;
+      ctx.stroke();
+    }
+
+    ctx.font = '500 10.5px Inter, Arial, sans-serif';
+    ctx.fillStyle = '#4b5563';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(label, 28, 12.5);
+  }
+
+  return {
+    dataUrl: canvas.toDataURL('image/png'),
+    width,
+    height,
+  };
+}
+
 
 type LegendItem =
   | { type: 'wms'; id: string; name: string; legendUrl: string }
@@ -750,11 +891,22 @@ function calculateLegendSplit(
   return { page1Wms, page1Vector, overflowPages };
 }
 
-export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, addedLayers = [] }) => {
+export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, addedLayers = [], mapId }) => {
   const { notification } = App.useApp();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
+
+  // Saved Custom Print Templates for the current map workspace
+  const [savedTemplates, setSavedTemplates] = useState<SavedPrintTemplate[]>([]);
+  const [isLoadingTemplates, setIsLoadingTemplates] = useState(false);
+  const [isSaveModalOpen, setIsSaveModalOpen] = useState(false);
+  const [saveTemplateName, setSaveTemplateName] = useState('');
+  const [isSavingTemplate, setIsSavingTemplate] = useState(false);
+  const [isSavePromptOpen, setIsSavePromptOpen] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [isManageModalOpen, setIsManageModalOpen] = useState(false);
+  const [templateToDelete, setTemplateToDelete] = useState<SavedPrintTemplate | null>(null);
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -800,7 +952,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
         ? view.calculateExtent(size)
         : null;
 
-      const visibleWmsLayers: Array<{ id: string; url: string }> = [];
+      const visibleWmsLayers: Array<{ id: string; url: string; layerName?: string; matchingLayer?: any; olLayer?: any }> = [];
       const seenLayers = new Set<string>();
 
       previewMapInstance.getLayers().forEach((layer: any) => {
@@ -844,13 +996,13 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
               ? activeStyleObj.legendUrl
               : buildLegendUrl(layerName, activeStyle);
 
-            visibleWmsLayers.push({ id: layerId || layerName, url: legendUrl });
+            visibleWmsLayers.push({ id: layerId || layerName, url: legendUrl, layerName, matchingLayer, olLayer: layer });
           }
         }
       });
 
       await Promise.all(
-        visibleWmsLayers.map(async (entry) => {
+        visibleWmsLayers.map(async (entry: any) => {
           const cached = legendCacheRef.current[entry.url];
           if (cached) {
             results[entry.id] = cached.dataUrl;
@@ -858,38 +1010,57 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
             return;
           }
 
+          let dataUrl: string | null = null;
+          let dims: { width: number; height: number } | null = null;
+
           try {
             const res = await fetch(entry.url, { headers });
-            if (!res.ok) return;
-            const blob = await res.blob();
-            const dataUrl = await new Promise<string | null>((resolve) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.onerror = () => resolve(null);
-              reader.readAsDataURL(blob);
-            });
+            if (res.ok) {
+              const contentType = res.headers.get('content-type') || '';
+              if (!contentType.includes('xml') && !contentType.includes('text')) {
+                const blob = await res.blob();
+                const readUrl = await new Promise<string | null>((resolve) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => resolve(reader.result as string);
+                  reader.onerror = () => resolve(null);
+                  reader.readAsDataURL(blob);
+                });
 
-            if (dataUrl && active) {
-              const dims = await new Promise<{ width: number; height: number } | null>((resolve) => {
-                const img = new Image();
-                img.onload = () => {
-                  resolve({
-                    width: img.naturalWidth || img.width || 1,
-                    height: img.naturalHeight || img.height || 1
+                if (readUrl) {
+                  const measuredDims = await new Promise<{ width: number; height: number } | null>((resolve) => {
+                    const img = new Image();
+                    img.onload = () => {
+                      resolve({
+                        width: img.naturalWidth || img.width || 1,
+                        height: img.naturalHeight || img.height || 1
+                      });
+                    };
+                    img.onerror = () => resolve(null);
+                    img.src = readUrl;
                   });
-                };
-                img.onerror = () => resolve(null);
-                img.src = dataUrl;
-              });
 
-              if (dims) {
-                legendCacheRef.current[entry.url] = { dataUrl, width: dims.width, height: dims.height };
-                results[entry.id] = dataUrl;
-                resultsDims[entry.id] = dims;
+                  if (measuredDims) {
+                    dataUrl = readUrl;
+                    dims = measuredDims;
+                  }
+                }
               }
             }
           } catch (err) {
-            console.error('Failed to load preview legend:', err);
+            // WMS legend fetch failed or disabled
+          }
+
+          // Fallback to client-side vector legend swatch if WMS GetLegendGraphic is disabled or failed
+          if (!dataUrl || !dims) {
+            const fallback = generateVectorLegendDataUrl(entry.layerName, entry.matchingLayer, entry.olLayer);
+            dataUrl = fallback.dataUrl;
+            dims = { width: fallback.width, height: fallback.height };
+          }
+
+          if (dataUrl && dims && active) {
+            legendCacheRef.current[entry.url] = { dataUrl, width: dims.width, height: dims.height };
+            results[entry.id] = dataUrl;
+            resultsDims[entry.id] = dims;
           }
         })
       );
@@ -1004,6 +1175,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
         [key]: value
       }
     }));
+    setHasUnsavedChanges(true);
   };
 
   const [settings, setSettings] = useState<PrintSettings>({
@@ -1022,6 +1194,172 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     scaleType: 'auto',
     customScaleValue: 20000
   });
+
+  const isCustomTemplate = settings.template === 'custom' || savedTemplates.some(t => t.id === settings.template);
+  const currentSavedTemplate = savedTemplates.find(t => t.id === settings.template);
+
+  const loadSavedTemplates = useCallback(async () => {
+    setIsLoadingTemplates(true);
+    try {
+      const res = await fetch('/api/maps/print-templates');
+      if (res.ok) {
+        const data = await res.json();
+        setSavedTemplates(Array.isArray(data) ? data : []);
+      }
+    } catch (err) {
+      console.error('Failed to load saved print templates:', err);
+    } finally {
+      setIsLoadingTemplates(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isModalOpen) {
+      loadSavedTemplates();
+    }
+  }, [isModalOpen, loadSavedTemplates]);
+
+  const handleTemplateChange = (value: string) => {
+    if (value === 'custom') {
+      setSettings(prev => ({ ...prev, template: 'custom' }));
+      setHasUnsavedChanges(true);
+      return;
+    }
+
+    const saved = savedTemplates.find(t => t.id === value);
+    if (saved) {
+      setSettings(prev => ({
+        ...prev,
+        template: saved.id,
+        layout: saved.layout,
+        pageSize: saved.pageSize,
+        dpi: saved.dpi,
+        ...(saved.pageElements || {})
+      }));
+      if (saved.positions) setCustomPositions(saved.positions);
+      if (saved.styles) setCustomStyles(saved.styles);
+      if (saved.pageElements?.zOrder && Array.isArray(saved.pageElements.zOrder)) {
+        setZOrder(saved.pageElements.zOrder);
+      }
+      setHasUnsavedChanges(false);
+      return;
+    }
+
+    // Default template
+    setSettings(prev => ({ ...prev, template: value }));
+    setHasUnsavedChanges(false);
+  };
+
+  const handleSaveTemplate = async (templateName: string, asNew = false) => {
+    const trimmedName = (templateName || '').trim();
+    if (!trimmedName) {
+      notification.warning({
+        message: 'Template Name Required',
+        description: 'Please enter a name for your custom template.',
+        placement: 'topRight'
+      });
+      return false;
+    }
+
+    setIsSavingTemplate(true);
+    try {
+      const existingId = (!asNew && currentSavedTemplate) ? currentSavedTemplate.id : undefined;
+      const res = await fetch('/api/maps/print-templates', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: existingId,
+          mapId: mapId || null,
+          name: trimmedName,
+          layout: settings.layout,
+          pageSize: settings.pageSize,
+          dpi: settings.dpi,
+          positions: customPositions,
+          styles: customStyles,
+          pageElements: {
+            includeGraticule: settings.includeGraticule,
+            includeLegend: settings.includeLegend,
+            includeNorthArrow: settings.includeNorthArrow,
+            includeOfficeUse: settings.includeOfficeUse,
+            includeScale: settings.includeScale,
+            zOrder
+          },
+          createdBy: user?.username || ''
+        })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      const savedTpl: SavedPrintTemplate = data.template;
+
+      setSavedTemplates(prev => {
+        const idx = prev.findIndex(t => t.id === savedTpl.id);
+        if (idx >= 0) {
+          const next = [...prev];
+          next[idx] = savedTpl;
+          return next;
+        }
+        return [...prev, savedTpl];
+      });
+
+      setSettings(prev => ({ ...prev, template: savedTpl.id }));
+      setHasUnsavedChanges(false);
+      setIsSaveModalOpen(false);
+
+      notification.success({
+        message: 'Template Saved',
+        description: `Custom print template "${savedTpl.name}" saved! It is now available across all map workspaces.`,
+        placement: 'topRight'
+      });
+      return true;
+    } catch (err: any) {
+      notification.error({
+        message: 'Save Failed',
+        description: err?.message || 'Could not save print template.',
+        placement: 'topRight'
+      });
+      return false;
+    } finally {
+      setIsSavingTemplate(false);
+    }
+  };
+
+  const handleDeleteTemplate = async (templateId: string) => {
+    try {
+      const res = await fetch(`/api/maps/print-templates?id=${encodeURIComponent(templateId)}`, {
+        method: 'DELETE'
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || 'Failed to delete template');
+      }
+
+      setSavedTemplates(prev => prev.filter(t => t.id !== templateId));
+      if (settings.template === templateId) {
+        setSettings(prev => ({
+          ...prev,
+          template: settings.layout === 'landscape' ? 'template1' : 'template2'
+        }));
+        setHasUnsavedChanges(false);
+      }
+
+      notification.success({
+        message: 'Template Deleted',
+        description: 'Custom print template deleted successfully.',
+        placement: 'topRight'
+      });
+    } catch (err: any) {
+      notification.error({
+        message: 'Delete Failed',
+        description: err?.message || 'Could not delete template.',
+        placement: 'topRight'
+      });
+    }
+  };
 
   const includeGraticuleRef = useRef(settings.includeGraticule);
   useEffect(() => {
@@ -1043,6 +1381,9 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
   // Reset custom elements layout based on orientation
   useEffect(() => {
     queueMicrotask(() => {
+      // Don't reset if a saved custom template is currently active
+      if (savedTemplates.some(t => t.id === settings.template)) return;
+
       if (settings.layout === 'landscape') {
         setCustomPositions({
           map: { left: 2, top: 2, width: 68, height: 96 },
@@ -1066,11 +1407,11 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       }
       setSelectedElementId(null);
     });
-  }, [settings.layout]);
+  }, [settings.layout, settings.template, savedTemplates]);
 
-  // Change template when layout changes (unless custom is selected)
+  // Change template when layout changes (unless custom or saved custom is selected)
   useEffect(() => {
-    if (settings.template === 'custom') return;
+    if (isCustomTemplate) return;
     queueMicrotask(() => {
       if (settings.layout === 'portrait' && (settings.template === 'template1' || settings.template === 'template3')) {
         setSettings(prev => ({ ...prev, template: 'template2' }));
@@ -1078,7 +1419,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
         setSettings(prev => ({ ...prev, template: 'template1' }));
       }
     });
-  }, [settings.layout, settings.template]);
+  }, [settings.layout, settings.template, isCustomTemplate]);
 
   // Resize Handler
   const startResize = (e: React.MouseEvent, id: string) => {
@@ -1123,6 +1464,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     const stopResize = () => {
       document.removeEventListener('mousemove', doResize);
       document.removeEventListener('mouseup', stopResize);
+      setHasUnsavedChanges(true);
     };
 
     document.addEventListener('mousemove', doResize);
@@ -1141,6 +1483,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     const id = active.id;
 
     if (delta && pageContainerRef.current) {
+      setHasUnsavedChanges(true);
       const containerRect = pageContainerRef.current.getBoundingClientRect();
 
       setCustomPositions((prev) => {
@@ -1524,7 +1867,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     let placeholderImg: HTMLImageElement | null = null;
     if (previewMapRef.current) {
       try {
-        const placeholderCanvas = captureMapAsCanvas(previewMapInstance, 1, settings.includeNorthArrow && settings.template !== 'custom');
+        const placeholderCanvas = captureMapAsCanvas(previewMapInstance, 1, settings.includeNorthArrow && !isCustomTemplate);
         placeholderImg = document.createElement('img');
         placeholderImg.src = placeholderCanvas.toDataURL('image/jpeg', 0.95);
         placeholderImg.style.position = 'absolute';
@@ -1584,7 +1927,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       });
 
       // Capture the high resolution canvas
-      const canvas = captureMapAsCanvas(previewMapInstance, scale, settings.includeNorthArrow && settings.template !== 'custom');
+      const canvas = captureMapAsCanvas(previewMapInstance, scale, settings.includeNorthArrow && !isCustomTemplate);
       return canvas;
     } finally {
       // Always restore original target, size and resolution
@@ -1619,10 +1962,15 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     let colWidth = 240;
     let fontSize = 8;
 
-    if (settings.template === 'custom') {
+    if (isCustomTemplate) {
       const legendHeight = (customPositions.legend.height / 100) * pageHeightPt;
       fontSize = customStyles.legend?.fontSize || 8;
-      availableHeight = legendHeight - (fontSize * 3.0);
+      // In PDF/Canvas generation, the legend box reserves space for:
+      // - Legend header label: ~fontSize * 2.5
+      // - Padding and borders: ~20pt
+      // - Bottom margin / "* Continued on Page 2..." notice: ~20-25pt
+      const overhead = (fontSize * 2.5) + 48;
+      availableHeight = Math.max(40, legendHeight - overhead);
       colWidth = (customPositions.legend.width / 100) * pageWidthPt;
     } else if (settings.layout === 'landscape') {
       // Landscape templates (sidebar details on right or left)
@@ -1680,7 +2028,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     }
 
     if (previewMapInstance) {
-      const legendUrlsToFetch: Array<{ id: string; name: string; url: string }> = [];
+      const legendUrlsToFetch: Array<{ id: string; name: string; url: string; matchingLayer?: any; olLayer?: any }> = [];
       const seenLayers = new Set<string>();
 
       previewMapInstance.getLayers().forEach((layer: any) => {
@@ -1724,14 +2072,19 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
               ? activeStyleObj.legendUrl
               : buildLegendUrl(layerName, activeStyle);
 
-            legendUrlsToFetch.push({ id: layerId || layerName, name: layerName, url: legendUrl });
+            legendUrlsToFetch.push({ id: layerId || layerName, name: layerName, url: legendUrl, matchingLayer, olLayer: layer });
           }
         }
       });
 
-      legendUrlsToFetch.forEach((item) => {
-        const base64 = loadedLegends[item.id] || null;
-        const dims = legendDimensions[item.id] || null;
+      legendUrlsToFetch.forEach((item: any) => {
+        let base64 = loadedLegends[item.id] || null;
+        let dims = legendDimensions[item.id] || null;
+        if (!base64 || !dims) {
+          const fallback = generateVectorLegendDataUrl(item.name, item.matchingLayer, item.olLayer);
+          base64 = fallback.dataUrl;
+          dims = { width: fallback.width, height: fallback.height };
+        }
         geoserverLegends.push({
           id: item.id,
           name: item.name,
@@ -1943,7 +2296,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     let mapX = mapAreaX;
     let mapY = mapAreaY;
 
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       // Canvas maintains north orientation (not rotated)
       const canvasAspectRatio = canvas.width / canvas.height;
       const areaAspectRatio = mapAreaWidth / mapAreaHeight;
@@ -1958,13 +2311,13 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     }
 
     // Page border (uniform black, line weight 1.5) - Only for standard templates
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       pdf.setLineWidth(borderWidth);
       pdf.setDrawColor(0, 0, 0);
       pdf.rect(margin, margin, pageWidthPt - (2 * margin), pageHeightPt - (2 * margin));
     }
 
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       // Map image (high quality JPEG) - north arrow already embedded in canvas
       const imgData = canvas.toDataURL('image/jpeg', 1.0);
       pdf.addImage(imgData, 'JPEG', mapX, mapY, mapWidth, mapHeight, undefined, 'FAST');
@@ -2453,7 +2806,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       pdf.setTextColor(0, 0, 0);
       const footerY = nextY + detailsPanelHeight - 15;
       pdf.text('Powered by RottenGrapes Pvt Ltd', pageWidthPt / 2, footerY, { align: 'center' });
-    } else if (settings.template === 'custom') {
+    } else if (isCustomTemplate) {
       const getPdfCoords = (rect: { left: number; top: number; width: number; height: number }) => {
         return {
           x: (rect.left / 100) * pageWidthPt,
@@ -2980,7 +3333,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     const geoserverLegends: Array<{ id: string; name: string; url: string; base64: string | null; width?: number; height?: number; imgElement?: HTMLImageElement }> = [];
 
     // Fetch WMS legend base64 images and preload Image elements
-    const legendUrlsToFetch: Array<{ id: string; name: string; url: string }> = [];
+    const legendUrlsToFetch: Array<{ id: string; name: string; url: string; matchingLayer?: any; olLayer?: any }> = [];
     const seenLayers = new Set<string>();
 
     if (previewMapInstance) {
@@ -3025,15 +3378,19 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
               ? activeStyleObj.legendUrl
               : buildLegendUrl(layerName, activeStyle);
 
-            legendUrlsToFetch.push({ id: layerId || layerName, name: layerName, url: legendUrl });
+            legendUrlsToFetch.push({ id: layerId || layerName, name: layerName, url: legendUrl, matchingLayer, olLayer: layer });
           }
         }
       });
 
       // Preload images in parallel preserving exact order
       const imgElements: Array<HTMLImageElement | undefined> = new Array(legendUrlsToFetch.length);
-      const loadPromises = legendUrlsToFetch.map(async (item, index) => {
-        const base64 = loadedLegends[item.id] || null;
+      const loadPromises = legendUrlsToFetch.map(async (item: any, index) => {
+        let base64 = loadedLegends[item.id] || null;
+        if (!base64) {
+          const fallback = generateVectorLegendDataUrl(item.name, item.matchingLayer, item.olLayer);
+          base64 = fallback.dataUrl;
+        }
         if (base64) {
           const img = new Image();
           await new Promise<void>((resolve) => {
@@ -3047,9 +3404,14 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       await Promise.all(loadPromises);
 
       // Populate geoserverLegends synchronously in correct order
-      legendUrlsToFetch.forEach((item, index) => {
-        const base64 = loadedLegends[item.id] || null;
-        const dims = legendDimensions[item.id] || null;
+      legendUrlsToFetch.forEach((item: any, index) => {
+        let base64 = loadedLegends[item.id] || null;
+        let dims = legendDimensions[item.id] || null;
+        if (!base64 || !dims) {
+          const fallback = generateVectorLegendDataUrl(item.name, item.matchingLayer, item.olLayer);
+          base64 = fallback.dataUrl;
+          dims = { width: fallback.width, height: fallback.height };
+        }
         geoserverLegends.push({
           id: item.id,
           name: item.name,
@@ -3253,7 +3615,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     let mapX = mapAreaX;
     let mapY = mapAreaY;
 
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       // Canvas maintains north orientation (not rotated)
       const canvasAspectRatio = canvas.width / canvas.height;
       const areaAspectRatio = mapAreaWidth / mapAreaHeight;
@@ -3372,13 +3734,13 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     };
 
     // Page border (uniform black, line weight 1.5) - Only for standard templates
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       setLineWidth(borderWidth);
       setDrawColor(0, 0, 0);
       drawRect(margin, margin, pageWidthPt - (2 * margin), pageHeightPt - (2 * margin));
     }
 
-    if (settings.template !== 'custom') {
+    if (!isCustomTemplate) {
       // Map image - drawn directly from map canvas
       outputContext.drawImage(canvas, mapX * scale, mapY * scale, mapWidth * scale, mapHeight * scale);
       setLineWidth(borderWidth);
@@ -3863,7 +4225,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       setTextColor(0, 0, 0);
       const footerY = nextY + detailsPanelHeight - 15;
       drawText('Powered by RottenGrapes Pvt Ltd', pageWidthPt / 2, footerY, { align: 'center' });
-    } else if (settings.template === 'custom') {
+    } else if (isCustomTemplate) {
       const getCanvasCoords = (rect: { left: number; top: number; width: number; height: number }) => {
         return {
           x: (rect.left / 100) * pageWidthPt,
@@ -4403,33 +4765,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     }
   }, [settings, liveScale, customPositions, customStyles, addedLayers, previewMapInstance, loadedLegends, legendDimensions, getPage1LegendParams]);
 
-  const handleExport = useCallback(async () => {
-    if (!previewMapInstance) {
-      notification.error({
-        message: 'Export Failed',
-        description: 'Map preview not available',
-        placement: 'topRight'
-      });
-      return;
-    }
-
-    const titleVal = settings.title.trim();
-    const filenameVal = settings.filename.trim();
-    let hasError = false;
-
-    if (!titleVal) {
-      setTitleError('Map Title cannot be empty or contain only whitespaces');
-      hasError = true;
-    }
-    if (!filenameVal) {
-      setFilenameError('File Name cannot be empty or contain only whitespaces');
-      hasError = true;
-    }
-
-    if (hasError) {
-      return;
-    }
-
+  const executeExport = useCallback(async () => {
     // Sanitize trailing spaces in settings
     setSettings(prev => ({
       ...prev,
@@ -4465,7 +4801,44 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
     } finally {
       setIsProcessing(false);
     }
-  }, [previewMapInstance, captureMapCanvas, generatePDF, generateJPEG, settings, notification]);
+  }, [captureMapCanvas, generatePDF, generateJPEG, settings, notification]);
+
+  const handleExport = useCallback(async () => {
+    if (!previewMapInstance) {
+      notification.error({
+        message: 'Export Failed',
+        description: 'Map preview not available',
+        placement: 'topRight'
+      });
+      return;
+    }
+
+    const titleVal = settings.title.trim();
+    const filenameVal = settings.filename.trim();
+    let hasError = false;
+
+    if (!titleVal) {
+      setTitleError('Map Title cannot be empty or contain only whitespaces');
+      hasError = true;
+    }
+    if (!filenameVal) {
+      setFilenameError('File Name cannot be empty or contain only whitespaces');
+      hasError = true;
+    }
+
+    if (hasError) {
+      return;
+    }
+
+    // If using custom template and has unsaved changes (or unsaved custom template), ask user if they want to save it
+    if (isCustomTemplate && hasUnsavedChanges) {
+      setSaveTemplateName(currentSavedTemplate ? currentSavedTemplate.name : `Template ${savedTemplates.length + 1}`);
+      setIsSavePromptOpen(true);
+      return;
+    }
+
+    await executeExport();
+  }, [previewMapInstance, settings, notification, isCustomTemplate, hasUnsavedChanges, mapId, currentSavedTemplate, savedTemplates.length, executeExport]);
 
   // Render preview based on template
   const renderPreview = () => {
@@ -4851,7 +5224,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       );
     };
 
-    if (settings.template === 'custom') {
+    if (isCustomTemplate) {
       return (
         <>
           <DndContext onDragStart={handleDragStart} onDragEnd={handleDragEnd}>
@@ -4944,7 +5317,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                       {renderLegendPreviewColumns(
                         page1Wms,
                         page1Vector,
-                        "max-h-[160px]",
+                        "max-h-full",
                         "text-[0.8em]",
                         "max-h-20"
                       )}
@@ -5204,7 +5577,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
           <div className="w-full md:w-80 space-y-4 flex-shrink-0 overflow-y-visible md:overflow-y-auto pr-0 md:pr-2 h-auto md:h-full md:border-r border-gray-100 pb-0">
             {/* Guide/Instruction Text at the top */}
             <div className="p-3 bg-gray-50 rounded-lg border border-gray-200 text-xs text-gray-500 space-y-1">
-              {settings.template === 'custom' ? (
+              {isCustomTemplate ? (
                 <>
                   <div className="text-primary font-semibold">• Custom Template Creator:</div>
                   <div>• Click on components (Map, Title, Scale, etc.) to select them.</div>
@@ -5294,18 +5667,162 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
             </div>
 
             <div>
-              <label className="block text-sm font-semibold text-gray-700 mb-2">
-                Template
-              </label>
+              <div className="flex items-center justify-between mb-2">
+                <label className="block text-sm font-semibold text-gray-700 m-0">
+                  Template
+                </label>
+                <div className="flex items-center gap-2">
+                  {isLoadingTemplates && (
+                    <span className="text-[10px] text-gray-400">Loading templates...</span>
+                  )}
+                  {savedTemplates.length > 0 && (
+                    <Button
+                      type="link"
+                      size="small"
+                      onClick={() => setIsManageModalOpen(true)}
+                      className="text-xs p-0 h-auto text-primary flex items-center gap-1 font-medium hover:underline"
+                    >
+                      <Settings size={12} />
+                      Manage ({savedTemplates.length})
+                    </Button>
+                  )}
+                </div>
+              </div>
               <Select
                 value={settings.template}
-                onChange={(value) => setSettings(prev => ({ ...prev, template: value }))}
+                onChange={handleTemplateChange}
                 className="w-full"
-                options={
-                  (settings.layout === 'landscape' ? landscapeTemplates : portraitTemplates)
-                    .filter(opt => !isMobile || opt.value !== 'custom')
-                }
+                optionRender={(option) => {
+                  const optionVal = (option.data as any)?.value;
+                  const saved = optionVal ? savedTemplates.find(t => t.id === optionVal) : undefined;
+                  if (saved) {
+                    return (
+                      <div className="flex items-center justify-between w-full py-0.5 group">
+                        <span className="truncate flex-1">{(option.data as any)?.label || option.label}</span>
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            e.preventDefault();
+                            setTemplateToDelete(saved);
+                          }}
+                          className="text-gray-400 hover:text-red-500 hover:bg-red-50 p-1 rounded transition-colors ml-2 cursor-pointer flex items-center"
+                          title={`Delete "${saved.name}"`}
+                        >
+                          <Trash2 size={13} />
+                        </span>
+                      </div>
+                    );
+                  }
+                  return (option.data as any)?.label || option.label;
+                }}
+                options={[
+                  {
+                    label: 'Standard Templates',
+                    options: (settings.layout === 'landscape' ? landscapeTemplates : portraitTemplates)
+                      .filter(opt => opt.value !== 'custom')
+                      .filter(opt => !isMobile || opt.value !== 'custom')
+                  },
+                  ...(savedTemplates.filter(t => t.layout === settings.layout).length > 0 ? [{
+                    label: `Saved Map Templates (${settings.layout === 'landscape' ? 'Landscape' : 'Portrait'})`,
+                    options: savedTemplates
+                      .filter(t => t.layout === settings.layout)
+                      .map(t => ({
+                        label: t.name,
+                        value: t.id
+                      }))
+                  }] : []),
+                  ...(!isMobile ? [{
+                    label: 'Custom',
+                    options: [
+                      { value: 'custom', label: '➕ Add New Template (Custom)' }
+                    ]
+                  }] : [])
+                ]}
               />
+
+              {/* Saved Custom Template Toolbar */}
+              {isCustomTemplate && (
+                <div className="mt-2.5 p-2.5 bg-blue-50/70 rounded-xl border border-blue-150 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="text-[11px] font-semibold text-blue-900 flex items-center gap-1.5 truncate">
+                      <span className="truncate">
+                        {currentSavedTemplate ? currentSavedTemplate.name : 'Custom Layout'}
+                      </span>
+                    </span>
+                    {hasUnsavedChanges ? (
+                      <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">
+                        Unsaved Changes
+                      </span>
+                    ) : (
+                      <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">
+                        Saved
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    {currentSavedTemplate ? (
+                      <>
+                        <Button
+                          size="small"
+                          type="primary"
+                          icon={<Save size={12} />}
+                          disabled={!hasUnsavedChanges}
+                          loading={isSavingTemplate}
+                          onClick={() => handleSaveTemplate(currentSavedTemplate.name)}
+                          className="text-[10px] h-6 px-2.5 font-medium"
+                        >
+                          Update
+                        </Button>
+                        <Button
+                          size="small"
+                          icon={<Plus size={12} />}
+                          onClick={() => {
+                            setSaveTemplateName(`${currentSavedTemplate.name} Copy`);
+                            setIsSaveModalOpen(true);
+                          }}
+                          className="text-[10px] h-6 px-2 text-gray-700 font-medium"
+                        >
+                          Save as New
+                        </Button>
+                        <Popconfirm
+                          title="Delete Template"
+                          description={`Are you sure you want to delete "${currentSavedTemplate.name}"?`}
+                          onConfirm={() => handleDeleteTemplate(currentSavedTemplate.id)}
+                          okText="Delete"
+                          cancelText="Cancel"
+                          okButtonProps={{ danger: true, size: 'small' }}
+                        >
+                          <Button
+                            size="small"
+                            danger
+                            icon={<Trash2 size={12} />}
+                            className="text-[10px] h-6 px-2.5 ml-auto font-medium"
+                          >
+                            Delete
+                          </Button>
+                        </Popconfirm>
+                      </>
+                    ) : (
+                      <Button
+                        size="small"
+                        type="primary"
+                        icon={<Save size={12} />}
+                        loading={isSavingTemplate}
+                        onClick={() => {
+                          setSaveTemplateName(`Template ${savedTemplates.length + 1}`);
+                          setIsSaveModalOpen(true);
+                        }}
+                        className="text-[10px] h-6 px-3 w-full justify-center font-medium"
+                      >
+                        Save This Template
+                      </Button>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Page Elements Checkbox section - inserted between Template and Page Size */}
@@ -5428,7 +5945,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
               </Radio.Group>
             </div>
 
-            {settings.template === 'custom' && (
+            {isCustomTemplate && (
               <div className="border-t pt-4 mt-4 space-y-4">
                 <div className="font-semibold text-xs text-gray-800 flex items-center gap-1.5">
                   <span>🎨 Element Styling</span>
@@ -5649,6 +6166,199 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
             }
           }
         ` }} />
+      </Modal>
+
+      {/* Save Custom Template Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2">
+            <Bookmark size={18} className="text-primary" />
+            <span className="font-semibold text-sm">Save Custom Print Template</span>
+          </div>
+        }
+        open={isSaveModalOpen}
+        onCancel={() => setIsSaveModalOpen(false)}
+        onOk={() => handleSaveTemplate(saveTemplateName)}
+        confirmLoading={isSavingTemplate}
+        okText="Save Template"
+        cancelText="Cancel"
+        className="rounded-2xl"
+      >
+        <div className="py-2 space-y-3">
+          <p className="text-xs text-gray-500 m-0">
+            Save this custom layout for this map workspace so you and your team can select it in future prints.
+          </p>
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              Template Name
+            </label>
+            <Input
+              value={saveTemplateName}
+              onChange={(e) => setSaveTemplateName(e.target.value)}
+              placeholder="e.g. Detailed Site Layout, Boundary Print A4"
+              maxLength={40}
+              onPressEnter={() => handleSaveTemplate(saveTemplateName)}
+              autoFocus
+            />
+          </div>
+          <div className="text-[11px] text-gray-500 bg-gray-50 p-2.5 rounded-lg border border-gray-150 space-y-0.5">
+            <div>• <strong>Orientation & Size:</strong> {settings.layout === 'landscape' ? 'Landscape' : 'Portrait'} ({settings.pageSize})</div>
+            <div>• <strong>Element Layouts:</strong> Map canvas, legend, title, scale & north arrow positions</div>
+            <div>• <strong>Custom Styles:</strong> Typography, borders, fills and opacities</div>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Prompt to Save Template Before Export Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2">
+            <Bookmark size={18} className="text-primary" />
+            <span className="font-semibold text-sm">Save Custom Template for This Map?</span>
+          </div>
+        }
+        open={isSavePromptOpen}
+        onCancel={() => setIsSavePromptOpen(false)}
+        footer={[
+          <Button key="cancel" onClick={() => setIsSavePromptOpen(false)}>
+            Cancel
+          </Button>,
+          <Button
+            key="export-only"
+            onClick={() => {
+              setIsSavePromptOpen(false);
+              executeExport();
+            }}
+          >
+            Export Without Saving
+          </Button>,
+          <Button
+            key="save-export"
+            type="primary"
+            loading={isSavingTemplate}
+            onClick={async () => {
+              const ok = await handleSaveTemplate(saveTemplateName || (currentSavedTemplate?.name || `Template ${savedTemplates.length + 1}`));
+              if (ok) {
+                setIsSavePromptOpen(false);
+                executeExport();
+              }
+            }}
+          >
+            Save & Export
+          </Button>
+        ]}
+        className="rounded-2xl"
+      >
+        <div className="py-2 space-y-3 text-xs text-gray-600">
+          <p className="m-0">
+            You have customized this print template. Would you like to save it for this map so you don&apos;t have to set it up again next time?
+          </p>
+          <div>
+            <label className="block text-xs font-semibold text-gray-700 mb-1">
+              Template Name
+            </label>
+            <Input
+              value={saveTemplateName}
+              onChange={(e) => setSaveTemplateName(e.target.value)}
+              placeholder={currentSavedTemplate?.name || 'e.g. Custom Site Template'}
+              maxLength={40}
+              autoFocus
+            />
+          </div>
+        </div>
+      </Modal>
+
+      {/* Delete Confirmation Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2 text-red-600">
+            <Trash2 size={18} />
+            <span className="font-semibold text-sm">Delete Print Template</span>
+          </div>
+        }
+        open={!!templateToDelete}
+        onCancel={() => setTemplateToDelete(null)}
+        onOk={async () => {
+          if (templateToDelete) {
+            const id = templateToDelete.id;
+            setTemplateToDelete(null);
+            await handleDeleteTemplate(id);
+          }
+        }}
+        okText="Delete Template"
+        okButtonProps={{ danger: true }}
+        cancelText="Cancel"
+        className="rounded-2xl"
+      >
+        <p className="text-xs text-gray-600 m-0 py-2">
+          Are you sure you want to permanently delete the custom template{' '}
+          <strong>&quot;{templateToDelete?.name}&quot;</strong>? This template will no longer be available for printing.
+        </p>
+      </Modal>
+
+      {/* Manage Custom Templates Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2">
+            <Settings size={18} className="text-primary" />
+            <span className="font-semibold text-sm">Manage Saved Print Templates</span>
+          </div>
+        }
+        open={isManageModalOpen}
+        onCancel={() => setIsManageModalOpen(false)}
+        footer={[
+          <Button key="close" type="primary" onClick={() => setIsManageModalOpen(false)}>
+            Done
+          </Button>
+        ]}
+        width={560}
+        className="rounded-2xl"
+      >
+        <div className="py-2">
+          <p className="text-xs text-gray-500 mb-3">
+            Custom print templates saved for your map workspaces:
+          </p>
+          {savedTemplates.length === 0 ? (
+            <div className="text-center py-6 text-gray-400 text-xs bg-gray-50 rounded-xl border border-gray-150">
+              No custom templates saved yet.
+            </div>
+          ) : (
+            <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
+              {savedTemplates.map((t) => (
+                <div
+                  key={t.id}
+                  className="flex items-center justify-between p-2.5 bg-gray-50 hover:bg-gray-100 rounded-xl border border-gray-200 transition-colors"
+                >
+                  <div className="min-w-0 flex-1 pr-3">
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-xs text-gray-800 truncate">{t.name}</span>
+                      <span className="text-[10px] px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded-md capitalize font-medium">
+                        {t.layout}
+                      </span>
+                      <span className="text-[10px] px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded-md font-medium">
+                        {t.pageSize}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-gray-400 mt-0.5">
+                      {t.createdAt ? `Saved on ${new Date(t.createdAt).toLocaleDateString()}` : 'Custom layout'}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <Button
+                      size="small"
+                      danger
+                      icon={<Trash2 size={12} />}
+                      onClick={() => setTemplateToDelete(t)}
+                      className="text-[11px] h-6 px-2.5 font-medium flex items-center gap-1"
+                    >
+                      Delete
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </Modal>
     </>
   );

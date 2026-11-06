@@ -66,11 +66,12 @@ export async function POST(req: Request) {
 
     const id = crypto.randomUUID();
     const geoserverUrl = getGeoserverUrl(req, user);
+    const now = new Date().toISOString();
     const { rows } = await pool.query(
-      `INSERT INTO dashboard_charts (id, title, chart_type, config, created_by, geoserver_url)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+      `INSERT INTO dashboard_charts (id, title, chart_type, config, created_by, geoserver_url, created_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
        RETURNING id, title, chart_type, config, created_at`,
-      [id, title.trim(), chart_type.trim(), JSON.stringify(config ?? {}), user.username, geoserverUrl]
+      [id, title.trim(), chart_type.trim(), JSON.stringify(config ?? {}), user.username, geoserverUrl, now]
     );
     return NextResponse.json(rows[0], { status: 201 });
   } catch (err) {

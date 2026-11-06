@@ -10,7 +10,6 @@
 'use client';
 
 import React from 'react';
-import { Check } from 'lucide-react';
 import { CHART_THEMES, ChartTheme } from '@/config/chartThemes';
 
 export interface ChartThemeValue {
@@ -60,10 +59,7 @@ export default function ChartThemePicker({ value = {}, onChange }: Props) {
             }`}
           >
             <div className="flex flex-col min-w-0 pr-2">
-              <div className="flex items-center gap-1.5">
-                <span className="text-[11px] font-bold text-gray-800 truncate">{theme.name}</span>
-                {isSelected && <Check size={12} className="text-indigo-600 shrink-0" />}
-              </div>
+              <span className="text-[11px] font-bold text-gray-800 truncate">{theme.name}</span>
               <span className="text-[10px] text-gray-400 truncate">{theme.description}</span>
             </div>
 

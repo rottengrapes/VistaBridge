@@ -10,9 +10,12 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import React, { useState } from 'react';
-import { Button, Divider, Tooltip, Dropdown, Tag, Checkbox, Slider } from 'antd';
+import { Button, Divider, Tooltip, Dropdown, Tag, Checkbox, Slider, Modal } from 'antd';
 import LegendImage from './LegendImage';
 import { useAuthStore } from '@/store/useAuthStore';
+import { useConfigStore } from '@/store/useConfigStore';
+import { apiRequest } from '@/lib/api';
+import GeoJSON from 'ol/format/GeoJSON';
 import {
   Plus,
   GripVertical,
@@ -24,7 +27,8 @@ import {
   Palette,
   Trash2,
   List,
-  Sheet
+  Sheet,
+  Download,
 } from 'lucide-react';
 
 
@@ -37,6 +41,8 @@ interface LayerState {
   labelsEnabled: boolean;
   styles?: Array<{ name: string; title: string; legendUrl: string }>;
   activeStyle?: string;
+  bbox?: number[];
+  protocol?: 'WMS' | 'WFS' | 'WMTS' | 'WCS';
 }
 
 interface LayerStyleData {
@@ -69,6 +75,9 @@ interface LayerListPanel2DProps {
   notification: any;
   modal: any;
   token?: string | null;
+  getVisibleFeatureIdsForLayer?: (layerId: string) => Promise<string[]>;
+  getViewportBboxAndSize?: () => { bbox: [number, number, number, number]; size: [number, number] } | null;
+  getOlLayer?: (layerId: string) => any;
 }
 
 export default function LayerListPanel2D({
@@ -88,12 +97,16 @@ export default function LayerListPanel2D({
   setAttributeTableOpen,
   notification,
   modal,
-  token
+  token,
+  getVisibleFeatureIdsForLayer,
+  getViewportBboxAndSize,
+  getOlLayer,
 }: LayerListPanel2DProps) {
   const { user } = useAuthStore();
   const [expandedLegends, setExpandedLegends] = useState<Record<string, boolean>>({});
   const [expandedOpacity, setExpandedOpacity] = useState<Record<string, boolean>>({});
   const [draggableLayerId, setDraggableLayerId] = useState<string | null>(null);
+  const [exportingLayerId, setExportingLayerId] = useState<string | null>(null);
 
   const _getActiveStyleConfig = (layerId: string) => {
     const layerStyleData = vectorLayerStyles[layerId];
@@ -137,7 +150,7 @@ export default function LayerListPanel2D({
 
   const showLegendModal = (layer: LayerState) => {
     const styleName = layer.activeStyle || '';
-    const geoserverBase = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+    const geoserverBase = (user?.geoserverUrl || useConfigStore.getState().geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
 
     if (layer.id.startsWith('wps_result_') || !layer.id.includes(':')) {
       modal.info({
@@ -173,6 +186,395 @@ export default function LayerListPanel2D({
       width: 320,
     });
   };
+
+  const performExport = async (
+    layer: LayerState,
+    format: 'csv' | 'geojson' | 'kml' | 'shapefile',
+    featureIds?: string[],
+    suffix: string = '_export'
+  ) => {
+    try {
+      setExportingLayerId(layer.id);
+
+      // 1. Try server-side dataset export first if not a local in-memory layer
+      const isLocalLayer = layer.id.startsWith('wps_result_');
+      let serverExportSucceeded = false;
+
+      if (!isLocalLayer) {
+        try {
+          const params = new URLSearchParams({ format });
+          if (featureIds && featureIds.length > 0) {
+            params.append('ids', featureIds.join(','));
+          }
+
+          const response = await apiRequest(`/datasets/${layer.id}/export/?${params.toString()}`);
+          if (response.ok) {
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `${layer.name}${suffix}.${format === 'shapefile' ? 'zip' : format}`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+
+            notification.success({
+              message: 'Export Successful',
+              description: featureIds && featureIds.length > 0
+                ? `${featureIds.length} features exported as ${format.toUpperCase()}`
+                : `Data exported as ${format.toUpperCase()}`,
+              placement: 'topRight',
+            });
+            serverExportSucceeded = true;
+            return;
+          }
+        } catch (serverErr) {
+          console.warn('[Export] Server-side export failed (e.g. WFS disabled), trying client-side OpenLayers layer fallback:', serverErr);
+        }
+      }
+
+      // 2. Client-side fallback: extract features directly from OpenLayers map layer (for local layers OR when WFS is disabled)
+      const olLayer = getOlLayer ? getOlLayer(layer.id) : (window as any).vismapLayers?.[layer.id];
+      let exportFeatures: any[] = [];
+      if (olLayer && typeof olLayer.getSource === 'function') {
+        const source = olLayer.getSource();
+        const geojsonFormat = new GeoJSON();
+        const features = typeof source.getFeatures === 'function' ? source.getFeatures() : [];
+        exportFeatures = features.map((f: any, idx: number) => {
+          const featObj = geojsonFormat.writeFeatureObject(f, {
+            dataProjection: 'EPSG:4326',
+            featureProjection: 'EPSG:3857'
+          });
+          if (featObj.id === undefined) {
+            featObj.id = f.getId?.() || f.get?.('ogc_fid') || f.get?.('fid') || f.get?.('id') || idx;
+          }
+          return featObj;
+        });
+      }
+
+      if (exportFeatures.length === 0) {
+        throw new Error('No features available to export (WFS server export failed and client layer has no cached features).');
+      }
+
+      if (featureIds && featureIds.length > 0) {
+        const selSet = new Set(featureIds);
+        exportFeatures = exportFeatures.filter((f, idx) => {
+          const id = f.id !== undefined ? String(f.id) : String(idx);
+          return selSet.has(id);
+        });
+      }
+
+      let blob: Blob;
+      let ext = format === 'shapefile' ? 'geojson' : format;
+
+      if (format === 'csv') {
+        const rows = exportFeatures.map((f, idx) => ({
+          id: f.id ?? idx + 1,
+          ...(f.properties || {})
+        }));
+        const headers = Array.from(new Set(rows.flatMap(r => Object.keys(r))));
+        const csvLines = [
+          headers.join(','),
+          ...rows.map(r => headers.map(h => {
+            const val = r[h] !== undefined ? String(r[h]) : '';
+            return `"${val.replace(/"/g, '""')}"`;
+          }).join(','))
+        ];
+        blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+        ext = 'csv';
+      } else {
+        const fc = {
+          type: 'FeatureCollection',
+          features: exportFeatures
+        };
+        blob = new Blob([JSON.stringify(fc, null, 2)], { type: 'application/json' });
+        ext = 'geojson';
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${layer.name || layer.id}${suffix}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+
+      notification.success({
+        message: 'Export Successful',
+        description: `${exportFeatures.length} features exported as ${ext.toUpperCase()}${!isLocalLayer ? ' (Client Fallback)' : ''}`,
+        placement: 'topRight',
+      });
+      return;
+    } catch (error: any) {
+      notification.error({
+        message: 'Export Failed',
+        description: error.message || 'Failed to export layer data',
+        placement: 'topRight',
+      });
+    } finally {
+      setExportingLayerId(null);
+    }
+  };
+
+  const handleExportAll = (layer: LayerState, format: 'csv' | 'geojson' | 'kml' | 'shapefile') => {
+    performExport(layer, format, undefined, '_export');
+  };
+
+  const handleExportVisible = async (layer: LayerState, format: 'csv' | 'geojson' | 'kml' | 'shapefile') => {
+    if (!getVisibleFeatureIdsForLayer) {
+      notification.error({
+        message: 'Map Integration Missing',
+        description: 'Cannot get visible features from map',
+        placement: 'topRight',
+      });
+      return;
+    }
+
+    try {
+      setExportingLayerId(layer.id);
+      const visibleIds = await getVisibleFeatureIdsForLayer(layer.id);
+
+      if (visibleIds.length === 0) {
+        notification.warning({
+          message: 'No Features Visible',
+          description: `No features from "${layer.name}" are currently visible in the map viewport`,
+          placement: 'topRight',
+        });
+        setExportingLayerId(null);
+        return;
+      }
+
+      const confirmDialog = modal?.confirm || Modal.confirm;
+      confirmDialog({
+        title: 'Export Visible Features',
+        content: `Export ${visibleIds.length} visible feature(s) from "${layer.name}" in current map viewport as ${format.toUpperCase()}?`,
+        okText: 'Export',
+        cancelText: 'Cancel',
+        onOk: async () => {
+          await performExport(layer, format, visibleIds, '_visible');
+        },
+        onCancel: () => {
+          setExportingLayerId(null);
+        }
+      });
+    } catch (error: any) {
+      notification.error({
+        message: 'Export Failed',
+        description: error.message || 'Failed to get visible features',
+        placement: 'topRight',
+      });
+      setExportingLayerId(null);
+    }
+  };
+
+  const getExportMenuItems = (layer: LayerState) => [
+    {
+      key: 'csv',
+      label: 'Export All to CSV',
+      onClick: () => handleExportAll(layer, 'csv'),
+    },
+    {
+      key: 'geojson',
+      label: 'Export All to GeoJSON',
+      onClick: () => handleExportAll(layer, 'geojson'),
+    },
+    {
+      key: 'kml',
+      label: 'Export All to KML',
+      onClick: () => handleExportAll(layer, 'kml'),
+    },
+    {
+      key: 'shapefile',
+      label: 'Export All to Shapefile',
+      onClick: () => handleExportAll(layer, 'shapefile'),
+    },
+    { type: 'divider' as const },
+    {
+      key: 'visible-csv',
+      label: 'Export Visible Features (CSV)',
+      onClick: () => handleExportVisible(layer, 'csv'),
+    },
+    {
+      key: 'visible-geojson',
+      label: 'Export Visible Features (GeoJSON)',
+      onClick: () => handleExportVisible(layer, 'geojson'),
+    },
+    {
+      key: 'visible-kml',
+      label: 'Export Visible Features (KML)',
+      onClick: () => handleExportVisible(layer, 'kml'),
+    },
+    {
+      key: 'visible-shapefile',
+      label: 'Export Visible Features (Shapefile)',
+      onClick: () => handleExportVisible(layer, 'shapefile'),
+    },
+  ];
+
+  const handleRasterExport = async (layer: LayerState, format: 'geotiff' | 'png', isViewport: boolean = false) => {
+    try {
+      setExportingLayerId(layer.id);
+      const ext = format === 'geotiff' ? 'tif' : 'png';
+      const suffix = isViewport ? '_viewport' : '_full';
+
+      // 1. Check if local in-memory raster result (e.g. from raster analysis / WPS)
+      const localRaster = layer as any;
+      if (layer.id.startsWith('raster_res_') || localRaster.rawBuffer || localRaster.imageBlob) {
+        let blob: Blob | null = null;
+        if (format === 'geotiff') {
+          if (localRaster.rawBuffer) {
+            blob = new Blob([localRaster.rawBuffer], { type: 'image/tiff' });
+          } else if (localRaster.imageBlob) {
+            blob = localRaster.imageBlob;
+          }
+        } else {
+          if (localRaster.imageBlob && (localRaster.imageBlob.type?.includes('png') || localRaster.imageBlob.type?.includes('image'))) {
+            blob = localRaster.imageBlob;
+          } else if (localRaster.imageUrl) {
+            const res = await fetch(localRaster.imageUrl);
+            blob = await res.blob();
+          }
+        }
+
+        if (blob) {
+          const url = window.URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${layer.name || layer.id}${suffix}.${ext}`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          window.URL.revokeObjectURL(url);
+
+          notification.success({
+            message: 'Download Successful',
+            description: `Raster layer exported as ${format === 'geotiff' ? 'GeoTIFF' : 'PNG'}`,
+            placement: 'topRight',
+          });
+          return;
+        }
+      }
+
+      // 2. Server-side GeoServer raster layer export
+      let bboxParam = '';
+      let width = 2048;
+      let height = 2048;
+
+      if (isViewport && getViewportBboxAndSize) {
+        const vp = getViewportBboxAndSize();
+        if (vp) {
+          bboxParam = vp.bbox.join(',');
+          width = Math.min(4096, Math.max(512, Math.round(vp.size[0] * 1.5)));
+          height = Math.min(4096, Math.max(512, Math.round(vp.size[1] * 1.5)));
+        }
+      }
+
+      if (!bboxParam) {
+        const b = (layer as any).bbox;
+        if (Array.isArray(b) && b.length === 4) {
+          bboxParam = b.join(',');
+          const dx = Math.abs(b[2] - b[0]);
+          const dy = Math.abs(b[3] - b[1]);
+          if (dx > 0 && dy > 0) {
+            width = 2048;
+            height = Math.min(4096, Math.max(256, Math.round(2048 * (dy / dx))));
+          }
+        }
+      }
+
+      const params = new URLSearchParams({
+        format: format === 'geotiff' ? 'geotiff' : 'png',
+        width: String(width),
+        height: String(height),
+      });
+      if (bboxParam) {
+        params.append('bbox', bboxParam);
+      }
+      if (layer.activeStyle) {
+        params.append('style', layer.activeStyle);
+      }
+
+      const response = await apiRequest(`/datasets/${layer.id}/export/?${params.toString()}`);
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.detail || `Failed to download raster as ${format.toUpperCase()}`);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${layer.name || layer.id}${suffix}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+
+      notification.success({
+        message: 'Download Successful',
+        description: `Raster layer exported as ${format === 'geotiff' ? 'GeoTIFF' : 'PNG'}`,
+        placement: 'topRight',
+      });
+    } catch (error: any) {
+      notification.error({
+        message: 'Download Failed',
+        description: error.message || 'Failed to download raster layer',
+        placement: 'topRight',
+      });
+    } finally {
+      setExportingLayerId(null);
+    }
+  };
+
+  const getRasterExportMenuItems = (layer: LayerState) => [
+    {
+      key: 'geotiff',
+      label: 'Download as GeoTIFF (.tif)',
+      onClick: () => handleRasterExport(layer, 'geotiff', false),
+    },
+    {
+      key: 'png',
+      label: 'Download as PNG (.png)',
+      onClick: () => handleRasterExport(layer, 'png', false),
+    },
+    { type: 'divider' as const },
+    {
+      key: 'visible-geotiff',
+      label: 'Download Visible Viewport (GeoTIFF)',
+      onClick: () => handleRasterExport(layer, 'geotiff', true),
+    },
+    {
+      key: 'visible-png',
+      label: 'Download Visible Viewport (PNG)',
+      onClick: () => handleRasterExport(layer, 'png', true),
+    },
+  ];
+
+  const getGroupExportMenuItems = (layer: LayerState) => [
+    {
+      key: 'geotiff',
+      label: 'Download Composite GeoTIFF (.tif)',
+      onClick: () => handleRasterExport(layer, 'geotiff', false),
+    },
+    {
+      key: 'png',
+      label: 'Download Composite PNG (.png)',
+      onClick: () => handleRasterExport(layer, 'png', false),
+    },
+    { type: 'divider' as const },
+    {
+      key: 'visible-geotiff',
+      label: 'Download Visible Viewport (GeoTIFF)',
+      onClick: () => handleRasterExport(layer, 'geotiff', true),
+    },
+    {
+      key: 'visible-png',
+      label: 'Download Visible Viewport (PNG)',
+      onClick: () => handleRasterExport(layer, 'png', true),
+    },
+  ];
 
   return (
     <div className="flex flex-col gap-4">
@@ -235,26 +637,28 @@ export default function LayerListPanel2D({
                   )}
                   <div className="text-xs font-bold text-gray-700 truncate">{layer.name}</div>
                 </div>
-                <Tag
-                  color={
-                    layer.type === 'VECTOR'
-                      ? 'blue'
+                <div className="flex items-center gap-1 shrink-0">
+                  <Tag
+                    color={
+                      layer.type === 'VECTOR'
+                        ? 'blue'
+                        : layer.type === 'RASTER'
+                          ? 'green'
+                          : layer.type === 'GROUP'
+                            ? 'gold'
+                            : 'purple'
+                    }
+                    className="text-[9px] font-extrabold tracking-wider px-1 py-0 m-0 border-none rounded uppercase"
+                  >
+                    {layer.type === 'VECTOR'
+                      ? 'Vector'
                       : layer.type === 'RASTER'
-                        ? 'green'
+                        ? 'Raster'
                         : layer.type === 'GROUP'
-                          ? 'gold'
-                          : 'purple'
-                  }
-                  className="text-[9px] font-extrabold tracking-wider px-1 py-0 m-0 border-none rounded uppercase shrink-0"
-                >
-                  {layer.type === 'VECTOR'
-                    ? 'Vector'
-                    : layer.type === 'RASTER'
-                      ? 'Raster'
-                      : layer.type === 'GROUP'
-                        ? 'Group'
-                        : 'Point Cloud'}
-                </Tag>
+                          ? 'Group'
+                          : 'Point Cloud'}
+                  </Tag>
+                </div>
               </div>
 
               {/* Layer Operations Icon Row */}
@@ -394,9 +798,8 @@ export default function LayerListPanel2D({
                         [layer.id]: !prev[layer.id]
                       }));
                     }}
-                    className={`flex items-center justify-center rounded h-6 w-6 ${
-                      expandedLegends[layer.id] ? 'bg-blue-50' : 'hover:bg-gray-50'
-                    }`}
+                    className={`flex items-center justify-center rounded h-6 w-6 ${expandedLegends[layer.id] ? 'bg-blue-50' : 'hover:bg-gray-50'
+                      }`}
                   />
                 </Tooltip>
                 {layer.type === 'VECTOR' && (
@@ -413,6 +816,48 @@ export default function LayerListPanel2D({
                     />
                   </Tooltip>
                 )}
+                {(layer.type === 'VECTOR' || layer.type === 'RASTER' || layer.type === 'GROUP') && (
+                  <Dropdown
+                    menu={{
+                      items: layer.type === 'VECTOR'
+                        ? getExportMenuItems(layer)
+                        : layer.type === 'GROUP'
+                          ? getGroupExportMenuItems(layer)
+                          : getRasterExportMenuItems(layer),
+                    }}
+                    trigger={['click']}
+                    placement="bottomLeft"
+                  >
+                    <Tooltip
+                      title={
+                        layer.type === 'VECTOR'
+                          ? "Export Vector Layer"
+                          : layer.type === 'GROUP'
+                            ? "Download Layer Group"
+                            : "Download Raster Layer"
+                      }
+                    >
+                      <Button
+                        type="text"
+                        size="small"
+                        loading={exportingLayerId === layer.id}
+                        icon={
+                          <Download
+                            size={12}
+                            className={
+                              layer.type === 'RASTER'
+                                ? "text-green-600"
+                                : layer.type === 'GROUP'
+                                  ? "text-amber-600"
+                                  : "text-gray-500"
+                            }
+                          />
+                        }
+                        className="flex items-center justify-center hover:bg-gray-50 rounded h-6 w-6"
+                      />
+                    </Tooltip>
+                  </Dropdown>
+                )}
                 <Divider type="vertical" className="h-4 bg-gray-200 !m-0" />
                 <Tooltip title={`Opacity: ${Math.round((layer.opacity ?? 1.0) * 100)}% (Click to adjust)`}>
                   <Button
@@ -424,9 +869,8 @@ export default function LayerListPanel2D({
                         [layer.id]: !prev[layer.id]
                       }));
                     }}
-                    className={`flex items-center justify-center rounded h-6 px-1 ${
-                      expandedOpacity[layer.id] ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-600'
-                    }`}
+                    className={`flex items-center justify-center rounded h-6 px-1 ${expandedOpacity[layer.id] ? 'bg-blue-50 text-blue-600 font-bold' : 'hover:bg-gray-50 text-gray-600'
+                      }`}
                     style={{ fontSize: 10, fontWeight: 'bold' }}
                   >
                     {Math.round((layer.opacity ?? 1.0) * 100)}%
@@ -543,7 +987,7 @@ export default function LayerListPanel2D({
                     </div>
                   ) : (
                     <LegendImage
-                      url={`${(user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '')}/wms?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image/png&layer=${encodeURIComponent(layer.id)}&style=${encodeURIComponent(layer.activeStyle || '')}`}
+                      url={`${(user?.geoserverUrl || useConfigStore.getState().geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '')}/wms?service=WMS&version=1.3.0&request=GetLegendGraphic&format=image/png&layer=${encodeURIComponent(layer.id)}&style=${encodeURIComponent(layer.activeStyle || '')}`}
                       notification={notification}
                     />
                   )}

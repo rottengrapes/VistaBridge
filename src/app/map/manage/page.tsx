@@ -39,28 +39,28 @@ import {
   Trash2,
   Lock,
   Globe,
-  Building,
   Eye,
   X,
-  Settings,
+  Edit3,
   Copy,
+  Plus,
+  Share2,
+  Check,
+  Link as LinkIcon,
 } from 'lucide-react';
 import DashboardLayout from '@/components/layout/DashboardLayout';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useUIStore } from '@/store/useUIStore';
 import { apiRequest } from '@/lib/api';
 import { siteConfig } from '@/config/site-config';
-import dayjs from 'dayjs';
-import relativeTime from 'dayjs/plugin/relativeTime';
-import isBetween from 'dayjs/plugin/isBetween';
-
-dayjs.extend(relativeTime);
-dayjs.extend(isBetween);
+import { slugify } from '@/lib/slug';
+import { formatRelativeTime, formatFullDate, compareDates, parseDate, dayjs } from '@/lib/dateUtils';
 
 const { Title, Text } = Typography;
 
 interface MapWorkspace {
   id: string;
+  slug?: string;
   name: string;
   description: string;
   share: 'PRIVATE' | 'INTERNAL' | 'PUBLIC';
@@ -115,12 +115,19 @@ export default function ManageMapsPage() {
   const [afterDate, setAfterDate] = useState<dayjs.Dayjs | null>(null);
   const [localSearch, setLocalSearch] = useState('');
 
-  // Edit Settings Modal States
+  // Edit Details Modal States
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingMap, setEditingMap] = useState<MapWorkspace | null>(null);
   const [editName, setEditName] = useState('');
-  const [editVisibility, setEditVisibility] = useState<'PUBLIC' | 'PRIVATE'>('PRIVATE');
-  const [savingSettings, setSavingSettings] = useState(false);
+  const [editDescription, setEditDescription] = useState('');
+  const [savingDetails, setSavingDetails] = useState(false);
+
+  // Share Modal States
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [sharingMap, setSharingMap] = useState<MapWorkspace | null>(null);
+  const [shareVisibility, setShareVisibility] = useState<'PUBLIC' | 'PRIVATE'>('PRIVATE');
+  const [savingSharing, setSavingSharing] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const fetchMaps = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
@@ -198,12 +205,18 @@ export default function ManageMapsPage() {
 
     // 5. Filter by Created After
     if (afterDate) {
-      filtered = filtered.filter(m => dayjs(m.created_at).isAfter(afterDate, 'day') || dayjs(m.created_at).isSame(afterDate, 'day'));
+      filtered = filtered.filter(m => {
+        const d = parseDate(m.created_at || m.updated_at);
+        return d ? (d.isAfter(afterDate, 'day') || d.isSame(afterDate, 'day')) : false;
+      });
     }
 
     // 6. Filter by Created Before
     if (beforeDate) {
-      filtered = filtered.filter(m => dayjs(m.created_at).isBefore(beforeDate, 'day') || dayjs(m.created_at).isSame(beforeDate, 'day'));
+      filtered = filtered.filter(m => {
+        const d = parseDate(m.created_at || m.updated_at);
+        return d ? (d.isBefore(beforeDate, 'day') || d.isSame(beforeDate, 'day')) : false;
+      });
     }
 
     return filtered;
@@ -285,8 +298,10 @@ export default function ManageMapsPage() {
 
   const handleClone = async (map: MapWorkspace) => {
     try {
+      const baseSlug = map.slug ? `${map.slug}_copy` : slugify(`${map.name}_copy`);
       const payload = {
         name: `${map.name} (Copy)`.slice(0, 32),
+        slug: baseSlug,
         description: map.description || '',
         share: map.share || 'PRIVATE',
         type: map.type || '2D',
@@ -317,14 +332,14 @@ export default function ManageMapsPage() {
     }
   };
 
-  const openEditVisibility = (map: MapWorkspace) => {
+  const openEditModal = (map: MapWorkspace) => {
     setEditingMap(map);
     setEditName(map.name);
-    setEditVisibility(map.share === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE');
+    setEditDescription(map.description || '');
     setEditModalOpen(true);
   };
 
-  const handleSaveVisibility = async () => {
+  const handleSaveDetails = async () => {
     if (!editingMap) return;
     const trimmedName = editName.trim();
     if (!trimmedName || trimmedName.length < 2) {
@@ -352,29 +367,30 @@ export default function ManageMapsPage() {
       return;
     }
 
-    setSavingSettings(true);
+    setSavingDetails(true);
     try {
       const response = await apiRequest(`/maps/${editingMap.id}/`, {
         method: 'PATCH',
         body: JSON.stringify({
           name: trimmedName,
-          share: editVisibility,
+          description: editDescription.trim(),
         }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || 'Failed to update map settings');
+        throw new Error(data.detail || 'Failed to update map details');
       }
 
+      const updatedData = await response.json().catch(() => ({}));
       setMaps((prev) =>
         prev.map((m) =>
           m.id === editingMap.id
-            ? { ...m, name: trimmedName, share: editVisibility }
+            ? { ...m, name: trimmedName, description: editDescription.trim(), slug: updatedData.slug || m.slug }
             : m
         )
       );
       notification.success({
-        message: 'Settings Saved',
+        message: 'Details Saved',
         description: `Map workspace "${trimmedName}" updated successfully.`,
         placement: 'topRight',
       });
@@ -383,12 +399,73 @@ export default function ManageMapsPage() {
     } catch (err: unknown) {
       notification.error({
         message: 'Update Failed',
-        description: (err as Error).message || 'Could not update map settings.',
+        description: (err as Error).message || 'Could not update map details.',
         placement: 'topRight',
       });
     } finally {
-      setSavingSettings(false);
+      setSavingDetails(false);
     }
+  };
+
+  const openShareModal = (map: MapWorkspace) => {
+    setSharingMap(map);
+    setShareVisibility(map.share === 'PUBLIC' ? 'PUBLIC' : 'PRIVATE');
+    setCopiedLink(false);
+    setShareModalOpen(true);
+  };
+
+  const handleSaveSharing = async () => {
+    if (!sharingMap) return;
+    setSavingSharing(true);
+    try {
+      const response = await apiRequest(`/maps/${sharingMap.id}/`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          share: shareVisibility,
+        }),
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || 'Failed to update map sharing');
+      }
+
+      setMaps((prev) =>
+        prev.map((m) =>
+          m.id === sharingMap.id
+            ? { ...m, share: shareVisibility }
+            : m
+        )
+      );
+      notification.success({
+        message: 'Sharing Updated',
+        description: `Map visibility updated to ${shareVisibility === 'PUBLIC' ? 'Public' : 'Private'}.`,
+        placement: 'topRight',
+      });
+      setShareModalOpen(false);
+      fetchMaps(true);
+    } catch (err: unknown) {
+      notification.error({
+        message: 'Update Failed',
+        description: (err as Error).message || 'Could not update map sharing.',
+        placement: 'topRight',
+      });
+    } finally {
+      setSavingSharing(false);
+    }
+  };
+
+  const handleCopyLink = () => {
+    if (!sharingMap) return;
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    const shareUrl = `${origin}/map/${sharingMap.slug || sharingMap.id}`;
+    navigator.clipboard.writeText(shareUrl);
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
+    notification.success({
+      message: 'Link Copied',
+      description: 'Shareable map link copied to clipboard.',
+      placement: 'topRight',
+    });
   };
 
   const columns = [
@@ -397,8 +474,9 @@ export default function ManageMapsPage() {
       dataIndex: 'name',
       key: 'name',
       render: (text: string, record: MapWorkspace) => {
-        // Build correct route depending on workspace type
-        const route = record.type === '2D' ? `/map/2d?id=${record.id}` : '#';
+        // Build correct route using unique slug
+        const targetSlug = record.slug || record.id;
+        const route = record.type === '2D' ? `/map/${targetSlug}` : '#';
         const isClickable = record.type === '2D';
 
         return (
@@ -413,7 +491,6 @@ export default function ManageMapsPage() {
             ) : (
               <Text className="block text-[14px] font-bold text-gray-400 truncate">{text}</Text>
             )}
-            <Text type="secondary" className="text-[11px] block truncate text-gray-400 font-mono mt-0.5">{record.id}</Text>
           </div>
         );
       },
@@ -468,78 +545,96 @@ export default function ManageMapsPage() {
       },
     },
     {
-      title: 'Visibility',
-      dataIndex: 'share',
+      title: 'Access & Sharing',
       key: 'share',
-      render: (share: string) => {
-        const isInternal = share === 'INTERNAL';
+      render: (_: unknown, record: MapWorkspace) => {
+        if (record.share === 'PUBLIC') {
+          return (
+            <Tag icon={<Globe size={11} className="inline mr-1" />} color="green" className="rounded-lg text-[11px] font-semibold py-0.5">
+              Public
+            </Tag>
+          );
+        }
         return (
-          <div className="flex items-center gap-1.5 whitespace-nowrap">
-            {share === 'PRIVATE' ? (
-              <Lock size={12} className="text-orange-400" />
-            ) : isInternal ? (
-              <Building size={12} className="text-blue-400" />
-            ) : (
-              <Globe size={12} className="text-green-400" />
-            )}
-            <Text className={`text-[10px] font-bold uppercase tracking-wider whitespace-nowrap ${share === 'PRIVATE' ? 'text-orange-500' : isInternal ? 'text-blue-500' : 'text-green-500'}`}>
-              {share}
-            </Text>
-          </div>
+          <Tag icon={<Lock size={11} className="inline mr-1" />} color="orange" className="rounded-lg text-[11px] font-semibold py-0.5">
+            Private
+          </Tag>
         );
       },
     },
     {
-      title: 'Created',
-      dataIndex: 'created_at',
-      key: 'created',
-      render: (date: string) => (
-        <Tooltip title={dayjs(date).format('YYYY-MM-DD HH:mm:ss')}>
-          <Text className="text-[12px] text-gray-400 font-medium whitespace-nowrap">{dayjs(date).fromNow()}</Text>
-        </Tooltip>
-      ),
-      sorter: (a: MapWorkspace, b: MapWorkspace) => dayjs(a.created_at).unix() - dayjs(b.created_at).unix(),
+      title: 'Updated',
+      key: 'updated',
+      render: (_: unknown, record: MapWorkspace) => {
+        const date = record.updated_at || record.created_at;
+        return (
+          <Tooltip title={formatFullDate(date)}>
+            <Text className="text-[12px] text-gray-400 font-medium whitespace-nowrap">
+              {formatRelativeTime(date)}
+            </Text>
+          </Tooltip>
+        );
+      },
+      sorter: (a: MapWorkspace, b: MapWorkspace) => {
+        return compareDates(a.updated_at || a.created_at, b.updated_at || b.created_at);
+      },
     },
     {
       title: '',
       key: 'actions',
       render: (_: unknown, record: MapWorkspace) => (
-        <Space size="small" className="whitespace-nowrap">
-          {record.type === '2D' && (
+        <Space size="middle" className="whitespace-nowrap">
+          {record.type === '2D' ? (
             <Tooltip title="Open Map">
-              <Link href={`/map/2d?id=${record.id}`}>
+              <Link href={`/map/${record.slug || record.id}`}>
                 <Button type="text" size="small" icon={<Eye size={16} className="text-gray-400 hover:text-primary" />} />
               </Link>
             </Tooltip>
+          ) : (
+            <Tooltip title="Preview not available">
+              <Button type="text" size="small" disabled icon={<Eye size={16} className="text-gray-300" />} />
+            </Tooltip>
           )}
-          <Tooltip title="Map Settings">
+
+          <Tooltip title="Edit Map Details">
             <Button
               type="text"
               size="small"
-              icon={<Settings size={16} className="text-gray-400 hover:text-primary" />}
-              onClick={() => openEditVisibility(record)}
+              icon={<Edit3 size={16} className="text-gray-400 hover:text-primary transition-colors" />}
+              onClick={() => openEditModal(record)}
             />
           </Tooltip>
+
+          <Tooltip title="Share Map">
+            <Button
+              type="text"
+              size="small"
+              icon={<Share2 size={16} className="text-gray-400 hover:text-primary transition-colors" />}
+              onClick={() => openShareModal(record)}
+            />
+          </Tooltip>
+
           <Tooltip title="Clone">
             <Button
               type="text"
               size="small"
-              icon={<Copy size={16} className="text-gray-400 hover:text-primary" />}
+              icon={<Copy size={15} className="text-gray-400 hover:text-primary" />}
               onClick={() => handleClone(record)}
             />
           </Tooltip>
+
           <Tooltip title="Delete Map">
             <Button
               type="text"
               size="small"
               danger
-              icon={<Trash2 size={16} />}
+              icon={<Trash2 size={16} className="text-red-500 hover:text-red-600 transition-colors" />}
               onClick={() => deleteWorkspace(record.id, record.name)}
             />
           </Tooltip>
         </Space>
       ),
-      width: 140,
+      width: 170,
     },
   ];
 
@@ -573,8 +668,9 @@ export default function ManageMapsPage() {
           <div className="flex items-center gap-[0.5rem]">
             <Button
               type="primary"
+              icon={<Plus size={16} />}
               onClick={() => setCreateMapModalOpen(true)}
-              className="rounded-[0.75rem] h-[2.5rem] px-[1.5rem] font-bold shadow-md hover:shadow-lg transition-all text-[0.75rem] sm:text-[0.875rem]"
+              className="rounded-[0.75rem] h-[2.5rem] px-[1.5rem] font-bold shadow-md hover:shadow-lg transition-all text-[0.75rem] sm:text-[0.875rem] flex items-center gap-1.5"
             >
               Create Map
             </Button>
@@ -591,18 +687,50 @@ export default function ManageMapsPage() {
         {/* Workspace Stats Bar */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-[0.75rem] sm:gap-[1rem]">
           {[
-            { label: 'Total Map Workspaces', value: stats.total, icon: <MapIcon size={isMobile ? 16 : 20} />, color: 'bg-primary' },
-            { label: 'Public Workspaces', value: stats.public, icon: <Globe size={isMobile ? 16 : 20} />, color: 'bg-green-500' },
-            { label: 'Private Workspaces', value: stats.private, icon: <Lock size={isMobile ? 16 : 20} />, color: 'bg-orange-500' },
+            {
+              label: 'Total Map Workspaces',
+              value: stats.total,
+              icon: <MapIcon size={isMobile ? 16 : 20} />,
+              color: 'bg-primary',
+              filterKey: 'ALL',
+            },
+            {
+              label: 'Private Workspaces',
+              value: stats.private,
+              icon: <Lock size={isMobile ? 16 : 20} />,
+              color: 'bg-orange-500',
+              filterKey: 'PRIVATE',
+            },
+            {
+              label: 'Public Workspaces',
+              value: stats.public,
+              icon: <Globe size={isMobile ? 16 : 20} />,
+              color: 'bg-green-500',
+              filterKey: 'PUBLIC',
+            },
           ].map((stat, i) => (
-            <Card key={i} variant="borderless" className="shadow-sm border border-gray-100 rounded-[1rem] overflow-hidden group hover:shadow-md transition-all" styles={{ body: { padding: isMobile ? '0.625rem 0.875rem' : '1.5rem' } }}>
+            <Card
+              key={i}
+              variant="borderless"
+              onClick={() => setActiveShare(stat.filterKey)}
+              className={`shadow-sm border rounded-[1rem] overflow-hidden group hover:shadow-md transition-all cursor-pointer ${
+                activeShare === stat.filterKey
+                  ? 'border-primary/40 ring-1 ring-primary/20 bg-primary/5'
+                  : 'border-gray-100 bg-white hover:border-gray-200'
+              }`}
+              styles={{ body: { padding: isMobile ? '0.625rem 0.875rem' : '1.25rem 1.5rem' } }}
+            >
               <div className="flex items-center gap-[0.75rem] sm:gap-[1rem]">
                 <div className={`${stat.color} p-[0.5rem] sm:p-[0.75rem] rounded-[0.75rem] text-white shadow-sm group-hover:scale-110 transition-transform mb-auto mt-[0.125rem] flex shrink-0`}>
                   {stat.icon}
                 </div>
                 <div>
-                  <Text className="text-[0.5625rem] xs:text-[0.625rem] sm:text-[0.75rem] font-bold uppercase tracking-widest text-gray-400 block leading-none mb-[0.25rem]">{stat.label}</Text>
-                  <Title level={3} className="!m-0 !text-[1rem] sm:!text-[1.25rem] md:!text-[1.5rem] font-black">{stat.value}</Title>
+                  <Text className="text-[0.5625rem] xs:text-[0.625rem] sm:text-[0.75rem] font-bold uppercase tracking-widest text-gray-400 block leading-none mb-[0.25rem]">
+                    {stat.label}
+                  </Text>
+                  <Title level={3} className="!m-0 !text-[1rem] sm:!text-[1.25rem] md:!text-[1.5rem] font-black">
+                    {stat.value}
+                  </Title>
                 </div>
               </div>
             </Card>
@@ -618,31 +746,33 @@ export default function ManageMapsPage() {
                   label: (
                     <div className="flex items-center gap-[0.5rem] px-[0.25rem]">
                       <MapIcon size={16} />
-                      <span className="hidden sm:inline">All Workspaces</span>
-                      <span className="sm:hidden">All</span>
+                      <span className="hidden sm:inline">All</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-gray-200/60 font-semibold">{stats.total}</Tag>
                     </div>
                   ),
                   value: 'ALL'
                 },
                 {
                   label: (
-                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-green-600">
-                      <Globe size={16} />
-                      <span className="hidden sm:inline">Public</span>
-                      <span className="sm:hidden">Public</span>
-                    </div>
-                  ),
-                  value: 'PUBLIC'
-                },
-                {
-                  label: (
                     <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-orange-500">
-                      <Lock size={16} />
+                      <Lock size={15} />
                       <span className="hidden sm:inline">Private</span>
                       <span className="sm:hidden">Private</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-orange-100 text-orange-700 font-semibold">{stats.private}</Tag>
                     </div>
                   ),
                   value: 'PRIVATE'
+                },
+                {
+                  label: (
+                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-green-600">
+                      <Globe size={15} />
+                      <span className="hidden sm:inline">Public</span>
+                      <span className="sm:hidden">Public</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-green-100 text-green-700 font-semibold">{stats.public}</Tag>
+                    </div>
+                  ),
+                  value: 'PUBLIC'
                 },
               ]}
               value={activeShare}
@@ -794,23 +924,28 @@ export default function ManageMapsPage() {
           />
         </Card>
 
-        {/* Map Settings Modal */}
+        {/* Edit Details Modal */}
         <Modal
           title={
             <div className="flex items-center gap-2.5 border-b border-gray-100 pb-3">
               <div className="p-1.5 rounded-lg bg-blue-50 text-primary">
-                <Settings size={18} />
+                <Edit3 size={18} />
               </div>
-              <span className="font-bold text-gray-800 text-base">Map Settings</span>
+              <div>
+                <span className="font-bold text-gray-800 text-base block">Edit Map Details</span>
+                <span className="text-gray-400 text-xs font-medium block truncate max-w-[340px]">
+                  {editingMap?.name}
+                </span>
+              </div>
             </div>
           }
           open={editModalOpen}
-          onCancel={() => !savingSettings && setEditModalOpen(false)}
+          onCancel={() => !savingDetails && setEditModalOpen(false)}
           footer={[
             <Button
               key="cancel"
               onClick={() => setEditModalOpen(false)}
-              disabled={savingSettings}
+              disabled={savingDetails}
               className="rounded-xl font-medium"
             >
               Cancel
@@ -818,87 +953,169 @@ export default function ManageMapsPage() {
             <Button
               key="save"
               type="primary"
-              loading={savingSettings}
-              onClick={handleSaveVisibility}
+              loading={savingDetails}
+              onClick={handleSaveDetails}
               className="bg-primary hover:bg-primary/90 border-none rounded-xl font-bold px-5"
             >
               Save Changes
             </Button>
           ]}
-          width={480}
+          width={500}
           centered
           className="rounded-2xl"
         >
-          <div className="py-3 flex flex-col gap-4">
-            <div>
-              <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-                Map Name
-              </div>
-              <Input
-                value={editName}
-                onChange={(e) => setEditName(e.target.value)}
-                placeholder="Enter map workspace name"
-                maxLength={32}
-                className="rounded-xl h-10 bg-gray-50/80 border-gray-200 font-medium text-sm focus:bg-white"
-              />
-              {editingMap && (
-                <div className="text-[11px] text-gray-400 font-mono mt-1.5 px-1 truncate">
-                  ID: {editingMap.id}
+          {editingMap && (
+            <div className="py-3 flex flex-col gap-4 animate-in fade-in duration-200">
+              <div>
+                <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                  Map Name
                 </div>
-              )}
-            </div>
-
-            <div>
-              <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2.5">
-                Select Visibility
+                <Input
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  placeholder="Enter map workspace name"
+                  maxLength={32}
+                  className="rounded-xl h-10 bg-gray-50/80 border-gray-200 font-medium text-sm focus:bg-white"
+                />
               </div>
-              <Radio.Group
-                value={editVisibility}
-                onChange={(e) => setEditVisibility(e.target.value)}
-                className="w-full flex flex-col gap-2.5"
-              >
-                <div
-                  onClick={() => setEditVisibility('PRIVATE')}
-                  className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
-                    editVisibility === 'PRIVATE'
-                      ? 'border-orange-400 bg-orange-50/40 shadow-xs'
-                      : 'border-gray-200 hover:border-gray-300 bg-white'
-                  }`}
+
+              <div>
+                <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                  Description
+                </div>
+                <Input.TextArea
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  placeholder="Describe this map workspace..."
+                  rows={3}
+                  className="rounded-xl bg-gray-50/80 border-gray-200 font-medium text-sm focus:bg-white"
+                />
+              </div>
+            </div>
+          )}
+        </Modal>
+
+        {/* Share Modal */}
+        <Modal
+          title={
+            <div className="flex items-center gap-2.5 border-b border-gray-100 pb-3">
+              <div className="p-1.5 rounded-lg bg-green-50 text-green-600">
+                <Share2 size={18} />
+              </div>
+              <div>
+                <span className="font-bold text-gray-800 text-base block">Share Map Workspace</span>
+                <span className="text-gray-400 text-xs font-medium block truncate max-w-[340px]">
+                  {sharingMap?.name}
+                </span>
+              </div>
+            </div>
+          }
+          open={shareModalOpen}
+          onCancel={() => !savingSharing && setShareModalOpen(false)}
+          footer={[
+            <Button
+              key="cancel"
+              onClick={() => setShareModalOpen(false)}
+              disabled={savingSharing}
+              className="rounded-xl font-medium"
+            >
+              Cancel
+            </Button>,
+            <Button
+              key="save"
+              type="primary"
+              loading={savingSharing}
+              onClick={handleSaveSharing}
+              className="bg-primary hover:bg-primary/90 border-none rounded-xl font-bold px-5"
+            >
+              Save Visibility
+            </Button>
+          ]}
+          width={500}
+          centered
+          className="rounded-2xl"
+        >
+          {sharingMap && (
+            <div className="py-3 flex flex-col gap-4 animate-in fade-in duration-200">
+              {/* Shareable Link Box */}
+              <div>
+                <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                  Shareable Link
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 flex items-center gap-2 px-3 h-10 rounded-xl bg-gray-50 border border-gray-200 text-xs text-gray-600 truncate">
+                    <LinkIcon size={14} className="text-gray-400 shrink-0" />
+                    <span className="truncate select-all">
+                      {typeof window !== 'undefined'
+                        ? `${window.location.origin}/map/${sharingMap.slug || sharingMap.id}`
+                        : `/map/${sharingMap.slug || sharingMap.id}`}
+                    </span>
+                  </div>
+                  <Button
+                    onClick={handleCopyLink}
+                    icon={copiedLink ? <Check size={16} className="text-green-600" /> : <Copy size={16} />}
+                    className={`h-10 rounded-xl font-bold flex items-center gap-1.5 shrink-0 ${
+                      copiedLink ? 'border-green-500 text-green-600 bg-green-50/50' : 'text-primary'
+                    }`}
+                  >
+                    {copiedLink ? 'Copied' : 'Copy Link'}
+                  </Button>
+                </div>
+              </div>
+
+              {/* General Access / Visibility Selection */}
+              <div>
+                <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2.5">
+                  General Access
+                </div>
+                <Radio.Group
+                  value={shareVisibility}
+                  onChange={(e) => setShareVisibility(e.target.value)}
+                  className="w-full flex flex-col gap-2.5"
                 >
-                  <Radio value="PRIVATE" className="mt-0.5" />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
-                      <Lock size={14} className="text-orange-500" />
-                      <span>Private</span>
-                    </div>
-                    <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
-                      Only you can view and access this map workspace (requires logging in).
+                  <div
+                    onClick={() => setShareVisibility('PRIVATE')}
+                    className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
+                      shareVisibility === 'PRIVATE'
+                        ? 'border-orange-400 bg-orange-50/40 shadow-xs'
+                        : 'border-gray-200 hover:border-gray-300 bg-white'
+                    }`}
+                  >
+                    <Radio value="PRIVATE" className="mt-0.5" />
+                    <div className="flex-1">
+                      <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
+                        <Lock size={14} className="text-orange-500" />
+                        <span>Private</span>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
+                        Only you can view and access this map workspace (requires logging in).
+                      </div>
                     </div>
                   </div>
-                </div>
 
-                <div
-                  onClick={() => setEditVisibility('PUBLIC')}
-                  className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
-                    editVisibility === 'PUBLIC'
-                      ? 'border-green-400 bg-green-50/40 shadow-xs'
-                      : 'border-gray-200 hover:border-gray-300 bg-white'
-                  }`}
-                >
-                  <Radio value="PUBLIC" className="mt-0.5" />
-                  <div className="flex-1">
-                    <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
-                      <Globe size={14} className="text-green-500" />
-                      <span>Public</span>
-                    </div>
-                    <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
-                      Anyone with the shareable link can view this map workspace without logging in.
+                  <div
+                    onClick={() => setShareVisibility('PUBLIC')}
+                    className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
+                      shareVisibility === 'PUBLIC'
+                        ? 'border-green-400 bg-green-50/40 shadow-xs'
+                        : 'border-gray-200 hover:border-gray-300 bg-white'
+                    }`}
+                  >
+                    <Radio value="PUBLIC" className="mt-0.5" />
+                    <div className="flex-1">
+                      <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
+                        <Globe size={14} className="text-green-500" />
+                        <span>Public</span>
+                      </div>
+                      <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
+                        Anyone with the shareable link can view this map workspace without logging in.
+                      </div>
                     </div>
                   </div>
-                </div>
-              </Radio.Group>
+                </Radio.Group>
+              </div>
             </div>
-          </div>
+          )}
         </Modal>
 
         {/* Bulk Action Bar (Floating) */}

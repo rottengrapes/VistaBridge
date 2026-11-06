@@ -43,28 +43,37 @@ import {
   Globe,
   Eye,
   Copy,
-  Settings,
+  Edit3,
   X,
+  Share2,
+  Users,
+  Shield,
 } from 'lucide-react';
 import DashboardLayout from '@/components/layout/DashboardLayout';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useUIStore } from '@/store/useUIStore';
 import { apiRequest } from '@/lib/api';
 import { siteConfig } from '@/config/site-config';
-import dayjs from 'dayjs';
-import relativeTime from 'dayjs/plugin/relativeTime';
-import isBetween from 'dayjs/plugin/isBetween';
-
-dayjs.extend(relativeTime);
-dayjs.extend(isBetween);
+import { slugify } from '@/lib/slug';
+import ShareDashboardModal from '@/components/dashboard/ShareDashboardModal';
+import { normalizeAllowedUsers, AllowedUserEntry, normalizeAllowedRoles, AllowedRoleEntry, isUserAdmin } from '@/lib/dashboardPermissions';
+import { formatRelativeTime, formatFullDate, compareDates, parseDate, dayjs } from '@/lib/dateUtils';
 
 const { Title, Text } = Typography;
 
 interface Dashboard {
   id: string;
+  slug?: string;
   name: string;
   description?: string;
   is_public?: boolean;
+  share_type?: 'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC';
+  allowed_users?: AllowedUserEntry[] | string[];
+  allowed_roles?: AllowedRoleEntry[] | string[];
+  created_by?: string;
+  is_owner?: boolean;
+  user_role?: string;
+  can_edit?: boolean;
   content: { widgets?: Array<{ type?: string; [key: string]: unknown }> };
   created_at?: string;
   updated_at?: string;
@@ -73,10 +82,21 @@ interface Dashboard {
 export default function ManageDashboardsPage() {
   const router = useRouter();
   const { notification, modal } = App.useApp();
-  const { token, hydrated } = useAuthStore();
+  const { token, hydrated, user } = useAuthStore();
+  const isAdmin = useMemo(() => isUserAdmin(user), [user]);
   const { globalSearch, setGlobalSearch } = useUIStore();
   const [loading, setLoading] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
+
+  // Edit Details Modal State
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editingDashboard, setEditingDashboard] = useState<Dashboard | null>(null);
+  const [editName, setEditName] = useState('');
+  const [savingDetails, setSavingDetails] = useState(false);
+
+  // Sharing Modal State
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [sharingDashboard, setSharingDashboard] = useState<Dashboard | null>(null);
 
   useEffect(() => {
     const handleResize = () => {
@@ -100,16 +120,40 @@ export default function ManageDashboardsPage() {
   const [afterDate, setAfterDate] = useState<dayjs.Dayjs | null>(null);
   const [localSearch, setLocalSearch] = useState('');
 
-  // Edit Settings Modal States
-  const [editModalOpen, setEditModalOpen] = useState(false);
-  const [editingDashboard, setEditingDashboard] = useState<Dashboard | null>(null);
-  const [editName, setEditName] = useState('');
-  const [editVisibility, setEditVisibility] = useState<'PUBLIC' | 'PRIVATE'>('PRIVATE');
-  const [savingSettings, setSavingSettings] = useState(false);
 
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [createShareType, setCreateShareType] = useState<'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC'>('PRIVATE');
   const [createForm] = Form.useForm();
+
+  interface UserOption {
+    username: string;
+    first_name?: string;
+    last_name?: string;
+    email?: string;
+    role?: string;
+  }
+  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
+  const [loadingRoles, setLoadingRoles] = useState(false);
+
+  const fetchRoles = useCallback(() => {
+    if (availableRoles.length > 0) return;
+    setLoadingRoles(true);
+    apiRequest('/geoserver/roles')
+      .then((res) => (res.ok ? res.json() : { roles: [] }))
+      .then((data) => {
+        if (Array.isArray(data.roles)) setAvailableRoles(data.roles);
+      })
+      .catch(() => {})
+      .finally(() => setLoadingRoles(false));
+  }, [availableRoles.length]);
+
+  useEffect(() => {
+    if (createOpen) {
+      fetchRoles();
+    }
+  }, [createOpen, fetchRoles]);
+
 
   // ── Fetch Dashboards ───────────────────────────────────────────────────────
 
@@ -177,11 +221,15 @@ export default function ManageDashboardsPage() {
   const filteredDashboards = useMemo(() => {
     let filtered = [...dashboards];
 
-    // 1. Filter by Segmented Tab (ALL, PUBLIC, PRIVATE)
-    if (activeShare === 'PUBLIC') {
-      filtered = filtered.filter(d => d.is_public);
+    // 1. Filter by Segmented Tab (ALL, MINE, SHARED, PUBLIC)
+    if (activeShare === 'MINE') {
+      filtered = filtered.filter(d => d.is_owner !== false);
+    } else if (activeShare === 'SHARED') {
+      filtered = filtered.filter(d => d.is_owner === false);
+    } else if (activeShare === 'PUBLIC') {
+      filtered = filtered.filter(d => d.share_type === 'PUBLIC' || d.is_public);
     } else if (activeShare === 'PRIVATE') {
-      filtered = filtered.filter(d => !d.is_public);
+      filtered = filtered.filter(d => (d.share_type || 'PRIVATE') === 'PRIVATE' && !d.is_public);
     }
 
     // 2. Filter by global navbar search
@@ -210,23 +258,25 @@ export default function ManageDashboardsPage() {
 
     // 4. Filter by Share dropdown in Advanced Filter
     if (shareFilter) {
-      if (shareFilter === 'PUBLIC') filtered = filtered.filter(d => d.is_public);
-      if (shareFilter === 'PRIVATE') filtered = filtered.filter(d => !d.is_public);
+      if (shareFilter === 'PUBLIC') filtered = filtered.filter(d => d.share_type === 'PUBLIC' || d.is_public);
+      if (shareFilter === 'PRIVATE') filtered = filtered.filter(d => (d.share_type || 'PRIVATE') === 'PRIVATE' && !d.is_public);
+      if (shareFilter === 'ROLES') filtered = filtered.filter(d => d.share_type === 'ROLES' || (d.allowed_roles && (d.allowed_roles as any).length > 0));
+      if (shareFilter === 'USERS') filtered = filtered.filter(d => d.share_type === 'USERS');
     }
 
     // 5. Filter by Created After Date
     if (afterDate) {
       filtered = filtered.filter(d => {
-        const date = d.created_at || d.updated_at;
-        return date ? (dayjs(date).isAfter(afterDate, 'day') || dayjs(date).isSame(afterDate, 'day')) : false;
+        const date = parseDate(d.created_at || d.updated_at);
+        return date ? (date.isAfter(afterDate, 'day') || date.isSame(afterDate, 'day')) : false;
       });
     }
 
     // 6. Filter by Created Before Date
     if (beforeDate) {
       filtered = filtered.filter(d => {
-        const date = d.created_at || d.updated_at;
-        return date ? (dayjs(date).isBefore(beforeDate, 'day') || dayjs(date).isSame(beforeDate, 'day')) : false;
+        const date = parseDate(d.created_at || d.updated_at);
+        return date ? (date.isBefore(beforeDate, 'day') || date.isSame(beforeDate, 'day')) : false;
       });
     }
 
@@ -307,8 +357,10 @@ export default function ManageDashboardsPage() {
 
   const handleClone = async (dashboard: Dashboard) => {
     try {
+      const baseSlug = dashboard.slug ? `${dashboard.slug}_copy` : slugify(`${dashboard.name}_copy`);
       const payload = {
         name: `${dashboard.name} (Copy)`,
+        slug: baseSlug,
         description: dashboard.description || '',
         is_public: dashboard.is_public || false,
         content: dashboard.content || { widgets: [] },
@@ -334,14 +386,13 @@ export default function ManageDashboardsPage() {
     }
   };
 
-  const openEditVisibility = (dashboard: Dashboard) => {
+  const openEditModal = (dashboard: Dashboard) => {
     setEditingDashboard(dashboard);
     setEditName(dashboard.name);
-    setEditVisibility(dashboard.is_public ? 'PUBLIC' : 'PRIVATE');
     setEditModalOpen(true);
   };
 
-  const handleSaveVisibility = async () => {
+  const handleSaveDetails = async () => {
     if (!editingDashboard) return;
     const trimmedName = editName.trim();
     if (!trimmedName || trimmedName.length < 2) {
@@ -369,28 +420,27 @@ export default function ManageDashboardsPage() {
       return;
     }
 
-    setSavingSettings(true);
+    setSavingDetails(true);
     try {
       const res = await apiRequest(`/dashboards/${editingDashboard.id}`, {
         method: 'PATCH',
         body: JSON.stringify({
           name: trimmedName,
-          is_public: editVisibility === 'PUBLIC',
         }),
       });
-      const updated = await res.json();
-      if (!res.ok) throw new Error(updated.detail || `HTTP ${res.status}`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
 
       setDashboards((prev) =>
         prev.map((d) =>
           d.id === editingDashboard.id
-            ? { ...d, name: trimmedName, is_public: editVisibility === 'PUBLIC' }
+            ? { ...d, name: trimmedName, slug: data.slug || d.slug }
             : d
         )
       );
       notification.success({
-        message: 'Settings Saved',
-        description: `Dashboard workspace "${trimmedName}" updated successfully.`,
+        message: 'Dashboard Renamed',
+        description: `Successfully renamed dashboard to "${trimmedName}".`,
         placement: 'topRight',
       });
       setEditModalOpen(false);
@@ -398,22 +448,51 @@ export default function ManageDashboardsPage() {
     } catch (err: any) {
       notification.error({
         message: 'Update Failed',
-        description: err.message || 'Could not update dashboard settings.',
+        description: err.message || 'Could not update dashboard details.',
         placement: 'topRight',
       });
     } finally {
-      setSavingSettings(false);
+      setSavingDetails(false);
     }
   };
 
-  const handleCreateDashboard = async (values: { name: string; description?: string; share: string }) => {
+  const openShareModal = (dashboard: Dashboard) => {
+    setSharingDashboard(dashboard);
+    setShareModalOpen(true);
+  };
+
+
+  const handleCreateDashboard = async (values: {
+    name: string;
+    description?: string;
+    share_type?: 'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC';
+    allowed_users?: string[];
+    allowed_roles?: string[];
+  }) => {
     setCreating(true);
     try {
+      const shareType = values.share_type || createShareType || 'PRIVATE';
+      const allowedRoles = shareType === 'ROLES'
+        ? (values.allowed_roles || []).map((r: string) => ({ role: r, permission: 'VIEWER' }))
+        : [];
+      if (shareType === 'ROLES' && allowedRoles.length === 0) {
+        notification.warning({
+          message: 'No Roles Selected',
+          description: 'Please select at least one GeoServer role for role-based access.',
+          placement: 'topRight',
+        });
+        setCreating(false);
+        return;
+      }
+
       const payload = {
         name: values.name.trim(),
         description: values.description || '',
-        is_public: values.share === 'PUBLIC',
-        content: { widgets: [] }
+        share_type: shareType,
+        allowed_roles: allowedRoles,
+        allowed_users: [],
+        is_public: shareType === 'PUBLIC',
+        content: { widgets: [] },
       };
       const res = await apiRequest('/dashboards', {
         method: 'POST',
@@ -430,11 +509,13 @@ export default function ManageDashboardsPage() {
       });
       setCreateOpen(false);
       createForm.resetFields();
-      router.push(`/dashboard/view?id=${data.id}`);
+      setCreateShareType('PRIVATE');
+      fetchDashboards(true);
+      router.push(`/dashboard/${data.slug || data.id}`);
     } catch (err: any) {
       notification.error({
-        message: 'Error',
-        description: err.message || 'Failed to create dashboard.',
+        message: 'Creation Failed',
+        description: err.message || 'Could not create new dashboard workspace.',
         placement: 'topRight',
       });
     } finally {
@@ -446,8 +527,10 @@ export default function ManageDashboardsPage() {
 
   const stats = {
     total: dashboards.length,
-    public: dashboards.filter(d => d.is_public).length,
-    private: dashboards.filter(d => !d.is_public).length,
+    mine: dashboards.filter(d => d.is_owner !== false).length,
+    shared: dashboards.filter(d => d.is_owner === false).length,
+    public: dashboards.filter(d => d.share_type === 'PUBLIC' || d.is_public).length,
+    private: dashboards.filter(d => (d.share_type || 'PRIVATE') === 'PRIVATE' && !d.is_public).length,
   };
 
   const widgetCount = (d: Dashboard) => d.content?.widgets?.length ?? 0;
@@ -459,16 +542,19 @@ export default function ManageDashboardsPage() {
       title: 'Dashboard Workspace',
       dataIndex: 'name',
       key: 'name',
-      render: (text: string, record: Dashboard) => (
-        <div className="max-w-[320px] whitespace-nowrap">
-          <Link
-            href={`/dashboard/view?id=${record.id}`}
-            className="block text-[14px] font-bold text-gray-800 hover:text-primary transition-colors truncate"
-          >
-            {text}
-          </Link>
-        </div>
-      ),
+      render: (text: string, record: Dashboard) => {
+        const targetSlug = record.slug || record.id;
+        return (
+          <div className="max-w-[320px] whitespace-nowrap">
+            <Link
+              href={`/dashboard/${targetSlug}`}
+              className="block text-[14px] font-bold text-gray-800 hover:text-primary transition-colors truncate"
+            >
+              {text}
+            </Link>
+          </div>
+        );
+      },
       sorter: (a: Dashboard, b: Dashboard) => a.name.localeCompare(b.name),
     },
     {
@@ -501,21 +587,70 @@ export default function ManageDashboardsPage() {
       },
     },
     {
-      title: 'Visibility',
-      dataIndex: 'is_public',
-      key: 'visibility',
-      render: (isPublic: boolean) => (
-        <div className="flex items-center gap-1.5 whitespace-nowrap">
-          {!isPublic ? (
-            <Lock size={12} className="text-orange-400" />
-          ) : (
-            <Globe size={12} className="text-green-400" />
-          )}
-          <Text className={`text-[10px] font-bold uppercase tracking-wider whitespace-nowrap ${!isPublic ? 'text-orange-500' : 'text-green-500'}`}>
-            {isPublic ? 'PUBLIC' : 'PRIVATE'}
-          </Text>
-        </div>
-      ),
+      title: 'Access & Sharing',
+      key: 'sharing',
+      render: (_: any, record: Dashboard) => {
+        const type = record.share_type || (record.is_public ? 'PUBLIC' : 'PRIVATE');
+        if (type === 'ROLES' || (record.allowed_roles && (record.allowed_roles as any).length > 0)) {
+          const normRoles = normalizeAllowedRoles(record.allowed_roles);
+          const tooltipText = normRoles.length > 0
+            ? normRoles.map((r) => `${r.role} (${r.permission === 'EDITOR' ? 'Editor' : 'Viewer'})`).join(', ')
+            : 'No roles';
+          return (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Tooltip title={`Shared with GeoServer Roles: ${tooltipText}`}>
+                <Tag icon={<Shield size={11} className="inline mr-1" />} color="blue" className="rounded-lg text-[11px] font-semibold py-0.5">
+                  Roles ({normRoles.length})
+                </Tag>
+              </Tooltip>
+              {!record.is_owner && (
+                <Tag color={isAdmin ? 'purple' : (record.can_edit ? 'purple' : 'default')} className="rounded-lg text-[10px] font-bold py-0.5">
+                  {isAdmin ? 'Admin' : (record.can_edit ? 'Editor' : 'Viewer')}
+                </Tag>
+              )}
+            </div>
+          );
+        }
+        if (type === 'USERS') {
+          const normUsers = normalizeAllowedUsers(record.allowed_users);
+          const tooltipText = normUsers.length > 0
+            ? normUsers.map((u) => `${u.username} (${u.role === 'EDITOR' ? 'Editor' : 'Viewer'})`).join(', ')
+            : 'No users';
+          return (
+            <div className="flex items-center gap-1.5 flex-wrap">
+              <Tooltip title={`Shared with: ${tooltipText}`}>
+                <Tag icon={<Users size={11} className="inline mr-1" />} color="blue" className="rounded-lg text-[11px] font-semibold py-0.5">
+                  Users ({normUsers.length})
+                </Tag>
+              </Tooltip>
+              {!record.is_owner && (
+                <Tag color={isAdmin ? 'purple' : (record.can_edit ? 'purple' : 'default')} className="rounded-lg text-[10px] font-bold py-0.5">
+                  {isAdmin ? 'Admin' : (record.can_edit ? 'Editor' : 'Viewer')}
+                </Tag>
+              )}
+            </div>
+          );
+        }
+        if (type === 'PUBLIC') {
+          return (
+            <div className="flex items-center gap-1.5">
+              <Tag icon={<Globe size={11} className="inline mr-1" />} color="green" className="rounded-lg text-[11px] font-semibold py-0.5">
+                Public Link
+              </Tag>
+              {!record.is_owner && (
+                <Tag color={isAdmin ? 'purple' : 'default'} className="rounded-lg text-[10px] font-bold py-0.5">
+                  {isAdmin ? 'Admin' : 'Viewer'}
+                </Tag>
+              )}
+            </div>
+          );
+        }
+        return (
+          <Tag icon={<Lock size={11} className="inline mr-1" />} color="orange" className="rounded-lg text-[11px] font-semibold py-0.5">
+            {record.is_owner ? 'Private (Only Me)' : (isAdmin ? 'Private (Admin Access)' : 'Private')}
+          </Tag>
+        );
+      },
     },
     {
       title: 'Updated',
@@ -523,60 +658,82 @@ export default function ManageDashboardsPage() {
       render: (_: any, record: Dashboard) => {
         const date = record.updated_at || record.created_at;
         return (
-          <Tooltip title={date ? dayjs(date).format('YYYY-MM-DD HH:mm:ss') : 'No date'}>
+          <Tooltip title={formatFullDate(date)}>
             <Text className="text-[12px] text-gray-400 font-medium whitespace-nowrap">
-              {date ? dayjs(date).fromNow() : 'N/A'}
+              {formatRelativeTime(date)}
             </Text>
           </Tooltip>
         );
       },
       sorter: (a: Dashboard, b: Dashboard) => {
-        const dateA = a.updated_at || a.created_at || '';
-        const dateB = b.updated_at || b.created_at || '';
-        return dayjs(dateA).unix() - dayjs(dateB).unix();
+        return compareDates(a.updated_at || a.created_at, b.updated_at || b.created_at);
       },
     },
     {
       title: '',
       key: 'actions',
-      render: (_: any, record: Dashboard) => (
-        <Space size="middle" className="whitespace-nowrap">
-          <Tooltip title="Open Dashboard">
-            <Link href={`/dashboard/view?id=${record.id}`}>
-              <Button type="text" size="small" icon={<Eye size={16} className="text-gray-400 hover:text-primary" />} />
-            </Link>
-          </Tooltip>
+      render: (_: any, record: Dashboard) => {
+        const canManage = Boolean(record.is_owner || isAdmin);
+        return (
+          <Space size="middle" className="whitespace-nowrap">
+            <Tooltip title="Open Dashboard">
+              <Link href={`/dashboard/${record.slug || record.id}`}>
+                <Button type="text" size="small" icon={<Eye size={16} className="text-gray-400 hover:text-primary" />} />
+              </Link>
+            </Tooltip>
 
-          <Tooltip title="Dashboard Settings">
-            <Button
-              type="text"
-              size="small"
-              icon={<Settings size={16} className="text-gray-400 hover:text-primary" />}
-              onClick={() => openEditVisibility(record)}
-            />
-          </Tooltip>
+            <Tooltip title={canManage ? "Rename Dashboard" : "Only owner or admin can rename dashboard"}>
+              <Button
+                type="text"
+                size="small"
+                disabled={!canManage}
+                icon={
+                  <Edit3
+                    size={16}
+                    className={canManage ? "text-gray-400 hover:text-primary transition-colors" : "text-gray-300 cursor-not-allowed"}
+                  />
+                }
+                onClick={() => canManage && openEditModal(record)}
+              />
+            </Tooltip>
 
-          <Tooltip title="Clone">
-            <Button
-              type="text"
-              size="small"
-              icon={<Copy size={15} className="text-gray-400 hover:text-primary" />}
-              onClick={() => handleClone(record)}
-            />
-          </Tooltip>
+            <Tooltip title={canManage ? "Share & Permissions" : "Share & Copy Link"}>
+              <Button
+                type="text"
+                size="small"
+                icon={<Share2 size={16} className="text-gray-400 hover:text-primary transition-colors" />}
+                onClick={() => openShareModal(record)}
+              />
+            </Tooltip>
 
-          <Tooltip title="Delete Dashboard">
-            <Button
-              type="text"
-              size="small"
-              danger
-              icon={<Trash2 size={16} />}
-              onClick={() => handleDelete(record.id, record.name)}
-            />
-          </Tooltip>
-        </Space>
-      ),
-      width: 140,
+            <Tooltip title="Clone">
+              <Button
+                type="text"
+                size="small"
+                icon={<Copy size={15} className="text-gray-400 hover:text-primary" />}
+                onClick={() => handleClone(record)}
+              />
+            </Tooltip>
+
+            <Tooltip title={canManage ? "Delete Dashboard" : "Only owner or admin can delete dashboard"}>
+              <Button
+                type="text"
+                size="small"
+                danger={canManage}
+                disabled={!canManage}
+                icon={
+                  <Trash2
+                    size={16}
+                    className={canManage ? "text-red-500 hover:text-red-600 transition-colors" : "text-gray-300 cursor-not-allowed"}
+                  />
+                }
+                onClick={() => canManage && handleDelete(record.id, record.name)}
+              />
+            </Tooltip>
+          </Space>
+        );
+      },
+      width: 170,
     },
   ];
 
@@ -587,6 +744,9 @@ export default function ManageDashboardsPage() {
   const rowSelection = {
     selectedRowKeys,
     onChange: onSelectChange,
+    getCheckboxProps: (record: Dashboard) => ({
+      disabled: !record.is_owner && !isAdmin,
+    }),
   };
 
   if (!hydrated || !token) {
@@ -613,8 +773,10 @@ export default function ManageDashboardsPage() {
               type="primary"
               icon={<Plus size={16} />}
               onClick={() => {
-                createForm.setFieldsValue({ name: '', description: '', share: 'PRIVATE' });
+                createForm.setFieldsValue({ name: '', description: '', share_type: 'PRIVATE', allowed_roles: [] });
+                setCreateShareType('PRIVATE');
                 setCreateOpen(true);
+                fetchRoles();
               }}
               className="rounded-[0.75rem] h-[2.5rem] px-[1.5rem] font-bold shadow-md hover:shadow-lg transition-all text-[0.75rem] sm:text-[0.875rem] flex items-center gap-1.5"
             >
@@ -631,20 +793,59 @@ export default function ManageDashboardsPage() {
         </div>
 
         {/* Dashboard Stats Bar */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-[0.75rem] sm:gap-[1rem]">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-[0.75rem] sm:gap-[1rem]">
           {[
-            { label: 'Total Dashboards', value: stats.total, icon: <LayoutDashboard size={isMobile ? 16 : 20} />, color: 'bg-primary' },
-            { label: 'Public Dashboards', value: stats.public, icon: <Globe size={isMobile ? 16 : 20} />, color: 'bg-green-500' },
-            { label: 'Private Dashboards', value: stats.private, icon: <Lock size={isMobile ? 16 : 20} />, color: 'bg-orange-500' },
+            {
+              label: 'Total Dashboards',
+              value: stats.total,
+              icon: <LayoutDashboard size={isMobile ? 16 : 20} />,
+              color: 'bg-primary',
+              filterKey: 'ALL',
+            },
+            {
+              label: 'My Dashboards',
+              value: stats.mine,
+              icon: <Lock size={isMobile ? 16 : 20} />,
+              color: 'bg-indigo-600',
+              filterKey: 'MINE',
+            },
+            {
+              label: 'Shared With Me',
+              value: stats.shared,
+              icon: <Users size={isMobile ? 16 : 20} />,
+              color: 'bg-blue-500',
+              filterKey: 'SHARED',
+            },
+            {
+              label: 'Public Dashboards',
+              value: stats.public,
+              icon: <Globe size={isMobile ? 16 : 20} />,
+              color: 'bg-green-500',
+              filterKey: 'PUBLIC',
+            },
           ].map((stat, i) => (
-            <Card key={i} variant="borderless" className="shadow-sm border border-gray-100 rounded-[1rem] overflow-hidden group hover:shadow-md transition-all" styles={{ body: { padding: isMobile ? '0.625rem 0.875rem' : '1.5rem' } }}>
+            <Card
+              key={i}
+              variant="borderless"
+              onClick={() => setActiveShare(stat.filterKey)}
+              className={`shadow-sm border rounded-[1rem] overflow-hidden group hover:shadow-md transition-all cursor-pointer ${
+                activeShare === stat.filterKey
+                  ? 'border-primary/40 ring-1 ring-primary/20 bg-primary/5'
+                  : 'border-gray-100 bg-white hover:border-gray-200'
+              }`}
+              styles={{ body: { padding: isMobile ? '0.625rem 0.875rem' : '1.25rem 1.5rem' } }}
+            >
               <div className="flex items-center gap-[0.75rem] sm:gap-[1rem]">
                 <div className={`${stat.color} p-[0.5rem] sm:p-[0.75rem] rounded-[0.75rem] text-white shadow-sm group-hover:scale-110 transition-transform mb-auto mt-[0.125rem] flex shrink-0`}>
                   {stat.icon}
                 </div>
                 <div>
-                  <Text className="text-[0.5625rem] xs:text-[0.625rem] sm:text-[0.75rem] font-bold uppercase tracking-widest text-gray-400 block leading-none mb-[0.25rem]">{stat.label}</Text>
-                  <Title level={3} className="!m-0 !text-[1rem] sm:!text-[1.25rem] md:!text-[1.5rem] font-black">{stat.value}</Title>
+                  <Text className="text-[0.5625rem] xs:text-[0.625rem] sm:text-[0.75rem] font-bold uppercase tracking-widest text-gray-400 block leading-none mb-[0.25rem]">
+                    {stat.label}
+                  </Text>
+                  <Title level={3} className="!m-0 !text-[1rem] sm:!text-[1.25rem] md:!text-[1.5rem] font-black">
+                    {stat.value}
+                  </Title>
                 </div>
               </div>
             </Card>
@@ -661,31 +862,44 @@ export default function ManageDashboardsPage() {
                   label: (
                     <div className="flex items-center gap-[0.5rem] px-[0.25rem]">
                       <LayoutDashboard size={16} />
-                      <span className="hidden sm:inline">All Dashboards</span>
-                      <span className="sm:hidden">All</span>
+                      <span className="hidden sm:inline">All</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-gray-200/60 font-semibold">{stats.total}</Tag>
                     </div>
                   ),
                   value: 'ALL'
                 },
                 {
                   label: (
-                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-green-600">
-                      <Globe size={16} />
-                      <span className="hidden sm:inline">Public</span>
-                      <span className="sm:hidden">Public</span>
+                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-primary">
+                      <Lock size={15} />
+                      <span className="hidden sm:inline">My Dashboards</span>
+                      <span className="sm:hidden">Mine</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-primary/10 text-primary font-semibold">{stats.mine}</Tag>
                     </div>
                   ),
-                  value: 'PUBLIC'
+                  value: 'MINE'
                 },
                 {
                   label: (
-                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-orange-500">
-                      <Lock size={16} />
-                      <span className="hidden sm:inline">Private</span>
-                      <span className="sm:hidden">Private</span>
+                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-blue-600">
+                      <Users size={15} />
+                      <span className="hidden sm:inline">Shared With Me</span>
+                      <span className="sm:hidden">Shared</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-blue-100 text-blue-700 font-semibold">{stats.shared}</Tag>
                     </div>
                   ),
-                  value: 'PRIVATE'
+                  value: 'SHARED'
+                },
+                {
+                  label: (
+                    <div className="flex items-center gap-[0.5rem] px-[0.25rem] text-green-600">
+                      <Globe size={15} />
+                      <span className="hidden sm:inline">Public</span>
+                      <span className="sm:hidden">Public</span>
+                      <Tag className="ml-1 text-[10px] py-0 px-1 border-none bg-green-100 text-green-700 font-semibold">{stats.public}</Tag>
+                    </div>
+                  ),
+                  value: 'PUBLIC'
                 },
               ]}
               value={activeShare}
@@ -739,8 +953,10 @@ export default function ManageDashboardsPage() {
                     value={shareFilter}
                     onChange={setShareFilter}
                     options={[
-                      { label: 'Private', value: 'PRIVATE' },
-                      { label: 'Public', value: 'PUBLIC' }
+                      { label: 'Private (Only Me)', value: 'PRIVATE' },
+                      { label: 'GeoServer Roles', value: 'ROLES' },
+                      { label: 'Specific Users', value: 'USERS' },
+                      { label: 'Public Link', value: 'PUBLIC' }
                     ]}
                   />
                 </div>
@@ -811,8 +1027,10 @@ export default function ManageDashboardsPage() {
                           type="link"
                           className="font-bold"
                           onClick={() => {
-                            createForm.setFieldsValue({ name: '', description: '', share: 'PRIVATE' });
+                            createForm.setFieldsValue({ name: '', description: '', share_type: 'PRIVATE', allowed_roles: [] });
+                            setCreateShareType('PRIVATE');
                             setCreateOpen(true);
+                            fetchRoles();
                           }}
                         >
                           Create your first dashboard
@@ -872,112 +1090,6 @@ export default function ManageDashboardsPage() {
         )}
       </div>
 
-      {/* Dashboard Settings Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-2.5 border-b border-gray-100 pb-3">
-            <div className="p-1.5 rounded-lg bg-blue-50 text-primary">
-              <Settings size={18} />
-            </div>
-            <span className="font-bold text-gray-800 text-base">Dashboard Settings</span>
-          </div>
-        }
-        open={editModalOpen}
-        onCancel={() => !savingSettings && setEditModalOpen(false)}
-        footer={[
-          <Button
-            key="cancel"
-            onClick={() => setEditModalOpen(false)}
-            disabled={savingSettings}
-            className="rounded-xl font-medium"
-          >
-            Cancel
-          </Button>,
-          <Button
-            key="save"
-            type="primary"
-            loading={savingSettings}
-            onClick={handleSaveVisibility}
-            className="bg-primary hover:bg-primary/90 border-none rounded-xl font-bold px-5"
-          >
-            Save Changes
-          </Button>
-        ]}
-        width={480}
-        centered
-        className="rounded-2xl"
-      >
-        <div className="py-3 flex flex-col gap-4">
-          <div>
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
-              Dashboard Name
-            </div>
-            <Input
-              value={editName}
-              onChange={(e) => setEditName(e.target.value)}
-              placeholder="Enter dashboard workspace name"
-              maxLength={32}
-              className="rounded-xl h-10 bg-gray-50/80 border-gray-200 font-medium text-sm focus:bg-white"
-            />
-            {editingDashboard && (
-              <div className="text-[11px] text-gray-400 font-mono mt-1.5 px-1 truncate">
-                ID: {editingDashboard.id}
-              </div>
-            )}
-          </div>
-
-          <div>
-            <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2.5">
-              Select Visibility
-            </div>
-            <Radio.Group
-              value={editVisibility}
-              onChange={(e) => setEditVisibility(e.target.value)}
-              className="w-full flex flex-col gap-2.5"
-            >
-              <div
-                onClick={() => setEditVisibility('PRIVATE')}
-                className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
-                  editVisibility === 'PRIVATE'
-                    ? 'border-orange-400 bg-orange-50/40 shadow-xs'
-                    : 'border-gray-200 hover:border-gray-300 bg-white'
-                }`}
-              >
-                <Radio value="PRIVATE" className="mt-0.5" />
-                <div className="flex-1">
-                  <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
-                    <Lock size={14} className="text-orange-500" />
-                    <span>Private</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
-                    Only you can view and access this dashboard workspace (requires logging in).
-                  </div>
-                </div>
-              </div>
-
-              <div
-                onClick={() => setEditVisibility('PUBLIC')}
-                className={`p-3.5 rounded-xl border cursor-pointer transition-all flex items-start gap-3 ${
-                  editVisibility === 'PUBLIC'
-                    ? 'border-green-400 bg-green-50/40 shadow-xs'
-                    : 'border-gray-200 hover:border-gray-300 bg-white'
-                }`}
-              >
-                <Radio value="PUBLIC" className="mt-0.5" />
-                <div className="flex-1">
-                  <div className="flex items-center gap-1.5 font-bold text-sm text-gray-800">
-                    <Globe size={14} className="text-green-500" />
-                    <span>Public</span>
-                  </div>
-                  <div className="text-xs text-gray-500 mt-0.5 leading-relaxed">
-                    Anyone with the shareable link can view this dashboard workspace without logging in.
-                  </div>
-                </div>
-              </div>
-            </Radio.Group>
-          </div>
-          </div>
-        </Modal>
 
       {/* Create Dashboard Modal */}
       <Modal
@@ -1032,7 +1144,11 @@ export default function ManageDashboardsPage() {
               }
             ]}
           >
-            <Input placeholder="e.g. My Dashboard Workspace" className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold" maxLength={32} />
+            <Input
+              placeholder="e.g. My Dashboard Workspace"
+              className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold"
+              maxLength={32}
+            />
           </Form.Item>
 
           <Form.Item
@@ -1043,19 +1159,50 @@ export default function ManageDashboardsPage() {
           </Form.Item>
 
           <Form.Item
-            name="share"
+            name="share_type"
             label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Access Control</span>}
             initialValue="PRIVATE"
             rules={[{ required: true }]}
           >
             <Select
               className="vismap-select h-11"
+              value={createShareType}
+              onChange={(val) => {
+                setCreateShareType(val);
+                createForm.setFieldValue('share_type', val);
+              }}
               options={[
-                { label: 'Private', value: 'PRIVATE' },
-                { label: 'Public', value: 'PUBLIC' }
+                { label: 'Private (Only you can access)', value: 'PRIVATE' },
+                { label: 'GeoServer Roles (Grant access to selected roles)', value: 'ROLES' },
+                { label: 'Public (Anyone with link can view)', value: 'PUBLIC' },
               ]}
             />
           </Form.Item>
+
+          {createShareType === 'ROLES' && (
+            <Form.Item
+              name="allowed_roles"
+              label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Select GeoServer Roles</span>}
+              rules={[{ required: true, message: 'Please select at least one GeoServer role' }]}
+            >
+              <Select
+                mode="multiple"
+                placeholder="Search and select GeoServer roles..."
+                loading={loadingRoles}
+                className="w-full rounded-xl"
+                options={availableRoles.map((r) => ({
+                  label: r,
+                  value: r,
+                }))}
+              />
+            </Form.Item>
+          )}
+
+          <div className="text-[11px] text-gray-400 -mt-2">
+            {createShareType === 'PRIVATE' && '🔒 Only you can view or edit this dashboard.'}
+            {createShareType === 'ROLES' && '🛡️ Only users possessing the selected GeoServer roles can access this dashboard.'}
+            {createShareType === 'PUBLIC' && '🌐 Anyone with the link can view this dashboard without logging in.'}
+          </div>
 
           <div className="flex gap-3 justify-end pt-5 border-t border-gray-100 mt-8">
             <Button className="rounded-xl h-11 px-6 font-semibold" onClick={() => setCreateOpen(false)}>
@@ -1072,6 +1219,99 @@ export default function ManageDashboardsPage() {
           </div>
         </Form>
       </Modal>
+
+      {/* Edit Dashboard Details Modal */}
+      <Modal
+        title={
+          <div className="flex items-center gap-2.5 border-b border-gray-100 pb-3">
+            <div className="p-1.5 rounded-lg bg-blue-50 text-primary">
+              <Edit3 size={18} />
+            </div>
+            <div>
+              <span className="font-bold text-gray-800 text-base block">Rename Dashboard</span>
+              <span className="text-gray-400 text-xs font-medium block truncate max-w-[340px]">
+                {editingDashboard?.name}
+              </span>
+            </div>
+          </div>
+        }
+        open={editModalOpen}
+        onCancel={() => !savingDetails && setEditModalOpen(false)}
+        footer={[
+          <Button
+            key="cancel"
+            onClick={() => setEditModalOpen(false)}
+            disabled={savingDetails}
+            className="rounded-xl font-medium"
+          >
+            Cancel
+          </Button>,
+          <Button
+            key="save"
+            type="primary"
+            loading={savingDetails}
+            onClick={handleSaveDetails}
+            className="bg-primary hover:bg-primary/90 border-none rounded-xl font-bold px-5"
+          >
+            Save Changes
+          </Button>
+        ]}
+        width={460}
+        centered
+        className="rounded-2xl"
+      >
+        {editingDashboard && (
+          <div className="py-3 flex flex-col gap-4 animate-in fade-in duration-200">
+            <div>
+              <div className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">
+                Dashboard Name
+              </div>
+              <Input
+                value={editName}
+                onChange={(e) => setEditName(e.target.value)}
+                placeholder="Enter dashboard workspace name"
+                maxLength={32}
+                className="rounded-xl h-10 bg-gray-50/80 border-gray-200 font-medium text-sm focus:bg-white"
+                onPressEnter={handleSaveDetails}
+              />
+            </div>
+          </div>
+        )}
+      </Modal>
+
+      {/* Share Dashboard Modal */}
+      {sharingDashboard && (
+        <ShareDashboardModal
+          open={shareModalOpen}
+          onClose={() => {
+            setShareModalOpen(false);
+            setSharingDashboard(null);
+          }}
+          dashboardId={sharingDashboard.id}
+          dashboardTitle={sharingDashboard.name}
+          dashboardSlug={sharingDashboard.slug}
+          createdBy={sharingDashboard.created_by}
+          initialShareType={sharingDashboard.share_type}
+          initialAllowedUsers={sharingDashboard.allowed_users}
+          initialAllowedRoles={sharingDashboard.allowed_roles}
+          onShareUpdated={(updated) => {
+            setDashboards((prev) =>
+              prev.map((d) =>
+                d.id === sharingDashboard.id
+                  ? {
+                      ...d,
+                      name: updated.name || d.name,
+                      share_type: updated.share_type as any,
+                      allowed_users: updated.allowed_users,
+                      allowed_roles: updated.allowed_roles,
+                    }
+                  : d
+              )
+            );
+            fetchDashboards(true);
+          }}
+        />
+      )}
     </DashboardLayout>
   );
 }
