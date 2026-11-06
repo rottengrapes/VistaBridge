@@ -966,7 +966,11 @@ function ViewDashboardContent() {
   const isRefreshing = useDashboardStore((state) => state.isRefreshing);
   const setIsRefreshing = useDashboardStore((state) => state.setIsRefreshing);
   const lastRefreshedAt = useDashboardStore((state) => state.lastRefreshedAt);
-  const lastRefreshTimeRef = useRef<number>(Date.now());
+  const lastRefreshTimeRef = useRef<number>(0);
+
+  useEffect(() => {
+    lastRefreshTimeRef.current = Date.now();
+  }, []);
 
   const handlePerformRefresh = useCallback(() => {
     setIsRefreshing(true);
