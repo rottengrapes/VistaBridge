@@ -26,6 +26,7 @@
 [Key Features](#key-features) •
 [Architecture](#architecture--tech-stack) •
 [Quick Start](#quick-start-guide) •
+[Docker Deployment & Updates](#docker-deployment--instant-updates) •
 [About Rotten Grapes](#about-rotten-grapes-private-limited)
 
 ---
@@ -205,6 +206,174 @@ Open [http://localhost:3000](http://localhost:3000) (or your configured port) in
 npm run build
 npm run start
 ```
+
+---
+
+### Option C: Docker Deployment & Instant Updates (Recommended)
+
+Deploy VistaBridge using our official pre-compiled production Docker image:  
+**`rottengrapesprivatelimited/vistabridge:latest`**
+
+This method requires **zero Node.js or build dependencies** and provides an integrated **Nginx reverse proxy** for automatic Port 80 and Domain/IP routing.
+
+---
+
+#### 📋 Quick Start: Direct Copy-Paste Deployment (Zero Cloning Needed)
+
+Any user or server administrator can deploy VistaBridge by creating just **two files** (`.env` and `docker-compose.yml`) in an empty folder:
+
+##### 1. Create `.env`
+Create a file named `.env` and paste:
+```env
+# ==============================================================================
+# VistaBridge Environment Configuration
+# ==============================================================================
+
+# Application & Network Settings
+PORT=3007
+HOSTNAME=0.0.0.0
+NODE_ENV=production
+NEXT_TELEMETRY_DISABLED=1
+
+# Nginx Reverse Proxy Settings (Accessible via port 80 without typing :3007)
+HTTP_PORT=80
+# Set your domain (e.g. vistabridge.example.com) or use '_' to allow access via Server IP
+DOMAIN=_
+
+# Official Docker Hub Image
+DOCKER_IMAGE=rottengrapesprivatelimited/vistabridge:latest
+
+# Database Configuration (SQLite)
+DB_TYPE=sqlite
+SQLITE_DB_PATH=./data/geovista.db
+
+# GeoServer Integration Settings:
+# - If GeoServer runs on the host machine: http://host.docker.internal:8080/geoserver
+# - If GeoServer runs on an external IP or domain: https://geoserver.example.com/geoserver
+GEOSERVER_URL=http://host.docker.internal:8080/geoserver
+NEXT_PUBLIC_GEOSERVER_URL=http://host.docker.internal:8080/geoserver
+
+# Vector Tile Server (pg_tileserv) Settings
+NEXT_PUBLIC_TILESERV_URL=http://host.docker.internal:7800
+
+# Analytics Service URL
+NEXT_PUBLIC_ANALYTICS_URL=http://host.docker.internal:8000
+
+# Next.js Internal API Base Route
+NEXT_PUBLIC_API_URL=/api
+
+# Authentication Secret (leave blank or use random string)
+JWT_SECRET=g4SwHtTa5sXzq8xDpfDik69DGOX9z6ahr6O2IPcwCcIWclnl8uVNE3ePLM5NVJ2i/G785wEDvdmZN9ZqWhQDOw==
+```
+
+##### 2. Create `docker-compose.yml`
+Create a file named `docker-compose.yml` in the same directory and paste:
+```yaml
+# ==============================================================================
+# VistaBridge Standalone Docker Compose Configuration
+# Automatically pulls and launches the latest official image from Docker Hub
+# ==============================================================================
+
+services:
+  vistabridge:
+    image: ${DOCKER_IMAGE:-rottengrapesprivatelimited/vistabridge:latest}
+    container_name: vistabridge
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3007}:3007"
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+      - NEXT_TELEMETRY_DISABLED=${NEXT_TELEMETRY_DISABLED:-1}
+      - PORT=${PORT:-3007}
+      - HOSTNAME=${HOSTNAME:-0.0.0.0}
+      - DB_TYPE=${DB_TYPE:-sqlite}
+      - SQLITE_DB_PATH=${SQLITE_DB_PATH:-/app/data/geovista.db}
+      - GEOSERVER_URL=${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_TILESERV_URL=${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}
+      - NEXT_PUBLIC_ANALYTICS_URL=${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
+      - JWT_SECRET=${JWT_SECRET:-}
+    volumes:
+      # Persistent SQLite database storage on host machine
+      - ./data:/app/data
+    extra_hosts:
+      # Allows container to reach host-level services (e.g. local GeoServer / TileServ)
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${PORT:-3007}/api/config/public || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+```
+
+##### 3. Spin Up the Service
+Run in your terminal:
+```bash
+docker compose up -d
+```
+> **Access URL**: Open [http://localhost:3007](http://localhost:3007) or `http://<SERVER_IP>:3007` in your browser.
+
+---
+
+#### 🚀 For Cloned Repositories (With Nginx Included)
+
+If you have cloned the VistaBridge repository, you can launch VistaBridge with the integrated **Nginx Reverse Proxy** for direct **Port 80** access without entering `:3007`:
+
+```bash
+# 1. Copy environment template
+cp env.example .env
+
+# 2. Launch with Docker Compose (VistaBridge + Nginx on Port 80)
+docker compose up -d
+```
+
+> **One-Click Automation**:
+> - **On Windows**: Double-click [`docker-update.bat`](docker-update.bat)
+> - **On Linux / macOS**: Run `./docker-update.sh`
+
+#### Where to Access:
+- **Standard HTTP (Port 80 via Nginx)**: [http://localhost](http://localhost) or `http://<YOUR_SERVER_IP>`
+- **Direct Application Port**: [http://localhost:3007](http://localhost:3007)
+
+---
+
+### Running via Pure Docker CLI (Zero Cloning Required)
+
+Anyone can spin up the application on any server without downloading the codebase:
+
+```bash
+docker run -d \
+  --name vistabridge \
+  --restart unless-stopped \
+  -p 3007:3007 \
+  -v "${PWD}/data:/app/data" \
+  -e PORT=3007 \
+  -e HOSTNAME=0.0.0.0 \
+  -e GEOSERVER_URL="http://host.docker.internal:8080/geoserver" \
+  -e NEXT_PUBLIC_GEOSERVER_URL="http://host.docker.internal:8080/geoserver" \
+  rottengrapesprivatelimited/vistabridge:latest
+```
+
+---
+
+### How to Apply New Code Changes (Guaranteed Latest Updates)
+
+Whenever new code is pushed to GitHub, a fresh Docker image is automatically built and published to `rottengrapesprivatelimited/vistabridge:latest`.
+
+To guarantee that your running deployment **always downloads and switches to the newest code** without using stale local caches:
+
+```bash
+docker compose pull && docker compose up -d --force-recreate
+```
+
+#### Why this ensures you always access the newest code:
+1. **`docker compose pull`**: Connects to Docker Hub, compares the image digest, and downloads the newly published layers for `rottengrapesprivatelimited/vistabridge:latest`.
+2. **`--force-recreate`**: Shuts down the previous container and launches a brand new one using the updated image layers.
+3. **Zero Data Loss**: Your SQLite database (`./data/geovista.db`), user accounts, maps, and dashboards are mounted externally and remain 100% preserved.
+4. **Browser Hard Refresh**: Since modern browsers cache static Next.js scripts and styles, press **`Ctrl + F5`** (Windows/Linux) or **`Cmd + Shift + R`** (Mac) after updating to immediately load the new frontend assets.
 
 ---
 
