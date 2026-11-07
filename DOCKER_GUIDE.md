@@ -193,6 +193,34 @@ A new user does **not even need to clone the repository**. They can pull the ima
 
 The user can pass individual environment variables directly on the command line:
 
+##### Interactive One-Liner (Prompts for Port & GeoServer URL):
+**Linux / macOS (Bash / Zsh):**
+```bash
+read -p "Enter Port [Default: 3007]: " P; P=${P:-3007}; \
+read -p "Enter GeoServer URL [Default: http://host.docker.internal:8080/geoserver]: " GS; GS=${GS:-http://host.docker.internal:8080/geoserver}; \
+docker run -d --name vistabridge --restart unless-stopped \
+  -p ${P}:3007 \
+  -v "${PWD}/data:/app/data" \
+  -e PORT=3007 \
+  -e HOSTNAME=0.0.0.0 \
+  -e GEOSERVER_URL="${GS}" \
+  rottengrapesprivatelimited/vistabridge:latest
+```
+
+**Windows (PowerShell):**
+```powershell
+$P = Read-Host "Enter Port [Default: 3007]"; if (!$P) { $P = "3007" }
+$GS = Read-Host "Enter GeoServer URL [Default: http://host.docker.internal:8080/geoserver]"; if (!$GS) { $GS = "http://host.docker.internal:8080/geoserver" }
+docker run -d --name vistabridge --restart unless-stopped `
+  -p "${P}:3007" `
+  -v "${PWD}/data:/app/data" `
+  -e PORT=3007 `
+  -e HOSTNAME=0.0.0.0 `
+  -e GEOSERVER_URL="$GS" `
+  rottengrapesprivatelimited/vistabridge:latest
+```
+
+##### Direct Static Execution:
 ```bash
 docker run -d \
   --name vistabridge-app \

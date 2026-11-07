@@ -346,9 +346,44 @@ docker compose up -d
 
 Anyone can spin up the application on any server without downloading the codebase:
 
+#### Option 1: Interactive Launch (Asks for Port & GeoServer URL)
+
+Copy and paste this into your terminal — it will prompt you interactively for your preferred port and GeoServer domain:
+
+**On Linux / macOS (Bash / Zsh):**
+```bash
+read -p "Enter Port [Default: 3007]: " P; P=${P:-3007}; \
+read -p "Enter GeoServer URL [Default: http://host.docker.internal:8080/geoserver]: " GS; GS=${GS:-http://host.docker.internal:8080/geoserver}; \
+docker run -d --name vistabridge --restart unless-stopped \
+  -p ${P}:3007 \
+  -v "${PWD}/data:/app/data" \
+  -e PORT=3007 \
+  -e HOSTNAME=0.0.0.0 \
+  -e GEOSERVER_URL="${GS}" \
+  rottengrapesprivatelimited/vistabridge:latest
+```
+
+**On Windows (PowerShell):**
+```powershell
+$P = Read-Host "Enter Port [Default: 3007]"; if (!$P) { $P = "3007" }
+$GS = Read-Host "Enter GeoServer URL [Default: http://host.docker.internal:8080/geoserver]"; if (!$GS) { $GS = "http://host.docker.internal:8080/geoserver" }
+docker run -d --name vistabridge --restart unless-stopped `
+  -p "${P}:3007" `
+  -v "${PWD}/data:/app/data" `
+  -e PORT=3007 `
+  -e HOSTNAME=0.0.0.0 `
+  -e GEOSERVER_URL="$GS" `
+  rottengrapesprivatelimited/vistabridge:latest
+```
+
+---
+
+#### Option 2: Direct Single-Command Execution
+
+Or launch directly with default settings (or customize the port and URL):
+
 ```bash
 docker run -d \
-  --platform linux/amd64 \
   --name vistabridge \
   --restart unless-stopped \
   -p 3007:3007 \
@@ -356,7 +391,6 @@ docker run -d \
   -e PORT=3007 \
   -e HOSTNAME=0.0.0.0 \
   -e GEOSERVER_URL="http://host.docker.internal:8080/geoserver" \
-  -e NEXT_PUBLIC_GEOSERVER_URL="http://host.docker.internal:8080/geoserver" \
   rottengrapesprivatelimited/vistabridge:latest
 ```
 
