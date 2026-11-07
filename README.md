@@ -209,7 +209,8 @@ npm run start
 
 ---
 
-### Option C: Docker Deployment & Instant Updates (Recommended)
+<a id="docker-deployment--instant-updates" name="docker-deployment--instant-updates"></a>
+## Docker Deployment & Instant Updates
 
 Deploy VistaBridge using our official pre-compiled production Docker image:  
 **`rottengrapesprivatelimited/vistabridge:latest`**
@@ -248,10 +249,10 @@ DB_TYPE=sqlite
 SQLITE_DB_PATH=./data/geovista.db
 
 # GeoServer Integration Settings:
-# - If GeoServer runs on the host machine: http://host.docker.internal:8080/geoserver
-# - If GeoServer runs on an external IP or domain: https://geoserver.example.com/geoserver
+# - If your GeoServer runs on the host machine: http://host.docker.internal:8080/geoserver
+# - If your GeoServer runs on a remote IP/domain: https://geoserver.example.com/geoserver
+# (Note: Only GEOSERVER_URL is required; frontend client endpoints inherit this automatically)
 GEOSERVER_URL=http://host.docker.internal:8080/geoserver
-NEXT_PUBLIC_GEOSERVER_URL=http://host.docker.internal:8080/geoserver
 
 # Vector Tile Server (pg_tileserv) Settings
 NEXT_PUBLIC_TILESERV_URL=http://host.docker.internal:7800
@@ -262,7 +263,7 @@ NEXT_PUBLIC_ANALYTICS_URL=http://host.docker.internal:8000
 # Next.js Internal API Base Route
 NEXT_PUBLIC_API_URL=/api
 
-# Authentication Secret (leave blank or use random string)
+# Authentication Secret (Used for signing login session tokens across container updates)
 JWT_SECRET=g4SwHtTa5sXzq8xDpfDik69DGOX9z6ahr6O2IPcwCcIWclnl8uVNE3ePLM5NVJ2i/G785wEDvdmZN9ZqWhQDOw==
 ```
 
@@ -276,6 +277,7 @@ Create a file named `docker-compose.yml` in the same directory and paste:
 
 services:
   vistabridge:
+    platform: linux/amd64
     image: ${DOCKER_IMAGE:-rottengrapesprivatelimited/vistabridge:latest}
     container_name: vistabridge
     pull_policy: always
@@ -290,7 +292,7 @@ services:
       - DB_TYPE=${DB_TYPE:-sqlite}
       - SQLITE_DB_PATH=${SQLITE_DB_PATH:-/app/data/geovista.db}
       - GEOSERVER_URL=${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
-      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}}
       - NEXT_PUBLIC_TILESERV_URL=${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}
       - NEXT_PUBLIC_ANALYTICS_URL=${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
@@ -346,6 +348,7 @@ Anyone can spin up the application on any server without downloading the codebas
 
 ```bash
 docker run -d \
+  --platform linux/amd64 \
   --name vistabridge \
   --restart unless-stopped \
   -p 3007:3007 \

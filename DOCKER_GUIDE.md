@@ -201,10 +201,10 @@ docker run -d \
   -e PORT=8080 \
   -e HOSTNAME=0.0.0.0 \
   -e GEOSERVER_URL="https://mygeoserver.org/geoserver" \
-  -e NEXT_PUBLIC_GEOSERVER_URL="https://mygeoserver.org/geoserver" \
   -v "${PWD}/data:/app/data" \
   rottengrapesprivatelimited/vistabridge:latest
 ```
+*(Note: If you do not have a GeoServer yet, simply omit `-e GEOSERVER_URL`. The app will start normally with standard defaults.)*
 
 ---
 
@@ -228,3 +228,51 @@ VistaBridge includes an integrated, auto-configured Nginx reverse proxy:
 | **3. Mount Database** | Mount `-v ./data:/app/data` or `-v vistabridge_data:/app/data` so their settings & maps persist |
 | **4. Launch Container** | `docker compose up -d` OR `docker run -d ...` |
 | **5. Access App** | Open in browser at `http://<SERVER_IP>:<PORT>` |
+
+---
+
+## 7. Troubleshooting: Apple Silicon (Mac M1/M2/M3/M4) Architecture Error
+
+### Symptom:
+On macOS (Apple Silicon M1, M2, M3, M4) or ARM64 Linux, running `docker compose up -d` or `docker pull` may fail with:
+```text
+Error response from daemon: no matching manifest for linux/arm64/v8 in the manifest list entries: no match for platform in manifest: not found
+```
+
+### Root Cause:
+Apple Silicon Macs run on the **ARM64** architecture (`linux/arm64/v8`). If an image on Docker Hub was built exclusively for **x86_64** (`linux/amd64`), Docker cannot find a matching ARM64 manifest.
+
+### Solutions:
+
+#### Solution 1: Explicitly Set `platform: linux/amd64` in `docker-compose.yml` (Recommended)
+Docker Desktop on Mac includes built-in Rosetta 2 emulation. Specifying the platform allows Docker on Mac to run the AMD64 image seamlessly:
+```yaml
+services:
+  vistabridge:
+    platform: linux/amd64
+    image: rottengrapesprivatelimited/vistabridge:latest
+    ...
+```
+
+#### Solution 2: Use `--platform linux/amd64` in Docker CLI
+```bash
+docker run -d --platform linux/amd64 -p 3007:3007 rottengrapesprivatelimited/vistabridge:latest
+```
+Or export the default platform in your terminal before running compose:
+```bash
+export DOCKER_DEFAULT_PLATFORM=linux/amd64
+docker compose up -d
+```
+
+#### Solution 3: Native Local Build (If Repository is Cloned)
+Compile natively for Apple Silicon ARM64 without pulling pre-built x86 images:
+```bash
+docker compose up -d --build
+```
+
+#### Permanent CI/CD Fix: Multi-Platform Docker Builds
+The GitHub Actions workflow (`.github/workflows/docker-build-push.yml`) is configured with:
+```yaml
+platforms: linux/amd64,linux/arm64
+```
+This automatically produces multi-architecture images supporting both Intel/AMD servers and Apple Silicon / ARM64 environments natively.

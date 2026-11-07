@@ -1,0 +1,25 @@
+# Enforce consistent line endings across Windows, Ubuntu/Linux, and macOS
+
+# Default behavior for all text files
+* text=auto
+
+# Enforce Unix line endings (LF) for shell scripts, Dockerfiles, and web assets
+*.sh text eol=lf
+*.bash text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.css text eol=lf
+*.md text eol=lf
+*.env* text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+
+# Enforce Windows line endings (CRLF) for batch scripts
+*.bat text eol=crlf
+*.cmd text eol=crlf

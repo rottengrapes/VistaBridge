@@ -5,6 +5,7 @@
 
 services:
   vistabridge:
+    platform: linux/amd64
     image: ${DOCKER_IMAGE:-rottengrapesprivatelimited/vistabridge:latest}
     build:
       context: .
@@ -12,7 +13,7 @@ services:
       args:
         PORT: ${PORT:-3007}
         GEOSERVER_URL: ${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
-        NEXT_PUBLIC_GEOSERVER_URL: ${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+        NEXT_PUBLIC_GEOSERVER_URL: ${NEXT_PUBLIC_GEOSERVER_URL:-${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}}
         NEXT_PUBLIC_TILESERV_URL: ${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-/api}
         NEXT_PUBLIC_ANALYTICS_URL: ${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
@@ -36,7 +37,7 @@ services:
 
       # GeoServer & Spatial Services
       - GEOSERVER_URL=${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
-      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}
+      - NEXT_PUBLIC_GEOSERVER_URL=${NEXT_PUBLIC_GEOSERVER_URL:-${GEOSERVER_URL:-http://host.docker.internal:8080/geoserver}}
       - NEXT_PUBLIC_TILESERV_URL=${NEXT_PUBLIC_TILESERV_URL:-http://host.docker.internal:7800}
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-/api}
       - NEXT_PUBLIC_ANALYTICS_URL=${NEXT_PUBLIC_ANALYTICS_URL:-http://host.docker.internal:8000}
