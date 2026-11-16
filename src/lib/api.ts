@@ -552,14 +552,45 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
                     }
                   }
 
+                  let nativeCRS = '';
+                  let nativeBbox: [number, number, number, number] | null = null;
+                  const bboxes = Array.from(layerEl.querySelectorAll('BoundingBox'));
+                  for (const b of bboxes) {
+                    const crsAttr = b.getAttribute('CRS') || b.getAttribute('crs') || b.getAttribute('SRS') || b.getAttribute('srs') || '';
+                    const minx = parseFloat(b.getAttribute('minx') || '0');
+                    const miny = parseFloat(b.getAttribute('miny') || '0');
+                    const maxx = parseFloat(b.getAttribute('maxx') || '0');
+                    const maxy = parseFloat(b.getAttribute('maxy') || '0');
+                    if (!crsAttr.includes('4326') && !crsAttr.includes('CRS84') && !crsAttr.includes('CRS:84')) {
+                      nativeCRS = crsAttr.includes('::') ? `EPSG:${crsAttr.split('::').pop()}` : (crsAttr.startsWith('EPSG:') ? crsAttr : `EPSG:${crsAttr.replace(/[^0-9]/g, '')}`);
+                      nativeBbox = [minx, miny, maxx, maxy];
+                      break;
+                    }
+                  }
+                  if (!nativeCRS) {
+                    const crsEls = Array.from(layerEl.querySelectorAll('CRS, SRS'));
+                    for (const cEl of crsEls) {
+                      const cText = cEl.textContent?.trim() || '';
+                      if (cText && !cText.includes('4326') && !cText.includes('CRS84') && !cText.includes('CRS:84')) {
+                        nativeCRS = cText.includes('::') ? `EPSG:${cText.split('::').pop()}` : (cText.startsWith('EPSG:') ? cText : `EPSG:${cText.replace(/[^0-9]/g, '')}`);
+                        break;
+                      }
+                    }
+                  }
+                  if (!nativeCRS) {
+                    nativeCRS = 'EPSG:4326';
+                  }
+
                   layerMap[name] = {
                     name,
                     title,
                     styles,
                     bbox,
+                    nativeBbox: nativeBbox || bbox,
+                    crs: nativeCRS,
                     isGroup,
                     dataType: 'RASTER', // will be refined by DescribeLayer/WFS check
-                  };
+                  } as any;
                 });
               }
             }
@@ -903,11 +934,14 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
           title: wl.title,
           styles: wl.styles,
           data_type: wl.dataType,
+          crs: wl.crs || 'EPSG:4326',
           service_used: layerService,
           status: 'READY',
           access_level: 'PUBLIC',
           metadata: {
             bbox: wl.bbox,
+            nativeBbox: wl.nativeBbox,
+            crs: wl.crs || 'EPSG:4326',
             service: layerService,
             isVectorTile: wl.isVectorTile || false,
             tileMatrixSet: wl.tileMatrixSet || 'EPSG:900913',
@@ -1054,6 +1088,9 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
       console.warn('WFS DescribeFeatureType check failed (likely a raster/group):', schemaErr);
     }
 
+    let datasetCrs = 'EPSG:4326';
+    let datasetNativeBbox: [number, number, number, number] | null = null;
+
     try {
       const capabilitiesUrl = `${geoserverUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`;
       const capRes = await fetch(capabilitiesUrl, { headers });
@@ -1081,16 +1118,39 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
               const south = parseFloat(geoBboxEl.getElementsByTagName('southBoundLatitude')[0]?.textContent || '-90');
               const north = parseFloat(geoBboxEl.getElementsByTagName('northBoundLatitude')[0]?.textContent || '90');
               bbox = [west, south, east, north];
-            } else {
-              const bboxEl = layers[i].getElementsByTagName('BoundingBox')[0];
-              if (bboxEl) {
-                const minx = parseFloat(bboxEl.getAttribute('minx') || '-180');
-                const miny = parseFloat(bboxEl.getAttribute('miny') || '-90');
-                const maxx = parseFloat(bboxEl.getAttribute('maxx') || '180');
-                const maxy = parseFloat(bboxEl.getAttribute('maxy') || '90');
+            }
+
+            let nativeCRS = '';
+            let nativeBbox: [number, number, number, number] | null = null;
+            const bboxes = Array.from(layers[i].getElementsByTagName('BoundingBox'));
+            for (const b of bboxes) {
+              const crsAttr = b.getAttribute('CRS') || b.getAttribute('crs') || b.getAttribute('SRS') || b.getAttribute('srs') || '';
+              const minx = parseFloat(b.getAttribute('minx') || '-180');
+              const miny = parseFloat(b.getAttribute('miny') || '-90');
+              const maxx = parseFloat(b.getAttribute('maxx') || '180');
+              const maxy = parseFloat(b.getAttribute('maxy') || '90');
+              if (!crsAttr.includes('4326') && !crsAttr.includes('CRS84') && !crsAttr.includes('CRS:84')) {
+                nativeCRS = crsAttr.includes('::') ? `EPSG:${crsAttr.split('::').pop()}` : (crsAttr.startsWith('EPSG:') ? crsAttr : `EPSG:${crsAttr.replace(/[^0-9]/g, '')}`);
+                nativeBbox = [minx, miny, maxx, maxy];
+                break;
+              } else if (!bbox || (bbox[0] === -180 && bbox[2] === 180)) {
                 bbox = [minx, miny, maxx, maxy];
               }
             }
+            if (!nativeCRS) {
+              const crsEls = Array.from(layers[i].querySelectorAll('CRS, SRS'));
+              for (const cEl of crsEls) {
+                const cText = cEl.textContent?.trim() || '';
+                if (cText && !cText.includes('4326') && !cText.includes('CRS84') && !cText.includes('CRS:84')) {
+                  nativeCRS = cText.includes('::') ? `EPSG:${cText.split('::').pop()}` : (cText.startsWith('EPSG:') ? cText : `EPSG:${cText.replace(/[^0-9]/g, '')}`);
+                  break;
+                }
+              }
+            }
+            if (nativeCRS) {
+              datasetCrs = nativeCRS;
+            }
+            datasetNativeBbox = nativeBbox;
             break;
           }
         }
@@ -1110,8 +1170,11 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
       id: layerId,
       name: title,
       data_type: dataType,
+      crs: datasetCrs,
       metadata: {
         bbox: bbox,
+        nativeBbox: datasetNativeBbox,
+        crs: datasetCrs,
         attributes_schema: attributesSchema,
         geom_field: geomField,
       },

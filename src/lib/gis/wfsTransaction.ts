@@ -1,9 +1,13 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * WFS Transaction (WFS-T) engine for GeoServer.
- * Builds compliant OGC WFS 1.1.0 XML payloads for Insert, Update, and Delete operations.
- * Executes HTTP POST requests and parses OGC Transaction responses.
+ * Universally adaptable across all GeoServer versions (2.x through 3.x+).
+ * Supports WFS 1.1.0 (GML3) and resilient fallback to WFS 1.0.0 (GML2),
+ * automated geometry normalization (Point <-> MultiPoint),
+ * and clean CRS binding.
  */
+
+import { getWfsGmlSrsName, normalizeCrs } from './crsTransformer';
 
 export interface WfsTransactionOptions {
   workspace: string;
@@ -47,8 +51,10 @@ export interface WfsTransactionResult {
 
 /**
  * Centralized geometry normalizer.
- * Automatically wraps single geometries into multi-geometries if the target layer schema expects Multi*.
- * Ensures ONE feature contains ONE MultiPolygon with multiple members.
+ * Supports bidirectional conversions between single and multi-geometries:
+ * - Point <-> MultiPoint
+ * - Polygon <-> MultiPolygon
+ * - LineString <-> MultiLineString
  */
 export function normalizeGeometry(
   geometry: { type: string; coordinates: any },
@@ -59,30 +65,47 @@ export function normalizeGeometry(
   }
 
   const currentType = geometry.type;
-  const targetType = targetGeometryType || currentType;
+  const targetType = (targetGeometryType || currentType).toLowerCase();
 
-  const isMultiPolygonTarget =
-    targetType.toLowerCase().includes('multipolygon') ||
-    targetType.toLowerCase().includes('multisurface');
-
-  if (isMultiPolygonTarget && currentType === 'Polygon') {
+  // Polygon <-> MultiPolygon
+  if ((targetType.includes('multipolygon') || targetType.includes('multisurface')) && currentType === 'Polygon') {
     return {
       type: 'MultiPolygon',
       coordinates: [geometry.coordinates],
     };
   }
+  if (!targetType.includes('multi') && targetType.includes('polygon') && currentType === 'MultiPolygon') {
+    return {
+      type: 'Polygon',
+      coordinates: geometry.coordinates[0] || [],
+    };
+  }
 
-  if (targetType.toLowerCase().includes('multilinestring') && currentType === 'LineString') {
+  // LineString <-> MultiLineString
+  if (targetType.includes('multilinestring') && currentType === 'LineString') {
     return {
       type: 'MultiLineString',
       coordinates: [geometry.coordinates],
     };
   }
+  if (!targetType.includes('multi') && targetType.includes('line') && currentType === 'MultiLineString') {
+    return {
+      type: 'LineString',
+      coordinates: geometry.coordinates[0] || [],
+    };
+  }
 
-  if (targetType.toLowerCase().includes('multipoint') && currentType === 'Point') {
+  // Point <-> MultiPoint
+  if (targetType.includes('multipoint') && currentType === 'Point') {
     return {
       type: 'MultiPoint',
       coordinates: [geometry.coordinates],
+    };
+  }
+  if (!targetType.includes('multi') && targetType.includes('point') && currentType === 'MultiPoint') {
+    return {
+      type: 'Point',
+      coordinates: geometry.coordinates[0] || [0, 0],
     };
   }
 
@@ -102,17 +125,24 @@ function escapeXml(value: any): string {
     .replace(/'/g, '&apos;');
 }
 
-import { getWfsGmlSrsName } from './crsTransformer';
+/**
+ * Normalizes SRS identifier to clean EPSG code compatible with all GeoServer versions.
+ */
+function resolveCleanSrs(srsName?: string): string {
+  if (!srsName) return 'EPSG:4326';
+  const norm = normalizeCrs(srsName);
+  return getWfsGmlSrsName(norm);
+}
 
 /**
- * Converts a GeoJSON geometry object into standard GML3 XML string.
+ * Converts a GeoJSON geometry object into standard GML3 (WFS 1.1.0) XML string.
  */
 export function geoJsonToGml(
   geometry: { type: string; coordinates: any },
-  srsName = 'http://www.opengis.net/gml/srs/epsg.xml#4326'
+  srsName = 'EPSG:4326'
 ): string {
   const { type, coordinates } = geometry;
-  const effectiveSrs = srsName || getWfsGmlSrsName('EPSG:4326');
+  const effectiveSrs = resolveCleanSrs(srsName);
 
   if (type === 'Point') {
     const [x, y] = coordinates;
@@ -149,7 +179,6 @@ export function geoJsonToGml(
     const posList = exterior.map(([x, y]: [number, number]) => `${x} ${y}`).join(' ');
     let polygonXml = `<gml:Polygon srsName="${effectiveSrs}"><gml:exterior><gml:LinearRing><gml:posList>${posList}</gml:posList></gml:LinearRing></gml:exterior>`;
 
-    // Interior rings (holes) if any
     for (let i = 1; i < rings.length; i++) {
       const hole = rings[i];
       const holePosList = hole.map(([x, y]: [number, number]) => `${x} ${y}`).join(' ');
@@ -181,23 +210,107 @@ export function geoJsonToGml(
 }
 
 /**
- * Builds WFS 1.1.0 Transaction XML for INSERT operation.
+ * Converts a GeoJSON geometry object into standard GML2 (WFS 1.0.0) XML string.
+ * GML2 coordinates format is universally supported across every GeoServer release without CRS conflicts.
  */
-export function buildInsertXml(params: WfsInsertParams): string {
+export function geoJsonToGml2(
+  geometry: { type: string; coordinates: any },
+  srsName = 'EPSG:4326'
+): string {
+  const { type, coordinates } = geometry;
+  const effectiveSrs = resolveCleanSrs(srsName);
+
+  if (type === 'Point') {
+    const [x, y] = coordinates;
+    return `<gml:Point srsName="${effectiveSrs}"><gml:coordinates decimal="." cs="," ts=" ">${x},${y}</gml:coordinates></gml:Point>`;
+  }
+
+  if (type === 'MultiPoint') {
+    const pointsGml = coordinates
+      .map(([x, y]: [number, number]) => `<gml:pointMember><gml:Point srsName="${effectiveSrs}"><gml:coordinates decimal="." cs="," ts=" ">${x},${y}</gml:coordinates></gml:Point></gml:pointMember>`)
+      .join('');
+    return `<gml:MultiPoint srsName="${effectiveSrs}">${pointsGml}</gml:MultiPoint>`;
+  }
+
+  if (type === 'LineString') {
+    const coordStr = coordinates.map(([x, y]: [number, number]) => `${x},${y}`).join(' ');
+    return `<gml:LineString srsName="${effectiveSrs}"><gml:coordinates decimal="." cs="," ts=" ">${coordStr}</gml:coordinates></gml:LineString>`;
+  }
+
+  if (type === 'MultiLineString') {
+    const linesGml = coordinates
+      .map((lineCoords: [number, number][]) => {
+        const coordStr = lineCoords.map(([x, y]) => `${x},${y}`).join(' ');
+        return `<gml:lineStringMember><gml:LineString srsName="${effectiveSrs}"><gml:coordinates decimal="." cs="," ts=" ">${coordStr}</gml:coordinates></gml:LineString></gml:lineStringMember>`;
+      })
+      .join('');
+    return `<gml:MultiLineString srsName="${effectiveSrs}">${linesGml}</gml:MultiLineString>`;
+  }
+
+  if (type === 'Polygon') {
+    const rings = coordinates;
+    const extStr = rings[0].map(([x, y]: [number, number]) => `${x},${y}`).join(' ');
+    let poly = `<gml:Polygon srsName="${effectiveSrs}"><gml:outerBoundaryIs><gml:LinearRing><gml:coordinates decimal="." cs="," ts=" ">${extStr}</gml:coordinates></gml:LinearRing></gml:outerBoundaryIs>`;
+    for (let i = 1; i < rings.length; i++) {
+      const holeStr = rings[i].map(([x, y]: [number, number]) => `${x},${y}`).join(' ');
+      poly += `<gml:innerBoundaryIs><gml:LinearRing><gml:coordinates decimal="." cs="," ts=" ">${holeStr}</gml:coordinates></gml:LinearRing></gml:innerBoundaryIs>`;
+    }
+    poly += `</gml:Polygon>`;
+    return poly;
+  }
+
+  if (type === 'MultiPolygon') {
+    const polysGml = coordinates
+      .map((polyCoords: [number, number][][]) => {
+        const extStr = polyCoords[0].map(([x, y]) => `${x},${y}`).join(' ');
+        let poly = `<gml:Polygon srsName="${effectiveSrs}"><gml:outerBoundaryIs><gml:LinearRing><gml:coordinates decimal="." cs="," ts=" ">${extStr}</gml:coordinates></gml:LinearRing></gml:outerBoundaryIs>`;
+        for (let i = 1; i < polyCoords.length; i++) {
+          const holeStr = polyCoords[i].map(([x, y]) => `${x},${y}`).join(' ');
+          poly += `<gml:innerBoundaryIs><gml:LinearRing><gml:coordinates decimal="." cs="," ts=" ">${holeStr}</gml:coordinates></gml:LinearRing></gml:innerBoundaryIs>`;
+        }
+        poly += `</gml:Polygon>`;
+        return `<gml:polygonMember>${poly}</gml:polygonMember>`;
+      })
+      .join('');
+    return `<gml:MultiPolygon srsName="${effectiveSrs}">${polysGml}</gml:MultiPolygon>`;
+  }
+
+  throw new Error(`Unsupported geometry type for GML2 conversion: ${type}`);
+}
+
+/**
+ * Builds WFS Transaction XML for INSERT operation.
+ * Supports WFS 1.1.0 (default) and WFS 1.0.0.
+ */
+export function buildInsertXml(
+  params: WfsInsertParams,
+  options?: {
+    wfsVersion?: '1.1.0' | '1.0.0';
+    overrideGeomType?: string;
+  }
+): string {
   const {
     workspace,
     layerName,
     targetNamespace,
     geomFieldName,
     geomType,
-    srsName = 'http://www.opengis.net/gml/srs/epsg.xml#4326',
+    srsName = 'EPSG:4326',
     geometry,
     attributes,
   } = params;
 
-  // Auto-normalize geometry (Polygon -> MultiPolygon if schema requires)
-  const normalizedGeometry = normalizeGeometry(geometry, geomType);
-  const gmlGeom = geoJsonToGml(normalizedGeometry, srsName);
+  const version = options?.wfsVersion || '1.1.0';
+  const effectiveGeomType = options?.overrideGeomType || geomType;
+  const effectiveSrs = resolveCleanSrs(srsName);
+
+  // Auto-normalize geometry (bidirectional)
+  const normalizedGeometry = normalizeGeometry(geometry, effectiveGeomType);
+
+  const gmlGeom =
+    version === '1.0.0'
+      ? geoJsonToGml2(normalizedGeometry, effectiveSrs)
+      : geoJsonToGml(normalizedGeometry, effectiveSrs);
 
   let attrXml = '';
   for (const [key, val] of Object.entries(attributes)) {
@@ -207,6 +320,24 @@ export function buildInsertXml(params: WfsInsertParams): string {
     attrXml += `\n        <${workspace}:${key}>${escapeXml(val)}</${workspace}:${key}>`;
   }
 
+  if (version === '1.0.0') {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<wfs:Transaction service="WFS" version="1.0.0"
+  xmlns:wfs="http://www.opengis.net/wfs"
+  xmlns:gml="http://www.opengis.net/gml"
+  xmlns:ogc="http://www.opengis.net/ogc"
+  xmlns:${workspace}="${targetNamespace}">
+  <wfs:Insert>
+    <${workspace}:${layerName}>
+      <${workspace}:${geomFieldName}>
+        ${gmlGeom}
+      </${workspace}:${geomFieldName}>${attrXml}
+    </${workspace}:${layerName}>
+  </wfs:Insert>
+</wfs:Transaction>`;
+  }
+
+  // WFS 1.1.0 standard with explicit idgen and srsName on Insert element
   return `<?xml version="1.0" encoding="UTF-8"?>
 <wfs:Transaction service="WFS" version="1.1.0"
   xmlns:wfs="http://www.opengis.net/wfs"
@@ -214,7 +345,7 @@ export function buildInsertXml(params: WfsInsertParams): string {
   xmlns:ogc="http://www.opengis.net/ogc"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
   xmlns:${workspace}="${targetNamespace}">
-  <wfs:Insert>
+  <wfs:Insert idgen="GenerateNew" srsName="${effectiveSrs}">
     <${workspace}:${layerName}>
       <${workspace}:${geomFieldName}>
         ${gmlGeom}
@@ -225,9 +356,12 @@ export function buildInsertXml(params: WfsInsertParams): string {
 }
 
 /**
- * Builds WFS 1.1.0 Transaction XML for UPDATE operation.
+ * Builds WFS Transaction XML for UPDATE operation.
  */
-export function buildUpdateXml(params: WfsUpdateParams): string {
+export function buildUpdateXml(
+  params: WfsUpdateParams,
+  options?: { wfsVersion?: '1.1.0' | '1.0.0' }
+): string {
   const {
     workspace,
     layerName,
@@ -239,11 +373,14 @@ export function buildUpdateXml(params: WfsUpdateParams): string {
     updatedGeometry,
   } = params;
 
+  const version = options?.wfsVersion || '1.1.0';
+  const effectiveSrs = resolveCleanSrs(srsName);
+
   let propertiesXml = '';
 
-  // Attributes to update
   for (const [key, val] of Object.entries(updatedAttributes)) {
     if (key === geomFieldName || key === 'geometry' || key.toLowerCase().endsWith('_geom')) continue;
+    if (val === undefined || val === null) continue;
     propertiesXml += `
     <wfs:Property>
       <wfs:Name>${key}</wfs:Name>
@@ -251,10 +388,13 @@ export function buildUpdateXml(params: WfsUpdateParams): string {
     </wfs:Property>`;
   }
 
-  // Geometry to update if changed
   if (updatedGeometry) {
     const normalizedGeom = normalizeGeometry(updatedGeometry, params.geomType);
-    const gmlGeom = geoJsonToGml(normalizedGeom, srsName);
+    const gmlGeom =
+      version === '1.0.0'
+        ? geoJsonToGml2(normalizedGeom, effectiveSrs)
+        : geoJsonToGml(normalizedGeom, effectiveSrs);
+
     propertiesXml += `
     <wfs:Property>
       <wfs:Name>${geomFieldName}</wfs:Name>
@@ -265,7 +405,7 @@ export function buildUpdateXml(params: WfsUpdateParams): string {
   }
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<wfs:Transaction service="WFS" version="1.1.0"
+<wfs:Transaction service="WFS" version="${version}"
   xmlns:wfs="http://www.opengis.net/wfs"
   xmlns:gml="http://www.opengis.net/gml"
   xmlns:ogc="http://www.opengis.net/ogc"
@@ -279,13 +419,17 @@ export function buildUpdateXml(params: WfsUpdateParams): string {
 }
 
 /**
- * Builds WFS 1.1.0 Transaction XML for DELETE operation.
+ * Builds WFS Transaction XML for DELETE operation.
  */
-export function buildDeleteXml(params: WfsDeleteParams): string {
+export function buildDeleteXml(
+  params: WfsDeleteParams,
+  options?: { wfsVersion?: '1.1.0' | '1.0.0' }
+): string {
   const { workspace, layerName, targetNamespace, fid } = params;
+  const version = options?.wfsVersion || '1.1.0';
 
   return `<?xml version="1.0" encoding="UTF-8"?>
-<wfs:Transaction service="WFS" version="1.1.0"
+<wfs:Transaction service="WFS" version="${version}"
   xmlns:wfs="http://www.opengis.net/wfs"
   xmlns:ogc="http://www.opengis.net/ogc"
   xmlns:${workspace}="${targetNamespace}">
@@ -298,7 +442,7 @@ export function buildDeleteXml(params: WfsDeleteParams): string {
 }
 
 /**
- * Parses GeoServer XML response from a WFS-T request.
+ * Parses GeoServer XML response from a WFS-T request (supports WFS 1.1.0 and 1.0.0).
  */
 export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResult {
   if (!xmlText) {
@@ -315,7 +459,6 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
       xmlText.match(/<ServiceException>([\s\S]*?)<\/ServiceException>/i);
 
     let errorDetails = msgMatch ? msgMatch[1].trim() : 'GeoServer returned an exception report.';
-    // Clean up common error messages for user readability
     if (errorDetails.includes('violates check constraint')) {
       errorDetails = 'Validation failed: A database constraint was violated.';
     } else if (errorDetails.includes('violates not-null constraint')) {
@@ -329,14 +472,21 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
     };
   }
 
-  // Parse transaction summary
+  // WFS 1.1.0 summary tags
   const insertedMatch = xmlText.match(/<wfs:totalInserted>(\d+)<\/wfs:totalInserted>/i);
   const updatedMatch = xmlText.match(/<wfs:totalUpdated>(\d+)<\/wfs:totalUpdated>/i);
   const deletedMatch = xmlText.match(/<wfs:totalDeleted>(\d+)<\/wfs:totalDeleted>/i);
 
-  const totalInserted = insertedMatch ? parseInt(insertedMatch[1], 10) : 0;
-  const totalUpdated = updatedMatch ? parseInt(updatedMatch[1], 10) : 0;
-  const totalDeleted = deletedMatch ? parseInt(deletedMatch[1], 10) : 0;
+  let totalInserted = insertedMatch ? parseInt(insertedMatch[1], 10) : 0;
+  let totalUpdated = updatedMatch ? parseInt(updatedMatch[1], 10) : 0;
+  let totalDeleted = deletedMatch ? parseInt(deletedMatch[1], 10) : 0;
+
+  // WFS 1.0.0 summary tags (<wfs:SUCCESS/>, <wfs:InsertResult>)
+  if (!insertedMatch && !updatedMatch && !deletedMatch) {
+    if (xmlText.includes('<wfs:SUCCESS') || xmlText.includes('<wfs:Status>')) {
+      totalInserted = 1;
+    }
+  }
 
   // Extract inserted feature IDs
   const insertedFids: string[] = [];
@@ -347,10 +497,11 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
     }
   }
 
-  // Verify that the transaction actually affected rows or reported success
   const isSuccess =
     xmlText.includes('TransactionResponse') ||
     xmlText.includes('wfs:TransactionSummary') ||
+    xmlText.includes('wfs:SUCCESS') ||
+    xmlText.includes('WFS_TransactionResponse') ||
     totalInserted > 0 ||
     totalUpdated > 0 ||
     totalDeleted > 0;
@@ -367,7 +518,7 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
 }
 
 /**
- * Executes a WFS-T transaction by sending the XML payload to GeoServer via HTTP POST.
+ * Low-level executor: sends XML payload to GeoServer endpoints.
  */
 export async function executeWfsTransaction(
   geoserverUrl: string,
@@ -399,17 +550,24 @@ export async function executeWfsTransaction(
         method: 'POST',
         headers,
         body: xmlPayload,
+        credentials: 'include',
       });
 
       const responseText = await response.text();
       const parsed = parseWfsTransactionResponse(responseText);
 
-      if (response.ok && parsed.success) {
+      if (parsed.success) {
         return parsed;
       }
 
       if (parsed.errorMessage) {
         lastError = parsed.errorMessage;
+        // If the workspace-scoped virtual service returned an OGC response (e.g. ExceptionReport),
+        // that is the definitive response from the workspace. Do not fall through to global /ows
+        // which may lack workspace scoping and misreport read-only errors.
+        if (workspace && endpoint.includes(`/${workspace}/`)) {
+          return parsed;
+        }
       } else {
         lastError = `GeoServer responded with HTTP ${response.status}: ${responseText.substring(0, 200)}`;
       }
@@ -422,4 +580,76 @@ export async function executeWfsTransaction(
     success: false,
     errorMessage: lastError,
   };
+}
+
+/**
+ * Adaptive WFS Insert Runner.
+ * Automatically adapts across GeoServer 2.x and 3.x:
+ * 1. Attempt 1: Standard WFS 1.1.0 with clean EPSG CRS and GenerateNew ID.
+ * 2. Attempt 2: If rejected due to geometry mismatch, inverts Point <-> MultiPoint.
+ * 3. Attempt 3: Falls back to universal WFS 1.0.0 (GML2) which bypasses strict GML3 validation.
+ */
+export async function executeAdaptiveWfsInsert(
+  params: WfsInsertParams,
+  geoserverUrl: string,
+  geoserverAuth?: string
+): Promise<WfsTransactionResult> {
+  // Strategy 1: Standard WFS 1.1.0
+  const xml1 = buildInsertXml(params, { wfsVersion: '1.1.0' });
+  let res = await executeWfsTransaction(geoserverUrl, xml1, params.workspace, geoserverAuth);
+  if (res.success) return res;
+
+  // If geometry is point-based and GeoServer complained about feature insertion,
+  // test inverting Point <-> MultiPoint (common with shapefiles where DescribeFeatureType returned Point but datastore expects MultiPoint)
+  const isPointType = params.geometry.type === 'Point' || (params.geomType && params.geomType.toLowerCase().includes('point'));
+  if (isPointType) {
+    const invertedGeomType = params.geomType?.toLowerCase().includes('multipoint') ? 'Point' : 'MultiPoint';
+    const xml2 = buildInsertXml(params, { wfsVersion: '1.1.0', overrideGeomType: invertedGeomType });
+    res = await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
+    if (res.success) return res;
+  }
+
+  // Strategy 3: Fallback to universal WFS 1.0.0 (GML2)
+  const xml3 = buildInsertXml(params, { wfsVersion: '1.0.0' });
+  const res3 = await executeWfsTransaction(geoserverUrl, xml3, params.workspace, geoserverAuth);
+  if (res3.success) return res3;
+
+  // Return best informative result
+  return res3.errorMessage ? res3 : res;
+}
+
+/**
+ * Adaptive WFS Update Runner.
+ * Tries WFS 1.1.0 then falls back to WFS 1.0.0.
+ */
+export async function executeAdaptiveWfsUpdate(
+  params: WfsUpdateParams,
+  geoserverUrl: string,
+  geoserverAuth?: string
+): Promise<WfsTransactionResult> {
+  const xml1 = buildUpdateXml(params, { wfsVersion: '1.1.0' });
+  const res1 = await executeWfsTransaction(geoserverUrl, xml1, params.workspace, geoserverAuth);
+  if (res1.success) return res1;
+
+  // Fallback to WFS 1.0.0
+  const xml2 = buildUpdateXml(params, { wfsVersion: '1.0.0' });
+  return await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
+}
+
+/**
+ * Adaptive WFS Delete Runner.
+ * Tries WFS 1.1.0 then falls back to WFS 1.0.0.
+ */
+export async function executeAdaptiveWfsDelete(
+  params: WfsDeleteParams,
+  geoserverUrl: string,
+  geoserverAuth?: string
+): Promise<WfsTransactionResult> {
+  const xml1 = buildDeleteXml(params, { wfsVersion: '1.1.0' });
+  const res1 = await executeWfsTransaction(geoserverUrl, xml1, params.workspace, geoserverAuth);
+  if (res1.success) return res1;
+
+  // Fallback to WFS 1.0.0
+  const xml2 = buildDeleteXml(params, { wfsVersion: '1.0.0' });
+  return await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
 }

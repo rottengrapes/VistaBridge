@@ -9,7 +9,7 @@
 // ============================================================================
 
 import { RasterMetadata, RasterBoundingBox } from '../types/rasterAnalysis';
-import { normalizeCRS } from './rasterCRS';
+import { normalizeCRS, isProjectedCRS, transformBBox } from './rasterCRS';
 
 // In-memory cache for layer metadata
 const metadataCache = new Map<string, RasterMetadata>();
@@ -36,9 +36,12 @@ export async function getRasterMetadata(
 
   // 1. Try WCS 1.1.1 DescribeCoverage
   try {
+    const cleanId = layerName.split(':').pop() || layerName;
+    const doubleUnderscoreId = layerName.includes(':') ? layerName.replace(':', '__') : layerName;
     const candidates = [
       `${cleanUrl}/wcs?service=WCS&version=1.1.1&request=DescribeCoverage&identifiers=${encodeURIComponent(layerName)}`,
-      `${cleanUrl}/wcs?service=WCS&version=1.1.1&request=DescribeCoverage&identifiers=${encodeURIComponent(layerName.split(':').pop() || layerName)}`
+      `${cleanUrl}/wcs?service=WCS&version=1.1.1&request=DescribeCoverage&identifiers=${encodeURIComponent(cleanId)}`,
+      `${cleanUrl}/wcs?service=WCS&version=1.1.1&request=DescribeCoverage&identifiers=${encodeURIComponent(doubleUnderscoreId)}`
     ];
 
     for (const url of candidates) {
@@ -57,15 +60,34 @@ export async function getRasterMetadata(
       if (!coverageEl) continue;
 
       const title = coverageEl.getElementsByTagNameNS('*', 'Title')[0]?.textContent || layerName;
+      const idEl = coverageEl.getElementsByTagNameNS('*', 'Identifier')[0];
+      const wcsCoverageId = idEl?.textContent?.trim() || cleanId;
+
+      // Extract WGS84BoundingBox if present
+      let latLonBbox: RasterBoundingBox | null = null;
+      const wgs84Els = Array.from(coverageEl.getElementsByTagNameNS('*', 'WGS84BoundingBox'));
+      for (const wEl of wgs84Els) {
+        const lowerText = wEl.getElementsByTagNameNS('*', 'LowerCorner')[0]?.textContent || '';
+        const upperText = wEl.getElementsByTagNameNS('*', 'UpperCorner')[0]?.textContent || '';
+        const lowerParts = lowerText.trim().split(/\s+/).map(Number);
+        const upperParts = upperText.trim().split(/\s+/).map(Number);
+        if (lowerParts.length >= 2 && upperParts.length >= 2 && !isNaN(lowerParts[0]) && !isNaN(upperParts[0])) {
+          latLonBbox = {
+            minX: Math.min(lowerParts[0], upperParts[0]),
+            minY: Math.min(lowerParts[1], upperParts[1]),
+            maxX: Math.max(lowerParts[0], upperParts[0]),
+            maxY: Math.max(lowerParts[1], upperParts[1])
+          };
+        }
+      }
 
       // Extract all BoundingBox elements
       const bboxEls = Array.from(coverageEl.getElementsByTagNameNS('*', 'BoundingBox'));
       let nativeCRS = '';
       let nativeBBox: RasterBoundingBox | null = null;
-      let latLonBbox: RasterBoundingBox | null = null;
 
       for (const bEl of bboxEls) {
-        const crsAttr = bEl.getAttribute('crs') || '';
+        const crsAttr = bEl.getAttribute('crs') || bEl.getAttribute('CRS') || bEl.getAttribute('srsName') || bEl.getAttribute('srs') || '';
         const lowerText = bEl.getElementsByTagNameNS('*', 'LowerCorner')[0]?.textContent || '';
         const upperText = bEl.getElementsByTagNameNS('*', 'UpperCorner')[0]?.textContent || '';
 
@@ -81,7 +103,7 @@ export async function getRasterMetadata(
           };
 
           if (crsAttr.includes('CRS84') || crsAttr.includes('4326')) {
-            latLonBbox = parsedBbox;
+            if (!latLonBbox) latLonBbox = parsedBbox;
           } else {
             nativeCRS = normalizeCRS(crsAttr);
             nativeBBox = parsedBbox;
@@ -120,9 +142,33 @@ export async function getRasterMetadata(
         nativeBBox = latLonBbox;
       }
 
+      // Ensure that projected coverages have their native bounding box expressed in native projected units (meters)
+      if (nativeBBox && isProjectedCRS(nativeCRS)) {
+        const isBboxDegrees = (
+          Math.abs(nativeBBox.minX) <= 180 &&
+          Math.abs(nativeBBox.maxX) <= 180 &&
+          Math.abs(nativeBBox.minY) <= 90 &&
+          Math.abs(nativeBBox.maxY) <= 90
+        );
+        if (isBboxDegrees) {
+          if (!latLonBbox) latLonBbox = { ...nativeBBox };
+          try {
+            const [pMinX, pMinY, pMaxX, pMaxY] = await transformBBox(
+              [nativeBBox.minX, nativeBBox.minY, nativeBBox.maxX, nativeBBox.maxY],
+              'EPSG:4326',
+              nativeCRS
+            );
+            nativeBBox = { minX: pMinX, minY: pMinY, maxX: pMaxX, maxY: pMaxY };
+          } catch (projErr) {
+            console.warn('Could not project native bbox to nativeCRS:', projErr);
+          }
+        }
+      }
+
       if (nativeBBox) {
         const meta: RasterMetadata = {
           layerName,
+          wcsCoverageId,
           title,
           nativeCRS,
           bbox: nativeBBox,

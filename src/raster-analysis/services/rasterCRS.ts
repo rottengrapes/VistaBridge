@@ -35,6 +35,33 @@ export function normalizeCRS(crs: string): string {
 }
 
 /**
+ * Returns true if the coordinate reference system is projected (units: meters or feet),
+ * and false if geographic (units: degrees, e.g. EPSG:4326, CRS:84, EPSG:4269, EPSG:4267).
+ */
+export function isProjectedCRS(crs: string): boolean {
+  if (!crs) return false;
+  const canonical = normalizeCRS(crs).toUpperCase();
+  if (
+    canonical === 'EPSG:4326' ||
+    canonical === 'CRS:84' ||
+    canonical === 'CRS84' ||
+    canonical === 'EPSG:4269' ||
+    canonical === 'EPSG:4267' ||
+    canonical.includes('CRS84')
+  ) {
+    return false;
+  }
+  const match = canonical.match(/EPSG:(\d+)/i);
+  if (!match) return false;
+  const code = parseInt(match[1], 10);
+  // EPSG 4000-4999 are predominantly geographic 2D coordinate reference systems
+  if (code >= 4000 && code <= 4999) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Ensures a projection is registered in OpenLayers.
  * If OpenLayers does not already recognize it, queries proj4 or dynamically fetches
  * the proj4 definition from epsg.io.

@@ -368,6 +368,7 @@ interface PrintComponentProps {
   mapInstance: Map | null;
   addedLayers?: GeoServerLayerState[];
   mapId?: string;
+  isQuickMap?: boolean;
 }
 
 interface PrintSettings {
@@ -403,13 +404,13 @@ const dpiOptions = [
 const landscapeTemplates = [
   { value: 'template1', label: 'Details on Right' },
   { value: 'template3', label: 'Details on Left' },
-  { value: 'custom', label: 'Add New Template (Custom)' }
+  { value: 'custom', label: 'Custom Template' }
 ];
 
 const portraitTemplates = [
   { value: 'template2', label: 'Details Below Map' },
   { value: 'template4', label: 'Details Above Map' },
-  { value: 'custom', label: 'Add New Template (Custom)' }
+  { value: 'custom', label: 'Custom Template' }
 ];
 
 const scaleOptions = [
@@ -891,7 +892,7 @@ function calculateLegendSplit(
   return { page1Wms, page1Vector, overflowPages };
 }
 
-export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, addedLayers = [], mapId }) => {
+export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, addedLayers = [], mapId, isQuickMap = false }) => {
   const { notification } = App.useApp();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -1214,10 +1215,10 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
   }, []);
 
   useEffect(() => {
-    if (isModalOpen) {
+    if (isModalOpen && !isQuickMap) {
       loadSavedTemplates();
     }
-  }, [isModalOpen, loadSavedTemplates]);
+  }, [isModalOpen, isQuickMap, loadSavedTemplates]);
 
   const handleTemplateChange = (value: string) => {
     if (value === 'custom') {
@@ -4830,15 +4831,15 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       return;
     }
 
-    // If using custom template and has unsaved changes (or unsaved custom template), ask user if they want to save it
-    if (isCustomTemplate && hasUnsavedChanges) {
+    // If using custom template and has unsaved changes (or unsaved custom template), ask user if they want to save it (disabled on quick maps)
+    if (isCustomTemplate && hasUnsavedChanges && !isQuickMap) {
       setSaveTemplateName(currentSavedTemplate ? currentSavedTemplate.name : `Template ${savedTemplates.length + 1}`);
       setIsSavePromptOpen(true);
       return;
     }
 
     await executeExport();
-  }, [previewMapInstance, settings, notification, isCustomTemplate, hasUnsavedChanges, mapId, currentSavedTemplate, savedTemplates.length, executeExport]);
+  }, [previewMapInstance, settings, notification, isCustomTemplate, hasUnsavedChanges, isQuickMap, mapId, currentSavedTemplate, savedTemplates.length, executeExport]);
 
   // Render preview based on template
   const renderPreview = () => {
@@ -5672,10 +5673,10 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                   Template
                 </label>
                 <div className="flex items-center gap-2">
-                  {isLoadingTemplates && (
+                  {!isQuickMap && isLoadingTemplates && (
                     <span className="text-[10px] text-gray-400">Loading templates...</span>
                   )}
-                  {savedTemplates.length > 0 && (
+                  {!isQuickMap && savedTemplates.length > 0 && (
                     <Button
                       type="link"
                       size="small"
@@ -5699,19 +5700,21 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                     return (
                       <div className="flex items-center justify-between w-full py-0.5 group">
                         <span className="truncate flex-1">{(option.data as any)?.label || option.label}</span>
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            setTemplateToDelete(saved);
-                          }}
-                          className="text-gray-400 hover:text-red-500 hover:bg-red-50 p-1 rounded transition-colors ml-2 cursor-pointer flex items-center"
-                          title={`Delete "${saved.name}"`}
-                        >
-                          <Trash2 size={13} />
-                        </span>
+                        {!isQuickMap && (
+                          <span
+                            role="button"
+                            tabIndex={0}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              e.preventDefault();
+                              setTemplateToDelete(saved);
+                            }}
+                            className="text-gray-400 hover:text-red-500 hover:bg-red-50 p-1 rounded transition-colors ml-2 cursor-pointer flex items-center"
+                            title={`Delete "${saved.name}"`}
+                          >
+                            <Trash2 size={13} />
+                          </span>
+                        )}
                       </div>
                     );
                   }
@@ -5724,7 +5727,7 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                       .filter(opt => opt.value !== 'custom')
                       .filter(opt => !isMobile || opt.value !== 'custom')
                   },
-                  ...(savedTemplates.filter(t => t.layout === settings.layout).length > 0 ? [{
+                  ...(!isQuickMap && savedTemplates.filter(t => t.layout === settings.layout).length > 0 ? [{
                     label: `Saved Map Templates (${settings.layout === 'landscape' ? 'Landscape' : 'Portrait'})`,
                     options: savedTemplates
                       .filter(t => t.layout === settings.layout)
@@ -5736,14 +5739,17 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                   ...(!isMobile ? [{
                     label: 'Custom',
                     options: [
-                      { value: 'custom', label: '➕ Add New Template (Custom)' }
+                      {
+                        value: 'custom',
+                        label: isQuickMap ? 'Custom Template' : '➕ Add New Template (Custom)'
+                      }
                     ]
                   }] : [])
                 ]}
               />
 
-              {/* Saved Custom Template Toolbar */}
-              {isCustomTemplate && (
+              {/* Saved Custom Template Toolbar (hidden on Quick Maps) */}
+              {isCustomTemplate && !isQuickMap && (
                 <div className="mt-2.5 p-2.5 bg-blue-50/70 rounded-xl border border-blue-150 flex flex-col gap-2">
                   <div className="flex items-center justify-between gap-1">
                     <span className="text-[11px] font-semibold text-blue-900 flex items-center gap-1.5 truncate">
@@ -6169,197 +6175,205 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
       </Modal>
 
       {/* Save Custom Template Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-2">
-            <Bookmark size={18} className="text-primary" />
-            <span className="font-semibold text-sm">Save Custom Print Template</span>
+      {!isQuickMap && (
+        <Modal
+          title={
+            <div className="flex items-center gap-2">
+              <Bookmark size={18} className="text-primary" />
+              <span className="font-semibold text-sm">Save Custom Print Template</span>
+            </div>
+          }
+          open={isSaveModalOpen}
+          onCancel={() => setIsSaveModalOpen(false)}
+          onOk={() => handleSaveTemplate(saveTemplateName)}
+          confirmLoading={isSavingTemplate}
+          okText="Save Template"
+          cancelText="Cancel"
+          className="rounded-2xl"
+        >
+          <div className="py-2 space-y-3">
+            <p className="text-xs text-gray-500 m-0">
+              Save this custom layout for this map workspace so you and your team can select it in future prints.
+            </p>
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">
+                Template Name
+              </label>
+              <Input
+                value={saveTemplateName}
+                onChange={(e) => setSaveTemplateName(e.target.value)}
+                placeholder="e.g. Detailed Site Layout, Boundary Print A4"
+                maxLength={40}
+                onPressEnter={() => handleSaveTemplate(saveTemplateName)}
+                autoFocus
+              />
+            </div>
+            <div className="text-[11px] text-gray-500 bg-gray-50 p-2.5 rounded-lg border border-gray-150 space-y-0.5">
+              <div>• <strong>Orientation & Size:</strong> {settings.layout === 'landscape' ? 'Landscape' : 'Portrait'} ({settings.pageSize})</div>
+              <div>• <strong>Element Layouts:</strong> Map canvas, legend, title, scale & north arrow positions</div>
+              <div>• <strong>Custom Styles:</strong> Typography, borders, fills and opacities</div>
+            </div>
           </div>
-        }
-        open={isSaveModalOpen}
-        onCancel={() => setIsSaveModalOpen(false)}
-        onOk={() => handleSaveTemplate(saveTemplateName)}
-        confirmLoading={isSavingTemplate}
-        okText="Save Template"
-        cancelText="Cancel"
-        className="rounded-2xl"
-      >
-        <div className="py-2 space-y-3">
-          <p className="text-xs text-gray-500 m-0">
-            Save this custom layout for this map workspace so you and your team can select it in future prints.
-          </p>
-          <div>
-            <label className="block text-xs font-semibold text-gray-700 mb-1">
-              Template Name
-            </label>
-            <Input
-              value={saveTemplateName}
-              onChange={(e) => setSaveTemplateName(e.target.value)}
-              placeholder="e.g. Detailed Site Layout, Boundary Print A4"
-              maxLength={40}
-              onPressEnter={() => handleSaveTemplate(saveTemplateName)}
-              autoFocus
-            />
-          </div>
-          <div className="text-[11px] text-gray-500 bg-gray-50 p-2.5 rounded-lg border border-gray-150 space-y-0.5">
-            <div>• <strong>Orientation & Size:</strong> {settings.layout === 'landscape' ? 'Landscape' : 'Portrait'} ({settings.pageSize})</div>
-            <div>• <strong>Element Layouts:</strong> Map canvas, legend, title, scale & north arrow positions</div>
-            <div>• <strong>Custom Styles:</strong> Typography, borders, fills and opacities</div>
-          </div>
-        </div>
-      </Modal>
+        </Modal>
+      )}
 
       {/* Prompt to Save Template Before Export Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-2">
-            <Bookmark size={18} className="text-primary" />
-            <span className="font-semibold text-sm">Save Custom Template for This Map?</span>
-          </div>
-        }
-        open={isSavePromptOpen}
-        onCancel={() => setIsSavePromptOpen(false)}
-        footer={[
-          <Button key="cancel" onClick={() => setIsSavePromptOpen(false)}>
-            Cancel
-          </Button>,
-          <Button
-            key="export-only"
-            onClick={() => {
-              setIsSavePromptOpen(false);
-              executeExport();
-            }}
-          >
-            Export Without Saving
-          </Button>,
-          <Button
-            key="save-export"
-            type="primary"
-            loading={isSavingTemplate}
-            onClick={async () => {
-              const ok = await handleSaveTemplate(saveTemplateName || (currentSavedTemplate?.name || `Template ${savedTemplates.length + 1}`));
-              if (ok) {
+      {!isQuickMap && (
+        <Modal
+          title={
+            <div className="flex items-center gap-2">
+              <Bookmark size={18} className="text-primary" />
+              <span className="font-semibold text-sm">Save Custom Template for This Map?</span>
+            </div>
+          }
+          open={isSavePromptOpen}
+          onCancel={() => setIsSavePromptOpen(false)}
+          footer={[
+            <Button key="cancel" onClick={() => setIsSavePromptOpen(false)}>
+              Cancel
+            </Button>,
+            <Button
+              key="export-only"
+              onClick={() => {
                 setIsSavePromptOpen(false);
                 executeExport();
-              }
-            }}
-          >
-            Save & Export
-          </Button>
-        ]}
-        className="rounded-2xl"
-      >
-        <div className="py-2 space-y-3 text-xs text-gray-600">
-          <p className="m-0">
-            You have customized this print template. Would you like to save it for this map so you don&apos;t have to set it up again next time?
-          </p>
-          <div>
-            <label className="block text-xs font-semibold text-gray-700 mb-1">
-              Template Name
-            </label>
-            <Input
-              value={saveTemplateName}
-              onChange={(e) => setSaveTemplateName(e.target.value)}
-              placeholder={currentSavedTemplate?.name || 'e.g. Custom Site Template'}
-              maxLength={40}
-              autoFocus
-            />
+              }}
+            >
+              Export Without Saving
+            </Button>,
+            <Button
+              key="save-export"
+              type="primary"
+              loading={isSavingTemplate}
+              onClick={async () => {
+                const ok = await handleSaveTemplate(saveTemplateName || (currentSavedTemplate?.name || `Template ${savedTemplates.length + 1}`));
+                if (ok) {
+                  setIsSavePromptOpen(false);
+                  executeExport();
+                }
+              }}
+            >
+              Save & Export
+            </Button>
+          ]}
+          className="rounded-2xl"
+        >
+          <div className="py-2 space-y-3 text-xs text-gray-600">
+            <p className="m-0">
+              You have customized this print template. Would you like to save it for this map so you don&apos;t have to set it up again next time?
+            </p>
+            <div>
+              <label className="block text-xs font-semibold text-gray-700 mb-1">
+                Template Name
+              </label>
+              <Input
+                value={saveTemplateName}
+                onChange={(e) => setSaveTemplateName(e.target.value)}
+                placeholder={currentSavedTemplate?.name || 'e.g. Custom Site Template'}
+                maxLength={40}
+                autoFocus
+              />
+            </div>
           </div>
-        </div>
-      </Modal>
+        </Modal>
+      )}
 
       {/* Delete Confirmation Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-2 text-red-600">
-            <Trash2 size={18} />
-            <span className="font-semibold text-sm">Delete Print Template</span>
-          </div>
-        }
-        open={!!templateToDelete}
-        onCancel={() => setTemplateToDelete(null)}
-        onOk={async () => {
-          if (templateToDelete) {
-            const id = templateToDelete.id;
-            setTemplateToDelete(null);
-            await handleDeleteTemplate(id);
+      {!isQuickMap && (
+        <Modal
+          title={
+            <div className="flex items-center gap-2 text-red-600">
+              <Trash2 size={18} />
+              <span className="font-semibold text-sm">Delete Print Template</span>
+            </div>
           }
-        }}
-        okText="Delete Template"
-        okButtonProps={{ danger: true }}
-        cancelText="Cancel"
-        className="rounded-2xl"
-      >
-        <p className="text-xs text-gray-600 m-0 py-2">
-          Are you sure you want to permanently delete the custom template{' '}
-          <strong>&quot;{templateToDelete?.name}&quot;</strong>? This template will no longer be available for printing.
-        </p>
-      </Modal>
+          open={!!templateToDelete}
+          onCancel={() => setTemplateToDelete(null)}
+          onOk={async () => {
+            if (templateToDelete) {
+              const id = templateToDelete.id;
+              setTemplateToDelete(null);
+              await handleDeleteTemplate(id);
+            }
+          }}
+          okText="Delete Template"
+          okButtonProps={{ danger: true }}
+          cancelText="Cancel"
+          className="rounded-2xl"
+        >
+          <p className="text-xs text-gray-600 m-0 py-2">
+            Are you sure you want to permanently delete the custom template{' '}
+            <strong>&quot;{templateToDelete?.name}&quot;</strong>? This template will no longer be available for printing.
+          </p>
+        </Modal>
+      )}
 
       {/* Manage Custom Templates Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-2">
-            <Settings size={18} className="text-primary" />
-            <span className="font-semibold text-sm">Manage Saved Print Templates</span>
+      {!isQuickMap && (
+        <Modal
+          title={
+            <div className="flex items-center gap-2">
+              <Settings size={18} className="text-primary" />
+              <span className="font-semibold text-sm">Manage Saved Print Templates</span>
+            </div>
+          }
+          open={isManageModalOpen}
+          onCancel={() => setIsManageModalOpen(false)}
+          footer={[
+            <Button key="close" type="primary" onClick={() => setIsManageModalOpen(false)}>
+              Done
+            </Button>
+          ]}
+          width={560}
+          className="rounded-2xl"
+        >
+          <div className="py-2">
+            <p className="text-xs text-gray-500 mb-3">
+              Custom print templates saved for your map workspaces:
+            </p>
+            {savedTemplates.length === 0 ? (
+              <div className="text-center py-6 text-gray-400 text-xs bg-gray-50 rounded-xl border border-gray-150">
+                No custom templates saved yet.
+              </div>
+            ) : (
+              <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
+                {savedTemplates.map((t) => (
+                  <div
+                    key={t.id}
+                    className="flex items-center justify-between p-2.5 bg-gray-50 hover:bg-gray-100 rounded-xl border border-gray-200 transition-colors"
+                  >
+                    <div className="min-w-0 flex-1 pr-3">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-xs text-gray-800 truncate">{t.name}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded-md capitalize font-medium">
+                          {t.layout}
+                        </span>
+                        <span className="text-[10px] px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded-md font-medium">
+                          {t.pageSize}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-gray-400 mt-0.5">
+                        {t.createdAt ? `Saved on ${new Date(t.createdAt).toLocaleDateString()}` : 'Custom layout'}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <Button
+                        size="small"
+                        danger
+                        icon={<Trash2 size={12} />}
+                        onClick={() => setTemplateToDelete(t)}
+                        className="text-[11px] h-6 px-2.5 font-medium flex items-center gap-1"
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        }
-        open={isManageModalOpen}
-        onCancel={() => setIsManageModalOpen(false)}
-        footer={[
-          <Button key="close" type="primary" onClick={() => setIsManageModalOpen(false)}>
-            Done
-          </Button>
-        ]}
-        width={560}
-        className="rounded-2xl"
-      >
-        <div className="py-2">
-          <p className="text-xs text-gray-500 mb-3">
-            Custom print templates saved for your map workspaces:
-          </p>
-          {savedTemplates.length === 0 ? (
-            <div className="text-center py-6 text-gray-400 text-xs bg-gray-50 rounded-xl border border-gray-150">
-              No custom templates saved yet.
-            </div>
-          ) : (
-            <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
-              {savedTemplates.map((t) => (
-                <div
-                  key={t.id}
-                  className="flex items-center justify-between p-2.5 bg-gray-50 hover:bg-gray-100 rounded-xl border border-gray-200 transition-colors"
-                >
-                  <div className="min-w-0 flex-1 pr-3">
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-xs text-gray-800 truncate">{t.name}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 bg-blue-100 text-blue-700 rounded-md capitalize font-medium">
-                        {t.layout}
-                      </span>
-                      <span className="text-[10px] px-1.5 py-0.5 bg-purple-100 text-purple-700 rounded-md font-medium">
-                        {t.pageSize}
-                      </span>
-                    </div>
-                    <div className="text-[10px] text-gray-400 mt-0.5">
-                      {t.createdAt ? `Saved on ${new Date(t.createdAt).toLocaleDateString()}` : 'Custom layout'}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <Button
-                      size="small"
-                      danger
-                      icon={<Trash2 size={12} />}
-                      onClick={() => setTemplateToDelete(t)}
-                      className="text-[11px] h-6 px-2.5 font-medium flex items-center gap-1"
-                    >
-                      Delete
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      </Modal>
+        </Modal>
+      )}
     </>
   );
 };

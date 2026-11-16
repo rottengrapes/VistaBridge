@@ -20,6 +20,9 @@ import {
 } from '../types/rasterAnalysis';
 import RasterProcessForm from './RasterProcessForm';
 import { executeRasterWPS } from '../services/rasterWps';
+import { getRasterMetadata } from '../services/rasterMetadata';
+import { useConfigStore } from '@/store/useConfigStore';
+import { useAuthStore } from '@/store/useAuthStore';
 
 interface RasterAnalysisPanelProps {
   addedLayers: LayerState[];
@@ -30,6 +33,7 @@ interface RasterAnalysisPanelProps {
   onStopDrawGeom?: () => void;
   allDatasets?: any[];
   isMobile?: boolean;
+  geoserverUrl?: string;
 }
 
 
@@ -83,7 +87,8 @@ export default function RasterAnalysisPanel({
   onStartDrawGeom,
   onStopDrawGeom,
   allDatasets = [],
-  isMobile: _isMobile = false
+  isMobile: _isMobile = false,
+  geoserverUrl: propGeoserverUrl
 }: RasterAnalysisPanelProps) {
   const [processes, setProcesses] = useState<RasterProcess[]>([]);
   const [loading, setLoading] = useState(false);
@@ -97,7 +102,18 @@ export default function RasterAnalysisPanel({
   const [searchQuery, setSearchQuery] = useState('');
   const [resultLayerName, setResultLayerName] = useState<string>('');
 
-  const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+  const configGeoserverUrl = useConfigStore((s) => s.geoserverUrl);
+  const authGeoserverUrl = useAuthStore.getState().user?.geoserverUrl;
+  const geoserverUrl = (
+    propGeoserverUrl ||
+    user?.geoserverUrl ||
+    authGeoserverUrl ||
+    configGeoserverUrl ||
+    process.env.NEXT_PUBLIC_GEOSERVER_URL ||
+    'http://localhost:8080/geoserver'
+  ).replace(/\/$/, '');
+
+  const authHeader = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
   // 1. Fetch available raster processes dynamically via GetCapabilities
   useEffect(() => {
@@ -105,8 +121,8 @@ export default function RasterAnalysisPanel({
       setLoading(true);
       try {
         const headers: Record<string, string> = {};
-        if (user?.geoserverAuth) {
-          headers['Authorization'] = user.geoserverAuth;
+        if (authHeader) {
+          headers['Authorization'] = authHeader;
         }
 
         const res = await fetch(`${geoserverUrl}/wps?service=WPS&version=1.0.0&request=GetCapabilities`, { headers });
@@ -170,7 +186,7 @@ export default function RasterAnalysisPanel({
     };
 
     fetchCapabilities();
-  }, [geoserverUrl, user?.geoserverAuth, notification]);
+  }, [geoserverUrl, authHeader, notification]);
 
   // 2. Fetch DescribeProcess schema dynamically
   const handleSelectProcess = async (processId: string) => {
@@ -183,8 +199,8 @@ export default function RasterAnalysisPanel({
 
     try {
       const headers: Record<string, string> = {};
-      if (user?.geoserverAuth) {
-        headers['Authorization'] = user.geoserverAuth;
+      if (authHeader) {
+        headers['Authorization'] = authHeader;
       }
 
       const res = await fetch(`${geoserverUrl}/wps?service=WPS&version=1.0.0&request=DescribeProcess&identifier=${encodeURIComponent(processId)}`, { headers });
@@ -364,6 +380,17 @@ export default function RasterAnalysisPanel({
     let effectiveMetadata = rasterMetadata;
     if (coverageInput) {
       const selectedId = formValues[coverageInput.identifier];
+      if (selectedId) {
+        try {
+          const freshMeta = await getRasterMetadata(selectedId, geoserverUrl, authHeader);
+          if (freshMeta) {
+            effectiveMetadata = freshMeta;
+          }
+        } catch (e) {
+          console.warn('Could not fetch fresh raster metadata before WPS execute:', e);
+        }
+      }
+
       const match = addedLayers.find(l => l.id === selectedId || l.name === selectedId);
       if (match) {
         const bboxObj = match.bbox ? {
@@ -373,9 +400,11 @@ export default function RasterAnalysisPanel({
           maxY: match.bbox[3],
         } : { minX: -180, minY: -90, maxX: 180, maxY: 90 };
 
+        const cleanId = match.id.includes(':') ? match.id.split(':').pop() || match.id : match.id;
         if (!effectiveMetadata || effectiveMetadata.layerName !== match.id) {
           effectiveMetadata = {
             layerName: match.id,
+            wcsCoverageId: cleanId,
             title: match.name || match.id,
             nativeCRS: match.nativeCRS || 'EPSG:4326',
             bbox: bboxObj,
@@ -396,8 +425,10 @@ export default function RasterAnalysisPanel({
         maxY: firstRaster.bbox[3],
       } : { minX: -180, minY: -90, maxX: 180, maxY: 90 };
 
+      const cleanId = firstRaster?.id ? (firstRaster.id.includes(':') ? firstRaster.id.split(':').pop() || firstRaster.id : firstRaster.id) : undefined;
       effectiveMetadata = {
         layerName: firstRaster?.id || 'raster_layer',
+        wcsCoverageId: cleanId,
         title: firstRaster?.name || firstRaster?.id || 'Raster Layer',
         nativeCRS: firstRaster?.nativeCRS || 'EPSG:4326',
         bbox: bboxObj,
@@ -418,7 +449,7 @@ export default function RasterAnalysisPanel({
         outputIdentifier: processOutput?.identifier || 'result',
         processOutput: processOutput || undefined,
         geoserverUrl,
-        authHeader: user?.geoserverAuth,
+        authHeader: authHeader,
         resultLayerName,
         addedLayers
       });
@@ -567,7 +598,7 @@ export default function RasterAnalysisPanel({
             onStartDrawGeom={onStartDrawGeom || (() => { })}
             onStopDrawGeom={onStopDrawGeom}
             geoserverUrl={geoserverUrl}
-            authHeader={user?.geoserverAuth}
+            authHeader={authHeader}
             disabled={executing}
           />
 

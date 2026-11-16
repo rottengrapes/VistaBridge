@@ -1123,6 +1123,68 @@ function ViewDashboardContent() {
     { key: 'table', label: 'Data Table' },
   ];
 
+  const formatLayerDisplayName = (rawName: string): string => {
+    if (!rawName) return '';
+    // Strip workspace prefix like "ne:", "workspace:"
+    const withoutWorkspace = rawName.includes(':') ? rawName.split(':').slice(1).join(':') : rawName;
+    // Replace underscores and hyphens with spaces
+    const withSpaces = withoutWorkspace.replace(/[_-]+/g, ' ').trim();
+    // Capitalize first letter of each word
+    return withSpaces.replace(/\b\w/g, (c) => c.toUpperCase());
+  };
+
+  const generateDefaultChartTitle = (
+    chartType: string,
+    layerId: string,
+    values?: any,
+    datasets: any[] = []
+  ): string => {
+    const chartLabel = GEO_CHART_TYPES.find((c) => c.key === chartType)?.label ?? chartType;
+    const ds = datasets.find((d) => d.id === layerId);
+    const rawLayerName = ds?.name ?? layerId;
+    const cleanLayerName = formatLayerDisplayName(rawLayerName);
+
+    if (chartType === 'kpi') {
+      const metricName = values?.metric && values.metric !== '__kpi__' && values.metric !== 'count' ? values.metric : '';
+      if (metricName) {
+        const cleanMetric = formatLayerDisplayName(metricName);
+        return cleanMetric.slice(0, 32);
+      }
+      return values?.aggregation === 'count' ? 'Total Features' : 'KPI Widget';
+    }
+
+    if (!cleanLayerName) {
+      return chartLabel.slice(0, 32);
+    }
+
+    // Format: "${chartLabel} - ${cleanLayerName}" up to 32 characters
+    const prefix = `${chartLabel} - `;
+    const maxLayerLen = 32 - prefix.length;
+    if (maxLayerLen >= 4) {
+      const truncatedLayer = cleanLayerName.length > maxLayerLen
+        ? cleanLayerName.slice(0, maxLayerLen).trim()
+        : cleanLayerName;
+      return `${prefix}${truncatedLayer}`.slice(0, 32);
+    }
+
+    return cleanLayerName.slice(0, 32);
+  };
+
+  const formatSavedChartTitle = (rawTitle: string): string => {
+    if (!rawTitle) return '';
+    if (rawTitle.includes('—') || rawTitle.includes('ne:') || rawTitle.includes(':') || rawTitle.includes('_')) {
+      let t = rawTitle
+        .replace(/—/g, '-')
+        .replace(/\b[a-zA-Z0-9_]+:/g, '')
+        .replace(/_/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      t = t.replace(/\b\w/g, c => c.toUpperCase());
+      return t.slice(0, 32);
+    }
+    return rawTitle.slice(0, 32);
+  };
+
   const AGGREGATIONS = [
     { key: 'count', label: 'Count' },
     { key: 'sum', label: 'Sum' },
@@ -1163,23 +1225,12 @@ function ViewDashboardContent() {
   const handleAddGeoChart = (values: any) => {
     if (!geoChartLayerId) return;
     const chartType = geoChartPresetType ?? values.chartType;
-    const ds = availableDatasets.find(d => d.id === geoChartLayerId);
-    const layerName = ds?.name ?? geoChartLayerId;
-    const chartLabel = GEO_CHART_TYPES.find(c => c.key === chartType)?.label ?? chartType;
 
     let title = values.title?.trim();
     if (!title) {
-      if (chartType === 'kpi') {
-        const metricName = values.metric && values.metric !== '__kpi__' && values.metric !== 'count' ? values.metric : '';
-        if (metricName) {
-          const fmt = (s: string) => s.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-          title = fmt(metricName);
-        } else {
-          title = values.aggregation === 'count' ? 'Total Features' : 'KPI Widget';
-        }
-      } else {
-        title = `${chartLabel} — ${layerName}`;
-      }
+      title = generateDefaultChartTitle(chartType, geoChartLayerId, values, availableDatasets);
+    } else {
+      title = title.slice(0, 32);
     }
     const config: GeoChartConfig = {
       layerId: geoChartLayerId,
@@ -1657,7 +1708,8 @@ function ViewDashboardContent() {
       const mapData = await res.json();
 
       if (mapData.name && (!mapConfigTitle || mapConfigTitle === 'Map')) {
-        setMapConfigTitle(mapData.name.slice(0, 32));
+        const clean = formatLayerDisplayName(mapData.name);
+        setMapConfigTitle(clean ? (clean.toLowerCase().includes('map') ? clean : `${clean} Map`).slice(0, 32) : 'Map');
       }
 
       const rawLayers = Array.isArray(mapData.layers) ? mapData.layers : [];
@@ -1745,7 +1797,8 @@ function ViewDashboardContent() {
       return [...prev, newLayer];
     });
     if (!mapConfigTitle || mapConfigTitle === 'Map') {
-      setMapConfigTitle(name.slice(0, 32));
+      const clean = formatLayerDisplayName(name);
+      setMapConfigTitle(clean ? `${clean} Map`.slice(0, 32) : 'Map');
     }
   };
 
@@ -1754,10 +1807,11 @@ function ViewDashboardContent() {
       notification.warning({ message: 'Add at least one layer to the map' });
       return;
     }
-    const cleanTitle = mapConfigTitle.trim().slice(0, 32);
+    let cleanTitle = mapConfigTitle.trim().slice(0, 32);
     if (!cleanTitle) {
-      notification.warning({ message: 'Map title cannot be empty or contain only whitespace' });
-      return;
+      const firstLayerName = mapConfigLayers[0]?.name || 'Map';
+      const clean = formatLayerDisplayName(firstLayerName);
+      cleanTitle = clean ? (clean.toLowerCase().includes('map') ? clean : `${clean} Map`).slice(0, 32) : 'Map';
     }
 
     if (editingWidgetId) {
@@ -1797,7 +1851,14 @@ function ViewDashboardContent() {
     setEditingWidgetId(widget.id);
 
     if (widget.type === 'map') {
-      setMapConfigTitle(widget.title || 'Map');
+      let initialMapTitle = widget.title || 'Map';
+      if (initialMapTitle.includes(':') || initialMapTitle.includes('_')) {
+        initialMapTitle = formatLayerDisplayName(initialMapTitle);
+        if (!initialMapTitle.toLowerCase().includes('map')) {
+          initialMapTitle = `${initialMapTitle} Map`;
+        }
+      }
+      setMapConfigTitle(initialMapTitle.slice(0, 32));
       setMapConfigLayers(widget.layers ? [...widget.layers] : []);
       setSelectedMapOrLayer(null);
       fetchAvailableDatasets();
@@ -1810,6 +1871,18 @@ function ViewDashboardContent() {
       setGeoChartLayerId(cfg.layerId);
       await loadLayerColumns(cfg.layerId);
       geoChartForm.resetFields();
+
+      let initialTitle = widget.title || '';
+      if (initialTitle.includes('—') || initialTitle.includes('ne:') || initialTitle.includes(':') || initialTitle.length > 32) {
+        initialTitle = initialTitle
+          .replace(/—/g, '-')
+          .replace(/\b[a-zA-Z0-9_]+:/g, '')
+          .replace(/_/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        initialTitle = initialTitle.replace(/\b\w/g, (c) => c.toUpperCase()).slice(0, 32);
+      }
+
       geoChartForm.setFieldsValue({
         chartType: cfg.chartType,
         layerId: cfg.layerId,
@@ -1817,7 +1890,7 @@ function ViewDashboardContent() {
         metric: cfg.metric,
         aggregation: cfg.aggregation || 'count',
         tableColumns: cfg.tableColumns || [],
-        title: widget.title,
+        title: initialTitle,
         themeSettings: {
           colorTheme: cfg.colorTheme,
           customColors: cfg.customColors,
@@ -3200,76 +3273,46 @@ function ViewDashboardContent() {
                 {/* ── GeoServer-native chart panel ─────────────────────── */}
                 {activePanel === 'geochart' && (
                   <Form form={geoChartForm} layout="vertical" onFinish={handleAddGeoChart} requiredMark={false} className="flex flex-col gap-1">
-                    <Form.Item name="title" rules={[
-                      { max: 32, message: 'Title cannot exceed 32 characters' },
-                      {
-                        validator: (_, value) => {
-                          if (!value) return Promise.resolve();
-                          if (value.startsWith(' ') || value.endsWith(' ')) {
-                            return Promise.reject(new Error('Title cannot start or end with spaces'));
-                          }
-                          if (value.trim().length === 0) {
-                            return Promise.reject(new Error('Title cannot contain only spaces'));
-                          }
-                          const hasLetters = /[a-zA-Z]/.test(value);
-                          const hasNumbers = /[0-9]/.test(value);
-                          const hasSpecial = /[^a-zA-Z0-9\s]/.test(value);
-                          if (!hasLetters && !hasNumbers && hasSpecial) {
-                            return Promise.reject(new Error('Title cannot consist of only special characters'));
-                          }
-                          if (hasSpecial && hasNumbers) {
-                            return Promise.reject(new Error('Title cannot contain both numbers and special characters'));
-                          }
-                          return Promise.resolve();
-                        }
-                      }
-                    ]} noStyle>
-                      {/* Chart title with same style counter as Map Title */}
-                      <Form.Item shouldUpdate noStyle>
-                        {() => {
-                          const val: string = geoChartForm.getFieldValue('title') ?? '';
-                          return (
-                            <div>
-                              <div className="flex items-center justify-between mb-1">
-                                <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block">Chart Title</label>
-                                <span className={`text-[10px] font-mono ${val.length >= 32 ? 'text-red-500 font-bold' : 'text-gray-400'}`}>
-                                  {val.length}/32
-                                </span>
-                              </div>
-                              <Form.Item name="title" noStyle rules={[
+                    <Form.Item shouldUpdate={(prev, curr) => prev.title !== curr.title} noStyle>
+                      {() => {
+                        const val: string = geoChartForm.getFieldValue('title') ?? '';
+                        return (
+                          <div className="mb-2">
+                            <div className="flex items-center justify-between mb-1">
+                              <label className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block">Chart Title</label>
+                              <span className={`text-[10px] font-mono ${val.length >= 32 ? 'text-red-500 font-bold' : 'text-gray-400'}`}>
+                                {val.length}/32
+                              </span>
+                            </div>
+                            <Form.Item
+                              name="title"
+                              noStyle
+                              rules={[
                                 { max: 32, message: 'Title cannot exceed 32 characters' },
                                 {
                                   validator: (_, value) => {
                                     if (!value) return Promise.resolve();
-                                    if (value.startsWith(' ') || value.endsWith(' ')) {
-                                      return Promise.reject(new Error('Title cannot start or end with spaces'));
-                                    }
-                                    if (value.trim().length === 0) {
+                                    const trimmed = value.trim();
+                                    if (trimmed.length === 0) {
                                       return Promise.reject(new Error('Title cannot contain only spaces'));
                                     }
-                                    const hasLetters = /[a-zA-Z]/.test(value);
-                                    const hasNumbers = /[0-9]/.test(value);
-                                    const hasSpecial = /[^a-zA-Z0-9\s]/.test(value);
-                                    if (!hasLetters && !hasNumbers && hasSpecial) {
-                                      return Promise.reject(new Error('Title cannot consist of only special characters'));
-                                    }
-                                    if (hasSpecial && hasNumbers) {
-                                      return Promise.reject(new Error('Title cannot contain both numbers and special characters'));
+                                    if (/[<>]/.test(trimmed)) {
+                                      return Promise.reject(new Error('Title contains invalid characters (< or >)'));
                                     }
                                     return Promise.resolve();
                                   }
                                 }
-                              ]}>
-                                <Input
-                                  placeholder="Auto-generated if blank"
-                                  className="rounded-xl h-9"
-                                  maxLength={32}
-                                />
-                              </Form.Item>
-                            </div>
-                          );
-                        }}
-                      </Form.Item>
+                              ]}
+                            >
+                              <Input
+                                placeholder="Auto-generated if blank (max 32 chars)"
+                                className="rounded-xl h-9"
+                                maxLength={32}
+                              />
+                            </Form.Item>
+                          </div>
+                        );
+                      }}
                     </Form.Item>
 
                     <Form.Item
@@ -3541,10 +3584,11 @@ function ViewDashboardContent() {
                           pie: <PieChart size={11} />, donut: <Donut size={11} />, scatter: <ScatterChart size={11} />,
                           kpi: <Hash size={11} />, table: <Table size={11} />,
                         };
+                        const cleanTitle = formatSavedChartTitle(sc.title);
                         return (
                           <div key={sc.id} className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 hover:border-gray-300 transition-colors group">
                             <span className="text-gray-400 shrink-0">{typeIcon[sc.chartType] ?? <BarChart3 size={11} />}</span>
-                            <span className="text-[10px] font-semibold text-gray-700 truncate flex-1" title={sc.title}>{sc.title}</span>
+                            <span className="text-[10px] font-semibold text-gray-700 truncate flex-1" title={cleanTitle}>{cleanTitle}</span>
                             <button
                               title="Add to canvas"
                               onClick={() => {
@@ -3553,14 +3597,14 @@ function ViewDashboardContent() {
                                   id: `gc_${Date.now()}`,
                                   type: 'geochart',
                                   geoChartConfig: sc.config,
-                                  title: sc.title,
+                                  title: cleanTitle,
                                   x: 0,
                                   y: nextY,
                                   w: sc.chartType === 'kpi' ? 3 : 6,
                                   h: sc.chartType === 'kpi' ? 120 : 300,
                                 };
                                 setWidgets(prev => [...prev, w]);
-                                notification.success({ message: `"${sc.title}" added to canvas`, duration: 2 });
+                                notification.success({ message: `"${cleanTitle}" added to canvas`, duration: 2 });
                               }}
                               className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-primary transition-colors"
                               style={{} as any}

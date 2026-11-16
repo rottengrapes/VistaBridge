@@ -88,8 +88,8 @@ export function getWfsGmlSrsName(layerCrs: string | undefined | null, wfsVersion
   const normalized = normalizeCrs(layerCrs);
 
   if (normalized === 'EPSG:4326' || normalized === 'CRS:84') {
-    // GeoServer standard GML3 SRS URL preserving Lon/Lat (X/Y)
-    return 'http://www.opengis.net/gml/srs/epsg.xml#4326';
+    // GeoServer standard EPSG short code universally compatible across 2.x and 3.x
+    return 'EPSG:4326';
   }
 
   return normalized;

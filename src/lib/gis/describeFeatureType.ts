@@ -41,10 +41,24 @@ export async function fetchWfsLayerSchema(
 ): Promise<WfsLayerSchema> {
   const cached = schemaCache.get(layerId);
   if (cached) {
-    if (layerKnownCrs && cached.srsName === defaultSrs) {
-      cached.srsName = normalizeCrs(layerKnownCrs);
+    const cleanLName = cached.layerName.toLowerCase();
+    const cleanQName = cached.qualifiedName.toLowerCase();
+    const lNameWithoutWorkspace = cleanQName.split(':').pop() || cleanLName;
+    if (
+      cached.attributes.some(
+        a =>
+          a.name.toLowerCase() === cleanLName ||
+          a.name.toLowerCase() === cleanQName ||
+          a.name.toLowerCase() === lNameWithoutWorkspace
+      )
+    ) {
+      schemaCache.delete(layerId);
+    } else {
+      if (layerKnownCrs && cached.srsName === defaultSrs) {
+        cached.srsName = normalizeCrs(layerKnownCrs);
+      }
+      return cached;
     }
-    return cached;
   }
 
   const cleanUrl = geoserverUrl.replace(/\/+$/, '');
@@ -119,6 +133,13 @@ export async function fetchWfsLayerSchema(
             if (firstFeature.geometry?.type) {
               parsed.geomType = firstFeature.geometry.type;
             }
+            if (firstFeature.properties && typeof firstFeature.properties === 'object') {
+              const realPropKeys = new Set(Object.keys(firstFeature.properties));
+              if (realPropKeys.size > 0) {
+                // Ensure parsed attributes ONLY contain fields that actually exist in the layer
+                parsed.attributes = parsed.attributes.filter(attr => realPropKeys.has(attr.name));
+              }
+            }
           }
           if (probeJson?.crs?.properties?.name) {
             parsed.srsName = normalizeCrs(probeJson.crs.properties.name);
@@ -188,6 +209,18 @@ export function parseDescribeFeatureTypeXml(
     else if (rawType.includes('point')) geomType = 'Point';
   }
 
+  const cleanLayer = layerName.toLowerCase();
+  const cleanQual = qualifiedName.toLowerCase();
+  const layerLocal = cleanQual.split(':').pop() || cleanLayer;
+
+  // In GeoServer XSD, actual feature attributes are strictly inside <xsd:complexType name="...Type"> ... <xsd:sequence> ... </xsd:sequence>
+  const ctRegex = new RegExp(`<xsd:complexType[^>]*name="[^"]*${layerLocal}[^"]*"[^>]*>([\\s\\S]*?)<\\/xsd:complexType>`, 'i');
+  const ctMatch = xmlText.match(ctRegex);
+  const scopeXml = ctMatch ? ctMatch[1] : xmlText;
+
+  const sequenceMatch = scopeXml.match(/<xsd:sequence>([\s\S]*?)<\/xsd:sequence>/i);
+  const targetXml = sequenceMatch ? sequenceMatch[1] : scopeXml;
+
   // Parse elements using regex for cross-environment compatibility (Node and Browser)
   const elementRegex = /<xsd:element\s+([^>]+)\/>/gi;
   let match: RegExpExecArray | null;
@@ -197,7 +230,7 @@ export function parseDescribeFeatureTypeXml(
     geomFieldName.toLowerCase()
   ]);
 
-  while ((match = elementRegex.exec(xmlText)) !== null) {
+  while ((match = elementRegex.exec(targetXml)) !== null) {
     const attrsStr = match[1];
     const nameMatch = attrsStr.match(/name="([^"]+)"/);
     const typeMatch = attrsStr.match(/type="([^"]+)"/);
@@ -217,6 +250,22 @@ export function parseDescribeFeatureTypeXml(
       GEOM_COL_NAMES.has(colName.toLowerCase()) ||
       rawColType.toLowerCase().includes('gml:') ||
       rawColType.toLowerCase().includes('propertytype')
+    ) {
+      continue;
+    }
+
+    // Skip the feature type root declaration itself (e.g. <xsd:element name="ne_10m_admin_0_countries_ind" substitutionGroup="gml:_Feature" ... />)
+    const cleanColName = colName.toLowerCase();
+    const cleanLayerName = layerName.toLowerCase();
+    const cleanQualName = qualifiedName.toLowerCase();
+    const layerNameWithoutWorkspace = cleanQualName.split(':').pop() || cleanLayerName;
+    if (
+      attrsStr.includes('substitutionGroup') ||
+      cleanColName === cleanLayerName ||
+      cleanColName === cleanQualName ||
+      cleanColName === layerNameWithoutWorkspace ||
+      rawColType.toLowerCase().endsWith(`${cleanLayerName}type`) ||
+      rawColType.toLowerCase().endsWith(`${layerNameWithoutWorkspace}type`)
     ) {
       continue;
     }
@@ -254,4 +303,27 @@ export function parseDescribeFeatureTypeXml(
     srsName: defaultSrs,
     attributes,
   };
+}
+
+export type WfsFieldType = LayerAttributeSchema['type'];
+
+export function inferFieldType(val: any): WfsFieldType {
+  if (val === null || val === undefined || val === '') return 'string';
+  const str = String(val).trim();
+  if (/^-?\d+$/.test(str)) return 'integer';
+  if (/^-?\d+\.\d+$/.test(str)) return 'float';
+  if (/^(true|false)$/i.test(str)) return 'boolean';
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) return 'date';
+  return 'string';
+}
+
+export function getFieldPlaceholder(type?: string, isRequired = false): string {
+  let typeLabel = 'text';
+  if (type === 'integer') typeLabel = 'int';
+  else if (type === 'float') typeLabel = 'decimal';
+  else if (type === 'boolean') typeLabel = 'boolean';
+  else if (type === 'date') typeLabel = 'date (YYYY-MM-DD)';
+  else if (type === 'datetime') typeLabel = 'datetime';
+
+  return isRequired ? `${typeLabel} (required)` : typeLabel;
 }

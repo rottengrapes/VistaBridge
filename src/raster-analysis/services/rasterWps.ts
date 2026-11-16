@@ -12,7 +12,7 @@ import { RasterMetadata, RasterProcessInput, RasterExecutionResult, RasterProces
 import { transformGeoJSONGeometry, geoJsonToWKT, detectGeometryCRS, extractRawGeometry, getGeoJSONBBox, parseGMLToGeoJSON, parseXmlStatsToGeoJSON } from './rasterGeometry';
 import { validateCropIntersection, formatRasterErrorMessage } from './rasterValidation';
 import { serializeClassificationRanges } from '../components/RasterClassificationRanges';
-import { transformBBox } from './rasterCRS';
+import { transformBBox, isProjectedCRS, normalizeCRS } from './rasterCRS';
 import { fromArrayBuffer } from 'geotiff';
 import { booleanIntersects } from '@turf/boolean-intersects';
 
@@ -322,7 +322,6 @@ export async function buildRasterWPSExecuteRequest({
 
   // 1. Resolve active raster layer's native CRS and bounding box upfront
   let activeRasterCrs = rasterMetadata?.nativeCRS || 'EPSG:4326';
-  let _activeRasterBbox = rasterMetadata?.bbox || { minX: -180, minY: -90, maxX: 180, maxY: 90 };
 
   for (const input of inputSchema) {
     const idLower = input.identifier.toLowerCase();
@@ -342,19 +341,56 @@ export async function buildRasterWPSExecuteRequest({
       const covVal = inputs[input.identifier];
       if (typeof covVal === 'string' && addedLayers) {
         const match = addedLayers.find(l => l.id === covVal || l.name === covVal);
-        if (match?.nativeCRS) {
+        if (rasterMetadata?.nativeCRS && rasterMetadata.nativeCRS !== 'EPSG:4326') {
+          activeRasterCrs = rasterMetadata.nativeCRS;
+        } else if (match?.nativeCRS && match.nativeCRS !== 'EPSG:4326') {
           activeRasterCrs = match.nativeCRS;
-        }
-        if (match?.bbox) {
-          _activeRasterBbox = {
-            minX: match.bbox[0],
-            minY: match.bbox[1],
-            maxX: match.bbox[2],
-            maxY: match.bbox[3],
-          };
+        } else {
+          activeRasterCrs = rasterMetadata?.nativeCRS || match?.nativeCRS || 'EPSG:4326';
         }
       }
       break;
+    }
+  }
+
+  activeRasterCrs = normalizeCRS(activeRasterCrs);
+  const crsCode = activeRasterCrs.replace(/[^0-9]/g, '');
+  const isCoverageProjected = isProjectedCRS(activeRasterCrs);
+
+  let nativeBbox = rasterMetadata?.bbox || { minX: -180, minY: -90, maxX: 180, maxY: 90 };
+  let latLonBbox = rasterMetadata?.latLonBbox;
+
+  if (isCoverageProjected) {
+    const isBboxDegrees = (
+      Math.abs(nativeBbox.minX) <= 180 &&
+      Math.abs(nativeBbox.maxX) <= 180 &&
+      Math.abs(nativeBbox.minY) <= 90 &&
+      Math.abs(nativeBbox.maxY) <= 90
+    );
+    if (isBboxDegrees) {
+      if (!latLonBbox) {
+        latLonBbox = { ...nativeBbox };
+      }
+      try {
+        const [pMinX, pMinY, pMaxX, pMaxY] = await transformBBox(
+          [nativeBbox.minX, nativeBbox.minY, nativeBbox.maxX, nativeBbox.maxY],
+          'EPSG:4326',
+          activeRasterCrs
+        );
+        nativeBbox = { minX: pMinX, minY: pMinY, maxX: pMaxX, maxY: pMaxY };
+      } catch (projErr) {
+        console.warn('Could not project native bbox to nativeCRS:', projErr);
+      }
+    }
+  } else {
+    const isBboxProjected = (
+      Math.abs(nativeBbox.minX) > 180 ||
+      Math.abs(nativeBbox.maxX) > 180 ||
+      Math.abs(nativeBbox.minY) > 90 ||
+      Math.abs(nativeBbox.maxY) > 90
+    );
+    if (isBboxProjected && latLonBbox) {
+      nativeBbox = { ...latLonBbox };
     }
   }
 
@@ -443,29 +479,54 @@ export async function buildRasterWPSExecuteRequest({
     </wps:Input>`;
       } else {
         // Use WCS GetCoverage reference for standard published layers on GeoServer
-        const crsCode = layerNativeCrs.replace(/[^0-9]/g, '');
-        const is4326 = !crsCode || crsCode === '4326' || layerNativeCrs.toUpperCase().includes('CRS84');
-        const crsUrn = is4326 ? 'urn:ogc:def:crs:OGC:1.3:CRS84' : `urn:ogc:def:crs:EPSG::${crsCode}`;
-        let minX = is4326 ? (rasterMetadata?.latLonBbox?.minX ?? layerBbox?.minX ?? -180) : (layerBbox?.minX ?? -180);
-        let minY = is4326 ? (rasterMetadata?.latLonBbox?.minY ?? layerBbox?.minY ?? -90) : (layerBbox?.minY ?? -90);
-        let maxX = is4326 ? (rasterMetadata?.latLonBbox?.maxX ?? layerBbox?.maxX ?? 180) : (layerBbox?.maxX ?? 180);
-        let maxY = is4326 ? (rasterMetadata?.latLonBbox?.maxY ?? layerBbox?.maxY ?? 90) : (layerBbox?.maxY ?? 90);
+        const cleanCoverageId = rasterMetadata?.wcsCoverageId || (
+          coverageLayerName.includes(':')
+            ? (coverageLayerName.split(':').pop() || coverageLayerName)
+            : coverageLayerName
+        );
 
-        // Dynamically crop WCS DomainSubset to ROI bounding box if ROI geometry is provided
+        const crsUrn = isCoverageProjected
+          ? `urn:ogc:def:crs:EPSG::${crsCode}`
+          : 'urn:ogc:def:crs:OGC:1.3:CRS84';
+
+        let minX = isCoverageProjected
+          ? nativeBbox.minX
+          : (latLonBbox?.minX ?? (Math.abs(layerBbox?.minX ?? 0) <= 180 ? layerBbox?.minX : -180) ?? -180);
+        let minY = isCoverageProjected
+          ? nativeBbox.minY
+          : (latLonBbox?.minY ?? (Math.abs(layerBbox?.minY ?? 0) <= 90 ? layerBbox?.minY : -90) ?? -90);
+        let maxX = isCoverageProjected
+          ? nativeBbox.maxX
+          : (latLonBbox?.maxX ?? (Math.abs(layerBbox?.maxX ?? 0) <= 180 ? layerBbox?.maxX : 180) ?? 180);
+        let maxY = isCoverageProjected
+          ? nativeBbox.maxY
+          : (latLonBbox?.maxY ?? (Math.abs(layerBbox?.maxY ?? 0) <= 90 ? layerBbox?.maxY : 90) ?? 90);
+
+        // For ras:CropCoverage, do NOT pre-clip WCS DomainSubset tightly to the ROI bbox,
+        // because CropCoverage performs the exact geometric cropping inside GeoServer.
+        // Pre-clipping with discrete raster pixels creates border truncation and EmptyIntersectionException.
+        const isCropProcess = processId.toLowerCase().includes('crop');
         const roiGeomVal = inputs.cropShape || inputs.roi || inputs.geometry || inputs.shape || inputs.polygon || inputs.cropGeom || inputs.clipGeom || inputs.geom;
-        if (roiGeomVal) {
+
+        if (roiGeomVal && !isCropProcess) {
           const rawGeom = extractRawGeometry(roiGeomVal) || roiGeomVal;
           if (rawGeom) {
             const srcCrs = detectGeometryCRS(rawGeom, 'EPSG:4326');
-            const targetCrs = is4326 ? 'EPSG:4326' : layerNativeCrs;
+            const targetCrs = isCoverageProjected ? layerNativeCrs : 'EPSG:4326';
             try {
               const transformedRoi = await transformGeoJSONGeometry(rawGeom, srcCrs, targetCrs);
               const roiBbox = getGeoJSONBBox(transformedRoi);
               if (roiBbox) {
-                const effMinX = Math.max(minX, roiBbox.minX);
-                const effMinY = Math.max(minY, roiBbox.minY);
-                const effMaxX = Math.min(maxX, roiBbox.maxX);
-                const effMaxY = Math.min(maxY, roiBbox.maxY);
+                // Add a 20% safety margin around the ROI bounding box to prevent edge cell clipping
+                const spanX = Math.max(roiBbox.maxX - roiBbox.minX, 0.001);
+                const spanY = Math.max(roiBbox.maxY - roiBbox.minY, 0.001);
+                const padX = spanX * 0.2;
+                const padY = spanY * 0.2;
+
+                const effMinX = Math.max(minX, roiBbox.minX - padX);
+                const effMinY = Math.max(minY, roiBbox.minY - padY);
+                const effMaxX = Math.min(maxX, roiBbox.maxX + padX);
+                const effMaxY = Math.min(maxY, roiBbox.maxY + padY);
                 if (effMinX < effMaxX && effMinY < effMaxY) {
                   minX = effMinX;
                   minY = effMinY;
@@ -488,7 +549,7 @@ export async function buildRasterWPSExecuteRequest({
       <wps:Reference mimeType="image/tiff" xlink:href="http://geoserver/wcs" method="POST">
         <wps:Body>
           <wcs:GetCoverage service="WCS" version="1.1.1">
-            <ows:Identifier>${coverageLayerName}</ows:Identifier>
+            <ows:Identifier>${cleanCoverageId}</ows:Identifier>
             <wcs:DomainSubset>
               <ows:BoundingBox crs="${crsUrn}">
                 <ows:LowerCorner>${lowerCorner}</ows:LowerCorner>
@@ -600,12 +661,17 @@ export async function buildRasterWPSExecuteRequest({
         // Extract raw geometry (unwrap FeatureCollection / Feature)
         const rawGeom = extractRawGeometry(val) || val;
         const geomSourceCRS = detectGeometryCRS(rawGeom, val.crs || 'EPSG:4326');
-        const targetCrs = activeRasterCrs || rasterMetadata?.nativeCRS || 'EPSG:4326';
+        // Match geometry target CRS to the WCS coverage request CRS (degrees vs projected meters)
+        const targetCrs = isCoverageProjected ? (activeRasterCrs || rasterMetadata?.nativeCRS || 'EPSG:4326') : 'EPSG:4326';
         const transformedGeom = await transformGeoJSONGeometry(rawGeom, geomSourceCRS, targetCrs);
 
         // Pre-validate intersection with raster bounding box if metadata is present
         if (rasterMetadata && rasterMetadata.bbox) {
-          const validation = validateCropIntersection(transformedGeom, rasterMetadata);
+          const validation = validateCropIntersection(transformedGeom, {
+            ...rasterMetadata,
+            bbox: nativeBbox,
+            latLonBbox: latLonBbox
+          });
           if (!validation.valid) {
             throw new Error(validation.error);
           }

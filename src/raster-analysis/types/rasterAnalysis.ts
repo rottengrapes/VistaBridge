@@ -19,6 +19,7 @@ export interface RasterBoundingBox {
 
 export interface RasterMetadata {
   layerName: string;
+  wcsCoverageId?: string;
   nativeCRS: string;
   bbox: RasterBoundingBox;
   latLonBbox?: RasterBoundingBox;

@@ -58,6 +58,7 @@ export default function RasterLayerSelector({
 
       const inMemoryMeta: RasterMetadata = {
         layerName: selectedLayer.id,
+        wcsCoverageId: selectedLayer.id.includes(':') ? (selectedLayer.id.split(':').pop() || selectedLayer.id) : selectedLayer.id,
         title: selectedLayer.name || selectedLayer.id,
         nativeCRS: selectedLayer.nativeCRS || 'EPSG:4326',
         bbox: bboxObj,
@@ -80,6 +81,24 @@ export default function RasterLayerSelector({
       })
       .catch(err => {
         console.warn('Failed to resolve raster metadata from GeoServer REST:', err);
+        if (isMounted) {
+          const matched = addedLayers.find(l => l.id === value || l.name === value);
+          const bboxObj = matched?.bbox ? {
+            minX: matched.bbox[0],
+            minY: matched.bbox[1],
+            maxX: matched.bbox[2],
+            maxY: matched.bbox[3],
+          } : { minX: -180, minY: -90, maxX: 180, maxY: 90 };
+          const cleanId = value.includes(':') ? (value.split(':').pop() || value) : value;
+          onChange(value, {
+            layerName: value,
+            wcsCoverageId: cleanId,
+            title: matched?.name || value,
+            nativeCRS: matched?.nativeCRS || 'EPSG:4326',
+            bbox: bboxObj,
+            latLonBbox: bboxObj,
+          });
+        }
       });
 
     return () => { isMounted = false; };

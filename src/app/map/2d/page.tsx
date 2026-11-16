@@ -12,7 +12,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 'use client';
 
-import React, { useEffect, useState, useRef, Suspense, useCallback } from 'react';
+import React, { useEffect, useState, useRef, Suspense, useCallback, useMemo } from 'react';
 import { useRouter, useSearchParams, useParams, usePathname } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useConfigStore } from '@/store/useConfigStore';
@@ -75,8 +75,21 @@ import { sampleRasterPixel } from '@/raster-analysis/services/rasterPixelSample'
 import { siteConfig } from '@/config/site-config';
 
 import Feature from 'ol/Feature';
-import { fetchWfsLayerSchema, type WfsLayerSchema } from '@/lib/gis/describeFeatureType';
-import { buildInsertXml, buildUpdateXml, buildDeleteXml, executeWfsTransaction } from '@/lib/gis/wfsTransaction';
+import {
+  fetchWfsLayerSchema,
+  type WfsLayerSchema,
+  getFieldPlaceholder,
+  inferFieldType
+} from '@/lib/gis/describeFeatureType';
+import {
+  buildInsertXml,
+  buildUpdateXml,
+  buildDeleteXml,
+  executeWfsTransaction,
+  executeAdaptiveWfsInsert,
+  executeAdaptiveWfsUpdate,
+  executeAdaptiveWfsDelete,
+} from '@/lib/gis/wfsTransaction';
 
 // OpenLayers Imports
 import 'ol/ol.css';
@@ -705,6 +718,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   const [newFeatureGeometry, setNewFeatureGeometry] = useState<any | null>(null);
   const [newFeatureValues, setNewFeatureValues] = useState<Record<string, any>>({});
   const [wfsLayerSchema, setWfsLayerSchema] = useState<WfsLayerSchema | null>(null);
+  const [editingSchema, setEditingSchema] = useState<WfsLayerSchema | null>(null);
   const wfsDrawRef = useRef<any>(null);
   const wfsDrawActiveRef = useRef<boolean>(false);
   const wfsFeatureSourceRef = useRef<VectorSource | null>(null);
@@ -4852,15 +4866,19 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   }, []);
 
   const startWfsDraw = useCallback(async (layerId: string) => {
+    if (isQuick) return;
     if (!mapInstance.current || !layerId) return;
 
     stopWfsDraw();
     stopMeasurement();
     stopDrawingAnnotation();
     stopQueryDraw();
+    setEditingFeatureId(null);
+    setInfoData([]);
+    setEditingSchema(null);
 
     const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
-    const geoserverAuth = user?.geoserverAuth;
+    const geoserverAuth = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
     const targetAddedLayer = addedLayers.find(l => l.id === layerId || l.name === layerId);
     const layerKnownCrs = targetAddedLayer?.nativeCRS;
@@ -4942,9 +4960,17 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         description: err?.message || 'Could not fetch layer schema for drawing.',
       });
     }
-  }, [stopWfsDraw, stopMeasurement, stopDrawingAnnotation, stopQueryDraw, user?.geoserverUrl, user?.geoserverAuth, addedLayers, notification]);
+  }, [isQuick, stopWfsDraw, stopMeasurement, stopDrawingAnnotation, stopQueryDraw, user?.geoserverUrl, user?.geoserverAuth, addedLayers, notification]);
 
   const handleCreateFeature = async () => {
+    if (isQuick) {
+      notification.warning({
+        message: 'Editing Disabled',
+        description: 'Feature creation is not permitted in Quick Map mode.',
+      });
+      return;
+    }
+
     if (!newFeatureGeometry) {
       notification.warning({
         message: 'Geometry Required',
@@ -4957,7 +4983,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
 
     setIsWfsSaving(true);
     const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
-    const geoserverAuth = user?.geoserverAuth;
+    const geoserverAuth = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
     try {
       // If the layer schema has MAPCOLOR9 (e.g. ne:countries) and not specified, default to '1' so GeoServer renders fill
@@ -4966,18 +4992,36 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         finalAttrs.MAPCOLOR9 = '1';
       }
 
-      const xml = buildInsertXml({
-        workspace: wfsLayerSchema.workspace,
-        layerName: wfsLayerSchema.layerName,
-        targetNamespace: wfsLayerSchema.targetNamespace,
-        geomFieldName: wfsLayerSchema.geomFieldName,
-        geomType: wfsLayerSchema.geomType,
-        srsName: wfsLayerSchema.srsName || 'http://www.opengis.net/gml/srs/epsg.xml#4326',
-        geometry: newFeatureGeometry,
-        attributes: finalAttrs,
+      // Sanitize attributes according to schema to avoid casting errors on backend (e.g. empty strings on int/float)
+      wfsLayerSchema.attributes.forEach(attr => {
+        const val = finalAttrs[attr.name];
+        if (val === '' || val === undefined || val === null) {
+          delete finalAttrs[attr.name];
+        } else if (attr.type === 'integer') {
+          const parsed = parseInt(String(val), 10);
+          if (!isNaN(parsed)) finalAttrs[attr.name] = parsed;
+          else delete finalAttrs[attr.name];
+        } else if (attr.type === 'float') {
+          const parsed = parseFloat(String(val));
+          if (!isNaN(parsed)) finalAttrs[attr.name] = parsed;
+          else delete finalAttrs[attr.name];
+        }
       });
 
-      const result = await executeWfsTransaction(geoserverUrl, xml, wfsLayerSchema.workspace, geoserverAuth);
+      const result = await executeAdaptiveWfsInsert(
+        {
+          workspace: wfsLayerSchema.workspace,
+          layerName: wfsLayerSchema.layerName,
+          targetNamespace: wfsLayerSchema.targetNamespace,
+          geomFieldName: wfsLayerSchema.geomFieldName,
+          geomType: wfsLayerSchema.geomType,
+          srsName: wfsLayerSchema.srsName || 'EPSG:4326',
+          geometry: newFeatureGeometry,
+          attributes: finalAttrs,
+        },
+        geoserverUrl,
+        geoserverAuth
+      );
 
       if (result.success) {
         const geomToHighlight = newFeatureGeometry;
@@ -5083,10 +5127,19 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       });
     } finally {
       setIsWfsSaving(false);
+      setEditingSchema(null);
     }
   };
 
   const handleSaveUpdateFeature = async (feature: any) => {
+    if (isQuick) {
+      notification.warning({
+        message: 'Editing Disabled',
+        description: 'Feature modification is not permitted in Quick Map mode.',
+      });
+      return;
+    }
+
     const targetLayerId = feature.layerId || selectedWfsLayerId;
     if (!targetLayerId) {
       notification.error({ message: 'Error', description: 'Could not identify target layer.' });
@@ -5095,22 +5148,40 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
 
     setIsWfsSaving(true);
     const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
-    const geoserverAuth = user?.geoserverAuth;
+    const geoserverAuth = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
     try {
       const schema = await fetchWfsLayerSchema(targetLayerId, geoserverUrl, geoserverAuth);
 
-      const xml = buildUpdateXml({
-        workspace: schema.workspace,
-        layerName: schema.layerName,
-        targetNamespace: schema.targetNamespace,
-        geomFieldName: schema.geomFieldName,
-        srsName: schema.srsName || 'EPSG:4326',
-        fid: feature.fid || feature.id,
-        updatedAttributes: editValues,
+      const sanitizedEditValues: Record<string, any> = { ...editValues };
+      schema.attributes.forEach(attr => {
+        const val = sanitizedEditValues[attr.name];
+        if (val === '' || val === undefined || val === null) {
+          delete sanitizedEditValues[attr.name];
+        } else if (attr.type === 'integer') {
+          const parsed = parseInt(String(val), 10);
+          if (!isNaN(parsed)) sanitizedEditValues[attr.name] = parsed;
+          else delete sanitizedEditValues[attr.name];
+        } else if (attr.type === 'float') {
+          const parsed = parseFloat(String(val));
+          if (!isNaN(parsed)) sanitizedEditValues[attr.name] = parsed;
+          else delete sanitizedEditValues[attr.name];
+        }
       });
 
-      const result = await executeWfsTransaction(geoserverUrl, xml, schema.workspace, geoserverAuth);
+      const result = await executeAdaptiveWfsUpdate(
+        {
+          workspace: schema.workspace,
+          layerName: schema.layerName,
+          targetNamespace: schema.targetNamespace,
+          geomFieldName: schema.geomFieldName,
+          srsName: schema.srsName || 'EPSG:4326',
+          fid: feature.fid || feature.id,
+          updatedAttributes: sanitizedEditValues,
+        },
+        geoserverUrl,
+        geoserverAuth
+      );
 
       if (result.success) {
         notification.success({
@@ -5184,10 +5255,19 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       });
     } finally {
       setIsWfsSaving(false);
+      setEditingSchema(null);
     }
   };
 
   const handleDeleteFeature = async (feature: any) => {
+    if (isQuick) {
+      notification.warning({
+        message: 'Editing Disabled',
+        description: 'Feature deletion is not permitted in Quick Map mode.',
+      });
+      return;
+    }
+
     const targetLayerId = feature.layerId || selectedWfsLayerId;
     if (!targetLayerId) {
       notification.error({ message: 'Error', description: 'Could not identify target layer.' });
@@ -5196,20 +5276,22 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
 
     setIsWfsSaving(true);
     const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
-    const geoserverAuth = user?.geoserverAuth;
+    const geoserverAuth = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
     try {
       const schema = await fetchWfsLayerSchema(targetLayerId, geoserverUrl, geoserverAuth);
 
-      const xml = buildDeleteXml({
-        workspace: schema.workspace,
-        layerName: schema.layerName,
-        targetNamespace: schema.targetNamespace,
-        geomFieldName: schema.geomFieldName,
-        fid: feature.fid || feature.id,
-      });
-
-      const result = await executeWfsTransaction(geoserverUrl, xml, schema.workspace, geoserverAuth);
+      const result = await executeAdaptiveWfsDelete(
+        {
+          workspace: schema.workspace,
+          layerName: schema.layerName,
+          targetNamespace: schema.targetNamespace,
+          geomFieldName: schema.geomFieldName,
+          fid: feature.fid || feature.id,
+        },
+        geoserverUrl,
+        geoserverAuth
+      );
 
       if (result.success) {
         notification.success({
@@ -5272,6 +5354,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       });
     } finally {
       setIsWfsSaving(false);
+      setEditingSchema(null);
     }
   };
 
@@ -5294,6 +5377,89 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       stopMeasurement();
       stopDrawingAnnotation();
     }
+  };
+
+  // Helper to format feature display titles and badges cleanly without redundant layer prefixes
+  const formatFeatureDisplayInfo = (
+    layerName: string,
+    props: Record<string, any> = {},
+    fid?: string,
+    index: number = 0
+  ) => {
+    // 1. Clean layer name by removing workspace prefix (e.g. 'ne:ne_10m_admin_0_countries_ind' -> 'ne_10m_admin_0_countries_ind')
+    let cleanLayerName = (layerName || '').trim();
+    if (cleanLayerName.includes(':')) {
+      cleanLayerName = cleanLayerName.split(':').pop() || cleanLayerName;
+    }
+    if (!cleanLayerName) {
+      cleanLayerName = 'Layer';
+    }
+
+    // 2. Extract feature id number/suffix (e.g. 'ne_10m_admin_0_countries_ind.9' -> '#9')
+    let featureBadge = '';
+    if (fid) {
+      const fidParts = fid.split(/[.:]/);
+      const lastPart = fidParts[fidParts.length - 1];
+      if (lastPart && /^\d+$/.test(lastPart)) {
+        featureBadge = `#${lastPart}`;
+      } else if (lastPart && lastPart !== cleanLayerName) {
+        featureBadge = `#${lastPart}`;
+      } else {
+        featureBadge = `#${index + 1}`;
+      }
+    } else {
+      featureBadge = `#${index + 1}`;
+    }
+
+    // 3. Find a meaningful property for the feature title (case-insensitive check)
+    const priorityKeys = [
+      'name', 'name_en', 'name_long', 'formal_en', 'admin', 'sovereignt',
+      'country', 'cntry_name', 'state', 'state_name', 'province', 'district',
+      'city', 'place', 'placename', 'label', 'title', 'admo_a3_in', 'adm0_a3',
+      'iso_a3', 'iso_a2', 'code', 'featurecla', 'type', 'category'
+    ];
+
+    let meaningfulName: string | null = null;
+    const propEntries = Object.entries(props || {});
+
+    for (const pKey of priorityKeys) {
+      const matched = propEntries.find(([k]) => k.toLowerCase() === pKey.toLowerCase());
+      if (matched && matched[1] !== undefined && matched[1] !== null) {
+        const valStr = String(matched[1]).trim();
+        if (valStr && valStr !== layerName && valStr !== cleanLayerName && valStr !== fid) {
+          meaningfulName = valStr;
+          break;
+        }
+      }
+    }
+
+    // Fallback: any non-internal string property with sensible length
+    if (!meaningfulName) {
+      for (const [k, v] of propEntries) {
+        if (
+          !['geometry', 'layer', 'bbox', 'id', 'fid', 'objectid', 'gid'].includes(k.toLowerCase()) &&
+          typeof v === 'string' &&
+          v.trim().length > 0 &&
+          v.trim().length <= 60 &&
+          v.trim() !== layerName &&
+          v.trim() !== cleanLayerName &&
+          v.trim() !== fid
+        ) {
+          meaningfulName = v.trim();
+          break;
+        }
+      }
+    }
+
+    const displayName = meaningfulName || (featureBadge ? `Feature ${featureBadge}` : (fid || `Feature #${index + 1}`));
+    const title = `${cleanLayerName} - ${displayName}`;
+
+    return {
+      cleanLayerName,
+      displayName,
+      featureBadge,
+      title
+    };
   };
 
   // Map click listener for Info Popup
@@ -5336,8 +5502,8 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
           }));
 
         const layerName = layer?.get?.('name') || '';
-        const nameAttr = props.name || props.title || props.id || feature.getId() || `Feature #${index + 1}`;
-        const titleStr = layerName ? `${layerName} - ${nameAttr}` : String(nameAttr);
+        const layerId = layer?.get?.('id') || layerName;
+        const displayInfo = formatFeatureDisplayInfo(layerName, props, feature.getId()?.toString(), index);
 
         const geom = feature.getGeometry();
         let geomObj: any = null;
@@ -5352,11 +5518,14 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         return {
           id: feature.getId()?.toString() || `f_${index}_${Date.now()}`,
           fid: feature.getId()?.toString(),
-          layerId: layerName,
-          layerName,
+          layerId: layerId,
+          layerName: layerName || layerId,
+          cleanLayerName: displayInfo.cleanLayerName,
+          displayName: displayInfo.displayName,
+          featureBadge: displayInfo.featureBadge,
           geometry: geomObj,
           properties: props,
-          title: titleStr,
+          title: displayInfo.title,
           rows: tableRows
         };
       });
@@ -5440,15 +5609,18 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                           value: typeof val === 'object' ? JSON.stringify(val) : String(val)
                         }));
 
-                        const nameAttr = props.name || props.title || props.id || feature.id || `Feature #${idx + 1}`;
+                        const displayInfo = formatFeatureDisplayInfo(layer.name, props, feature.id, idx);
                         wmsInfos.push({
                           id: feature.id || `wms_${layer.id}_${idx}_${Date.now()}`,
                           fid: feature.id,
                           layerId: layer.id,
                           layerName: layer.name,
+                          cleanLayerName: displayInfo.cleanLayerName,
+                          displayName: displayInfo.displayName,
+                          featureBadge: displayInfo.featureBadge,
                           geometry: feature.geometry,
                           properties: props,
-                          title: `${layer.name} - ${nameAttr}`,
+                          title: displayInfo.title,
                           rows
                         });
                       });
@@ -5511,15 +5683,18 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                     attribute: key,
                     value: typeof val === 'object' ? JSON.stringify(val) : String(val)
                   }));
-                  const nameAttr = props.name || props.title || props.id || feature.id || `Feature #${idx + 1}`;
+                  const displayInfo = formatFeatureDisplayInfo(layer.name, props, feature.id, idx);
                   wmsInfos.push({
                     id: feature.id || `spatial_${layer.id}_${idx}_${Date.now()}`,
                     fid: feature.id,
                     layerId: layer.id,
                     layerName: layer.name,
+                    cleanLayerName: displayInfo.cleanLayerName,
+                    displayName: displayInfo.displayName,
+                    featureBadge: displayInfo.featureBadge,
                     geometry: feature.geometry,
                     properties: props,
-                    title: `${layer.name} - ${nameAttr}`,
+                    title: displayInfo.title,
                     rows
                   });
                 });
@@ -5577,9 +5752,15 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 });
               });
 
+              const cleanRasterName = layer.name ? (layer.name.includes(':') ? layer.name.split(':').pop()! : layer.name) : 'Raster';
               rasterInfos.push({
                 id: `raster_${layer.id}_${Date.now()}`,
-                title: layer.name,
+                layerId: layer.id,
+                layerName: layer.name,
+                cleanLayerName: cleanRasterName,
+                displayName: 'Pixel Value',
+                featureBadge: 'Raster',
+                title: `${cleanRasterName} - Pixel Value`,
                 rows
               });
             }
@@ -5590,9 +5771,68 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
       }
 
       const allResults = [...parsedFeatures, ...rasterInfos, ...wmsInfos];
-      setInfoData(allResults);
+
+      // Helper to compute layer zIndex (top-most in layer list / highest zIndex)
+      const getLayerZIndex = (layerIdOrName: string): number => {
+        if (!layerIdOrName) return -1;
+        const cleanTarget = layerIdOrName.includes(':') ? layerIdOrName.split(':').pop()! : layerIdOrName;
+
+        // 1. Find matching layer in addedLayers
+        const matchedLayer = addedLayers.find(l =>
+          l.id === layerIdOrName ||
+          l.name === layerIdOrName ||
+          (l.id && l.id.split(':').pop() === cleanTarget) ||
+          (l.name && l.name.split(':').pop() === cleanTarget)
+        );
+
+        const targetId = matchedLayer?.id || layerIdOrName;
+        const targetName = matchedLayer?.name || layerIdOrName;
+        const olLayer = olLayersRef.current[targetId] || olLayersRef.current[targetName];
+
+        let olZ = -1;
+        if (olLayer && typeof olLayer.getZIndex === 'function') {
+          const z = olLayer.getZIndex();
+          if (typeof z === 'number' && !isNaN(z)) {
+            olZ = z;
+          }
+        }
+
+        // 2. Position in addedLayers array (higher index = higher in layer list = placed above other layers)
+        const arrayIdx = addedLayers.findIndex(l =>
+          l.id === layerIdOrName ||
+          l.name === layerIdOrName ||
+          (l.id && l.id.split(':').pop() === cleanTarget) ||
+          (l.name && l.name.split(':').pop() === cleanTarget)
+        );
+
+        if (olZ >= 0) {
+          return olZ;
+        }
+        return arrayIdx >= 0 ? arrayIdx + 1 : 0;
+      };
+
+      let finalResults = allResults;
       if (allResults.length > 0) {
-        const firstVector = allResults.find(f => f.layerId);
+        // Find the maximum zIndex among all layers that returned features
+        let maxZ = -Infinity;
+        allResults.forEach(item => {
+          const idToTest = item.layerId || item.layerName;
+          const z = getLayerZIndex(idToTest);
+          if (z > maxZ) {
+            maxZ = z;
+          }
+        });
+
+        // Retain ONLY features belonging to the top-most layer(s) matching maxZ
+        finalResults = allResults.filter(item => {
+          const idToTest = item.layerId || item.layerName;
+          return getLayerZIndex(idToTest) === maxZ;
+        });
+      }
+
+      setInfoData(finalResults);
+      if (finalResults.length > 0) {
+        const firstVector = finalResults.find(f => f.layerId);
         if (firstVector && firstVector.layerId) {
           setSelectedWfsLayerId(firstVector.layerId);
         }
@@ -5602,21 +5842,17 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
           highlightSourceRef.current.clear();
         }
 
-        if (activePanel === 'gotoXY') {
-          // Do not close the go to xy panel and also do not open the features details panel.
-          // The results are populated in infoData so they can be viewed via the info button.
-        } else if (isLeftPanelOpen && leftPanelMode === 'info') {
-          // If user already opened the info panel, keep it open with the updated details
+        // Do not auto-open the left panel on map click; the user opens it by clicking the Info icon.
+        // If the info panel is already open, keep it in 'info' mode with the updated data.
+        if (isLeftPanelOpen && leftPanelMode === 'info') {
           setLeftPanelMode('info');
         }
       } else {
-        // When clicking empty space with no features, clear highlight
+        // When clicking empty space with no features, clear highlight and info data
         if (highlightSourceRef.current) {
           highlightSourceRef.current.clear();
         }
-        if (isLeftPanelOpen && leftPanelMode === 'info') {
-          setIsLeftPanelOpen(false);
-        }
+        setInfoData([]);
       }
     };
 
@@ -6214,6 +6450,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
             mapInstance={mapInstance.current}
             addedLayers={addedLayers}
             mapId={mapDetail?.id || identifier || mapId}
+            isQuickMap={isQuick}
           />
           {!isMobile && <Divider type="vertical" className="h-6 bg-gray-100 !m-0" />}
           {isQuick ? (
@@ -6427,15 +6664,22 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
           </Tooltip>
 
           {/* Toggle Info Popup */}
-          <Tooltip title="Toggle Info Popup" placement="right">
+          <Tooltip title="Toggle Feature Information" placement="right">
             <Button
               type="text"
               icon={
-                (isLeftPanelOpen && leftPanelMode === 'info') ? (
-                  <X size={20} className="text-primary transition-colors animate-in spin duration-300" />
-                ) : (
-                  <Info size={20} className="text-gray-500 hover:text-primary transition-colors" />
-                )
+                <div className="relative flex items-center justify-center">
+                  {(isLeftPanelOpen && leftPanelMode === 'info') ? (
+                    <X size={20} className="text-primary transition-colors animate-in spin duration-300" />
+                  ) : (
+                    <Info size={20} className={infoData.length > 0 ? 'text-primary' : 'text-gray-500 hover:text-primary transition-colors'} />
+                  )}
+                  {infoData.length > 0 && !isLeftPanelOpen && (
+                    <span className="absolute -top-1.5 -right-2 min-w-4 h-4 px-1 bg-red-500 text-white rounded-full flex items-center justify-center text-[9px] font-bold border border-white shadow-xs">
+                      {infoData.length}
+                    </span>
+                  )}
+                </div>
               }
               onClick={toggleInfoActive}
               className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
@@ -6481,84 +6725,86 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
             {leftPanelMode === 'info' ? (
               <div className="flex-grow overflow-y-auto p-4 flex flex-col gap-4">
                 {/* Layer Selection and Add Feature Toolbar */}
-                <div className="flex flex-col gap-2.5 bg-gray-50/90 p-3 rounded-xl border border-gray-200">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] uppercase font-bold text-gray-500 tracking-wider">
-                      Target Vector Layer
-                    </span>
-                    {addedLayers.filter(l => l.type === 'VECTOR').length > 0 && (
-                      <span className="text-[10px] text-gray-400 font-medium">
-                        {addedLayers.filter(l => l.type === 'VECTOR').length} vector layer{addedLayers.filter(l => l.type === 'VECTOR').length > 1 ? 's' : ''}
+                {!isQuick && (
+                  <div className="flex flex-col gap-2.5 bg-gray-50/90 p-3 rounded-xl border border-gray-200">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] uppercase font-bold text-gray-500 tracking-wider">
+                        Target Vector Layer
                       </span>
-                    )}
-                  </div>
-                  {(() => {
-                    const activeVectorLayers = addedLayers.filter(l => l.type === 'VECTOR');
-                    const hasSelected = activeVectorLayers.some(l => l.id === selectedWfsLayerId || l.name === selectedWfsLayerId);
-                    const currentVal = hasSelected ? selectedWfsLayerId : (activeVectorLayers[0]?.id || undefined);
+                      {addedLayers.filter(l => l.type === 'VECTOR').length > 0 && (
+                        <span className="text-[10px] text-gray-400 font-medium">
+                          {addedLayers.filter(l => l.type === 'VECTOR').length} vector layer{addedLayers.filter(l => l.type === 'VECTOR').length > 1 ? 's' : ''}
+                        </span>
+                      )}
+                    </div>
+                    {(() => {
+                      const activeVectorLayers = addedLayers.filter(l => l.type === 'VECTOR');
+                      const hasSelected = activeVectorLayers.some(l => l.id === selectedWfsLayerId || l.name === selectedWfsLayerId);
+                      const currentVal = hasSelected ? selectedWfsLayerId : (activeVectorLayers[0]?.id || undefined);
 
-                    return (
-                      <>
-                        <Select
-                          size="middle"
-                          value={currentVal}
-                          disabled={activeVectorLayers.length === 0}
-                          onChange={(val) => {
-                            setSelectedWfsLayerId(val);
-                            setIsAddFeatureActive(false);
-                            stopWfsDraw();
-                            highlightSourceRef.current?.clear();
-                          }}
-                          className="w-full text-xs font-semibold"
-                          placeholder={activeVectorLayers.length === 0 ? "No vector layers on map" : "Select vector layer"}
-                          popupMatchSelectWidth={false}
-                          options={activeVectorLayers.map(l => ({ label: l.name, value: l.id }))}
-                        />
-                        <Button
-                          type={isAddFeatureActive ? 'default' : 'primary'}
-                          disabled={activeVectorLayers.length === 0}
-                          icon={isAddFeatureActive ? <X size={14} /> : <Plus size={14} />}
-                          onClick={() => {
-                            if (isAddFeatureActive) {
+                      return (
+                        <>
+                          <Select
+                            size="middle"
+                            value={currentVal}
+                            disabled={activeVectorLayers.length === 0}
+                            onChange={(val) => {
+                              setSelectedWfsLayerId(val);
                               setIsAddFeatureActive(false);
-                              setNewFeatureGeometry(null);
                               stopWfsDraw();
-                              wfsFeatureSourceRef.current?.clear();
                               highlightSourceRef.current?.clear();
-                            } else {
-                              const targetId = currentVal;
-                              if (!targetId) {
-                                notification.warning({
-                                  message: 'No Vector Layer',
-                                  description: 'Please add a vector layer to the map first before inserting features.',
-                                });
-                                return;
+                            }}
+                            className="w-full text-xs font-semibold"
+                            placeholder={activeVectorLayers.length === 0 ? "No vector layers on map" : "Select vector layer"}
+                            popupMatchSelectWidth={false}
+                            options={activeVectorLayers.map(l => ({ label: l.name, value: l.id }))}
+                          />
+                          <Button
+                            type={isAddFeatureActive ? 'default' : 'primary'}
+                            disabled={activeVectorLayers.length === 0}
+                            icon={isAddFeatureActive ? <X size={14} /> : <Plus size={14} />}
+                            onClick={() => {
+                              if (isAddFeatureActive) {
+                                setIsAddFeatureActive(false);
+                                setNewFeatureGeometry(null);
+                                stopWfsDraw();
+                                wfsFeatureSourceRef.current?.clear();
+                                highlightSourceRef.current?.clear();
+                              } else {
+                                const targetId = currentVal;
+                                if (!targetId) {
+                                  notification.warning({
+                                    message: 'No Vector Layer',
+                                    description: 'Please add a vector layer to the map first before inserting features.',
+                                  });
+                                  return;
+                                }
+                                setSelectedWfsLayerId(targetId);
+                                startWfsDraw(targetId);
                               }
-                              setSelectedWfsLayerId(targetId);
-                              startWfsDraw(targetId);
-                            }
-                          }}
-                          className={`w-full text-xs font-medium flex items-center justify-center gap-1.5 h-8 ${isAddFeatureActive ? 'border-red-300 text-red-600 hover:text-red-700 hover:border-red-400' : ''}`}
-                        >
-                          {isAddFeatureActive ? 'Cancel Adding Feature' : 'Add Feature'}
-                        </Button>
-                        {activeVectorLayers.length === 0 && (
-                          <span className="text-[11px] text-gray-400 italic">
-                            Only vector layers saved on this map can be edited.
-                          </span>
-                        )}
-                      </>
-                    );
-                  })()}
-                </div>
+                            }}
+                            className={`w-full text-xs font-medium flex items-center justify-center gap-1.5 h-8 ${isAddFeatureActive ? 'border-red-300 text-red-600 hover:text-red-700 hover:border-red-400' : ''}`}
+                          >
+                            {isAddFeatureActive ? 'Cancel Adding Feature' : 'Add Feature'}
+                          </Button>
+                          {activeVectorLayers.length === 0 && (
+                            <span className="text-[11px] text-gray-400 italic">
+                              Only vector layers saved on this map can be edited.
+                            </span>
+                          )}
+                        </>
+                      );
+                    })()}
+                  </div>
+                )}
 
                 {/* Add Feature Card (Form with identical ATTRIBUTE | VALUE structure) */}
-                {isAddFeatureActive && (
+                {!isQuick && isAddFeatureActive && (
                   <div className="flex flex-col gap-2 p-3 bg-blue-50/40 border border-blue-200 rounded-xl animate-in fade-in duration-200">
                     <div className="text-xs font-extrabold text-blue-900 border-b border-blue-200 pb-1.5 flex items-center justify-between">
                       <span className="flex items-center gap-1.5 truncate">
                         <Plus size={14} className="text-blue-600 shrink-0" />
-                        <span className="truncate">New Feature - {selectedWfsLayerId}</span>
+                        <span className="truncate">New Feature</span>
                       </span>
                       <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-100 text-blue-800 shrink-0">
                         {newFeatureGeometry ? '✓ Geometry Drawn' : 'Click Map to Draw'}
@@ -6610,7 +6856,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                                 <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600">
                                   <Input
                                     size="small"
-                                    placeholder={`Enter ${attr.name}`}
+                                    placeholder={getFieldPlaceholder(attr.type, attr.required)}
                                     value={newFeatureValues[attr.name] ?? ''}
                                     onChange={(e) =>
                                       setNewFeatureValues(prev => ({ ...prev, [attr.name]: e.target.value }))
@@ -6656,19 +6902,34 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 )}
 
                 {/* Identified Existing Features List */}
-                {infoData.length > 0 ? (
+                {!isAddFeatureActive && infoData.length > 0 ? (
                   <div className="flex flex-col gap-4">
                     <div className="text-[10px] uppercase font-bold text-gray-400">
                       Found {infoData.length} Feature{infoData.length > 1 ? 's' : ''}
                     </div>
-                    {infoData.map((feature) => {
-                      const isEditing = editingFeatureId === feature.id;
-                      const canEdit = !!feature.fid;
+                    {infoData.map((feature, fIdx) => {
+                      const isEditing = !isQuick && editingFeatureId === feature.id;
+                      const canEdit = !isQuick && !!feature.fid;
 
                       return (
-                        <div key={feature.id} className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-150 rounded-xl">
-                          <div className="text-xs font-extrabold text-gray-700 border-b border-gray-200 pb-1.5 flex items-center justify-between">
-                            <span className="truncate flex-1 pr-2" title={feature.title}>{feature.title}</span>
+                        <div key={feature.id} className="flex flex-col gap-2 p-3 bg-gray-50 border border-gray-150 rounded-xl shadow-xs">
+                          <div className="border-b border-gray-200 pb-2 flex items-start justify-between gap-2">
+                            <div className="flex flex-col min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5 flex-wrap mb-1">
+                                <span
+                                  className="text-[10px] font-semibold text-primary bg-primary/10 px-1.5 py-0.5 rounded max-w-[220px] truncate"
+                                  title={feature.layerName || feature.cleanLayerName}
+                                >
+                                  {feature.cleanLayerName || feature.layerName || 'Layer'}
+                                </span>
+                              </div>
+                              <span
+                                className="text-xs font-extrabold text-gray-800 truncate block"
+                                title={feature.displayName || feature.title}
+                              >
+                                {feature.displayName || feature.title}
+                              </span>
+                            </div>
                             {canEdit && !isEditing && (
                               <div className="flex items-center gap-1 shrink-0">
                                 <Tooltip title="Edit Attributes">
@@ -6683,6 +6944,14 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                                         initialVals[r.attribute] = r.value;
                                       });
                                       setEditValues(initialVals);
+                                      const targetLayer = feature.layerId || selectedWfsLayerId;
+                                      if (targetLayer) {
+                                        const geoserverUrl = getActiveGeoserverUrl(user?.geoserverUrl);
+                                        const geoserverAuth = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
+                                        fetchWfsLayerSchema(targetLayer, geoserverUrl, geoserverAuth)
+                                          .then((s) => setEditingSchema(s))
+                                          .catch(() => {});
+                                      }
                                     }}
                                     className="w-6 h-6 flex items-center justify-center p-0 rounded-lg hover:bg-gray-200"
                                   />
@@ -6723,25 +6992,36 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {feature.rows.map((row: any, rIdx: number) => (
-                                    <tr key={row.key} className={rIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50/20'}>
-                                      <td className="px-2.5 py-1.5 border-b border-gray-100 font-semibold text-gray-700 break-words w-5/12">{row.attribute}</td>
-                                      <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600 font-mono text-[10px]">
-                                        {isEditing ? (
-                                          <Input
-                                            size="small"
-                                            value={editValues[row.attribute] ?? row.value}
-                                            onChange={(e) =>
-                                              setEditValues(prev => ({ ...prev, [row.attribute]: e.target.value }))
-                                            }
-                                            className="text-[10px] h-6 px-1.5"
-                                          />
-                                        ) : (
-                                          <span className="break-words">{row.value}</span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  ))}
+                                  {feature.rows.map((row: any, rIdx: number) => {
+                                    const schemaAttr = (editingSchema || wfsLayerSchema)?.attributes?.find(
+                                      (a) => a.name.toLowerCase() === row.attribute.toLowerCase()
+                                    );
+                                    const fieldType = schemaAttr ? schemaAttr.type : inferFieldType(row.value);
+                                    const isRequired = schemaAttr ? schemaAttr.required : false;
+
+                                    return (
+                                      <tr key={row.key} className={rIdx % 2 === 0 ? 'bg-white' : 'bg-gray-50/20'}>
+                                        <td className="px-2.5 py-1.5 border-b border-gray-100 font-semibold text-gray-700 break-words w-5/12">
+                                          {row.attribute}
+                                        </td>
+                                        <td className="px-2.5 py-1.5 border-b border-gray-100 text-gray-600 font-mono text-[10px]">
+                                          {isEditing ? (
+                                            <Input
+                                              size="small"
+                                              value={editValues[row.attribute] ?? row.value}
+                                              placeholder={getFieldPlaceholder(fieldType, isRequired)}
+                                              onChange={(e) =>
+                                                setEditValues(prev => ({ ...prev, [row.attribute]: e.target.value }))
+                                              }
+                                              className="text-[10px] h-6 px-1.5"
+                                            />
+                                          ) : (
+                                            <span className="break-words">{row.value}</span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
                                 </tbody>
                               </table>
                             </div>
@@ -6756,6 +7036,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                                 onClick={() => {
                                   setEditingFeatureId(null);
                                   setEditValues({});
+                                  setEditingSchema(null);
                                 }}
                                 className="text-xs h-7"
                               >
@@ -6779,7 +7060,9 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 ) : (
                   !isAddFeatureActive && (
                     <div className="text-center py-8 text-gray-400 text-xs italic">
-                      No feature selected. Click on a vector layer on the map or click &quot;Add Feature&quot;.
+                      {isQuick
+                        ? 'No feature selected. Click on a feature on the map to view its details.'
+                        : 'No feature selected. Click on a vector layer on the map or click "Add Feature".'}
                     </div>
                   )
                 )}
@@ -7555,6 +7838,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
               isDrawing={isDrawing}
               getLayerFeatures={getLayerFeaturesLocal}
               allDatasets={datasetsList}
+              geoserverUrl={getActiveGeoserverUrl(user?.geoserverUrl)}
             />
           )}
 

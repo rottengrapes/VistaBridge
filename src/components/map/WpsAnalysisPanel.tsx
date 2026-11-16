@@ -21,6 +21,8 @@ import React, { useState, useEffect } from 'react';
 import { Button, Select, Input, Spin, Segmented, Modal } from 'antd';
 import { X, Play, ArrowLeft, Search, Info, PenTool, CheckCircle2, RotateCcw, MapPin } from 'lucide-react';
 import RasterAnalysisPanel, { isExcludedRasterProcess } from '@/raster-analysis/components/RasterAnalysisPanel';
+import { useConfigStore } from '@/store/useConfigStore';
+import { useAuthStore } from '@/store/useAuthStore';
 
 interface LayerState {
   id: string;
@@ -46,6 +48,7 @@ interface WpsAnalysisPanelProps {
   isDrawing?: boolean;
   getLayerFeatures?: (layerId: string) => any;
   allDatasets?: any[];
+  geoserverUrl?: string;
 }
 
 interface ProcessInput {
@@ -396,7 +399,8 @@ export default function WpsAnalysisPanel({
   isMobile,
   isDrawing,
   getLayerFeatures,
-  allDatasets = []
+  allDatasets = [],
+  geoserverUrl: propGeoserverUrl
 }: WpsAnalysisPanelProps) {
   const [processes, setProcesses] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
@@ -413,7 +417,18 @@ export default function WpsAnalysisPanel({
   const [outputIdentifier, setOutputIdentifier] = useState<string>('result');
   const [resultLayerName, setResultLayerName] = useState<string>('');
 
-  const geoserverUrl = (user?.geoserverUrl || process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/$/, '');
+  const configGeoserverUrl = useConfigStore((s) => s.geoserverUrl);
+  const authGeoserverUrl = useAuthStore.getState().user?.geoserverUrl;
+  const geoserverUrl = (
+    propGeoserverUrl ||
+    user?.geoserverUrl ||
+    authGeoserverUrl ||
+    configGeoserverUrl ||
+    process.env.NEXT_PUBLIC_GEOSERVER_URL ||
+    'http://localhost:8080/geoserver'
+  ).replace(/\/$/, '');
+
+  const authHeader = user?.geoserverAuth || useAuthStore.getState().user?.geoserverAuth;
 
   // 1. Fetch available processes list
   useEffect(() => {
@@ -421,8 +436,8 @@ export default function WpsAnalysisPanel({
       setLoading(true);
       try {
         const headers: Record<string, string> = {};
-        if (user?.geoserverAuth) {
-          headers['Authorization'] = user.geoserverAuth;
+        if (authHeader) {
+          headers['Authorization'] = authHeader;
         }
         const res = await fetch(`${geoserverUrl}/wps?service=WPS&version=1.0.0&request=GetCapabilities`, { headers });
         if (!res.ok) throw new Error('Failed to fetch GetCapabilities');
@@ -505,7 +520,7 @@ export default function WpsAnalysisPanel({
     };
 
     fetchCapabilities();
-  }, [geoserverUrl, user?.geoserverAuth, notification]);
+  }, [geoserverUrl, authHeader, notification]);
 
   // 2. Fetch process details & dynamic parameters
   const handleSelectProcess = async (processId: string) => {
@@ -518,8 +533,8 @@ export default function WpsAnalysisPanel({
 
     try {
       const headers: Record<string, string> = {};
-      if (user?.geoserverAuth) {
-        headers['Authorization'] = user.geoserverAuth;
+      if (authHeader) {
+        headers['Authorization'] = authHeader;
       }
       const res = await fetch(`${geoserverUrl}/wps?service=WPS&version=1.0.0&request=DescribeProcess&identifier=${processId}`, { headers });
       if (!res.ok) throw new Error('Failed to fetch process description details.');
@@ -693,8 +708,8 @@ export default function WpsAnalysisPanel({
 
     try {
       const headers: Record<string, string> = {};
-      if (user?.geoserverAuth) {
-        headers['Authorization'] = user.geoserverAuth;
+      if (authHeader) {
+        headers['Authorization'] = authHeader;
       }
 
       // Build data inputs XML nodes dynamically
@@ -725,6 +740,7 @@ export default function WpsAnalysisPanel({
             const miny = bbox[1];
             const maxx = bbox[2];
             const maxy = bbox[3];
+            const cleanVal = val.includes(':') ? val.split(':').pop() || val : val;
 
             dataInputsXml += `
     <wps:Input>
@@ -732,7 +748,7 @@ export default function WpsAnalysisPanel({
       <wps:Reference mimeType="image/tiff" xlink:href="http://geoserver/wcs" method="POST">
         <wps:Body>
           <wcs:GetCoverage service="WCS" version="1.1.1">
-            <ows:Identifier>${val}</ows:Identifier>
+            <ows:Identifier>${cleanVal}</ows:Identifier>
             <wcs:DomainSubset>
               <ows:BoundingBox crs="urn:ogc:def:crs:EPSG::4326">
                 <ows:LowerCorner>${miny} ${minx}</ows:LowerCorner>
@@ -1329,6 +1345,7 @@ export default function WpsAnalysisPanel({
               onStopDrawGeom={onStopDrawGeom}
               allDatasets={allDatasets}
               isMobile={isMobile}
+              geoserverUrl={geoserverUrl}
             />
           </div>
         ) : loading ? (
