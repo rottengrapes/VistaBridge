@@ -29,6 +29,10 @@ export async function DELETE(request: Request) {
       );
     }
 
+    if (mapId === 'quick-map') {
+      return NextResponse.json({ success: true, ephemeral: true });
+    }
+
     await pool.query('DELETE FROM map_measurements WHERE map_id = $1', [mapId]);
 
     return NextResponse.json({ success: true });

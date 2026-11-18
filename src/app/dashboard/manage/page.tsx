@@ -85,7 +85,7 @@ export default function ManageDashboardsPage() {
   const { notification, modal } = App.useApp();
   const { token, hydrated, user } = useAuthStore();
   const isAdmin = useMemo(() => isUserAdmin(user), [user]);
-  const { globalSearch, setGlobalSearch } = useUIStore();
+  const { globalSearch, setGlobalSearch, setCreateDashboardModalOpen } = useUIStore();
   const [loading, setLoading] = useState(true);
   const [isMobile, setIsMobile] = useState(false);
 
@@ -120,40 +120,6 @@ export default function ManageDashboardsPage() {
   const [beforeDate, setBeforeDate] = useState<dayjs.Dayjs | null>(null);
   const [afterDate, setAfterDate] = useState<dayjs.Dayjs | null>(null);
   const [localSearch, setLocalSearch] = useState('');
-
-
-  const [createOpen, setCreateOpen] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [createShareType, setCreateShareType] = useState<'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC'>('PRIVATE');
-  const [createForm] = Form.useForm();
-
-  interface UserOption {
-    username: string;
-    first_name?: string;
-    last_name?: string;
-    email?: string;
-    role?: string;
-  }
-  const [availableRoles, setAvailableRoles] = useState<string[]>([]);
-  const [loadingRoles, setLoadingRoles] = useState(false);
-
-  const fetchRoles = useCallback(() => {
-    if (availableRoles.length > 0) return;
-    setLoadingRoles(true);
-    apiRequest('/geoserver/roles')
-      .then((res) => (res.ok ? res.json() : { roles: [] }))
-      .then((data) => {
-        if (Array.isArray(data.roles)) setAvailableRoles(data.roles);
-      })
-      .catch(() => {})
-      .finally(() => setLoadingRoles(false));
-  }, [availableRoles.length]);
-
-  useEffect(() => {
-    if (createOpen) {
-      fetchRoles();
-    }
-  }, [createOpen, fetchRoles]);
 
 
   // ── Fetch Dashboards ───────────────────────────────────────────────────────
@@ -462,68 +428,6 @@ export default function ManageDashboardsPage() {
     setShareModalOpen(true);
   };
 
-
-  const handleCreateDashboard = async (values: {
-    name: string;
-    description?: string;
-    share_type?: 'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC';
-    allowed_users?: string[];
-    allowed_roles?: string[];
-  }) => {
-    setCreating(true);
-    try {
-      const shareType = values.share_type || createShareType || 'PRIVATE';
-      const allowedRoles = shareType === 'ROLES'
-        ? (values.allowed_roles || []).map((r: string) => ({ role: r, permission: 'VIEWER' }))
-        : [];
-      if (shareType === 'ROLES' && allowedRoles.length === 0) {
-        notification.warning({
-          message: 'No Roles Selected',
-          description: 'Please select at least one GeoServer role for role-based access.',
-          placement: 'topRight',
-        });
-        setCreating(false);
-        return;
-      }
-
-      const payload = {
-        name: values.name.trim(),
-        description: values.description || '',
-        share_type: shareType,
-        allowed_roles: allowedRoles,
-        allowed_users: [],
-        is_public: shareType === 'PUBLIC',
-        content: { widgets: [] },
-      };
-      const res = await apiRequest('/dashboards', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
-      if (!data.id) throw new Error('Server did not return a valid dashboard ID');
-
-      notification.success({
-        message: 'Dashboard Created',
-        description: `Successfully created "${data.name}"`,
-        placement: 'topRight',
-      });
-      setCreateOpen(false);
-      createForm.resetFields();
-      setCreateShareType('PRIVATE');
-      fetchDashboards(true);
-      router.push(`/dashboard/${data.slug || data.id}`);
-    } catch (err: any) {
-      notification.error({
-        message: 'Creation Failed',
-        description: err.message || 'Could not create new dashboard workspace.',
-        placement: 'topRight',
-      });
-    } finally {
-      setCreating(false);
-    }
-  };
-
   // ── Stats Logic ────────────────────────────────────────────────────────────
 
   const stats = {
@@ -681,8 +585,11 @@ export default function ManageDashboardsPage() {
         return (
           <Space size="middle" className="whitespace-nowrap">
             <Tooltip title="Open Dashboard">
-              <Link href={`/dashboard/${record.slug || record.id}`}>
-                <Button type="text" size="small" icon={<Eye size={16} className="text-gray-400 hover:text-primary" />} />
+              <Link
+                href={`/dashboard/${record.slug || record.id}`}
+                className="inline-flex items-center justify-center p-1 rounded-md text-gray-400 hover:text-primary transition-colors"
+              >
+                <Eye size={16} />
               </Link>
             </Tooltip>
 
@@ -776,12 +683,7 @@ export default function ManageDashboardsPage() {
             <Button
               type="primary"
               icon={<Plus size={16} />}
-              onClick={() => {
-                createForm.setFieldsValue({ name: '', description: '', share_type: 'PRIVATE', allowed_roles: [] });
-                setCreateShareType('PRIVATE');
-                setCreateOpen(true);
-                fetchRoles();
-              }}
+              onClick={() => setCreateDashboardModalOpen(true)}
               className="rounded-[0.75rem] h-[2.5rem] px-[1.5rem] font-bold shadow-md hover:shadow-lg transition-all text-[0.75rem] sm:text-[0.875rem] flex items-center gap-1.5"
             >
               Create Dashboard
@@ -1030,12 +932,7 @@ export default function ManageDashboardsPage() {
                         <Button
                           type="link"
                           className="font-bold"
-                          onClick={() => {
-                            createForm.setFieldsValue({ name: '', description: '', share_type: 'PRIVATE', allowed_roles: [] });
-                            setCreateShareType('PRIVATE');
-                            setCreateOpen(true);
-                            fetchRoles();
-                          }}
+                          onClick={() => setCreateDashboardModalOpen(true)}
                         >
                           Create your first dashboard
                         </Button>
@@ -1094,137 +991,6 @@ export default function ManageDashboardsPage() {
         )}
       </div>
 
-
-      {/* Create Dashboard Modal */}
-      <Modal
-        title={
-          <div className="flex items-center gap-3 text-gray-800 pr-6">
-            <div className="p-3.5 bg-primary/10 text-primary rounded-2xl shrink-0">
-              <LayoutDashboard size={22} />
-            </div>
-            <div>
-              <Title level={4} className="!m-0 font-extrabold">Configure Dashboard</Title>
-              <Text className="text-gray-400 text-[11px] font-medium block mt-0.5">Define metadata and access levels for your new dashboard workspace</Text>
-            </div>
-          </div>
-        }
-        open={createOpen}
-        onCancel={() => setCreateOpen(false)}
-        footer={null}
-        destroyOnClose
-        centered
-        width="min(100% - 32px, 500px)"
-        styles={{ body: { padding: '1.5rem 1.5rem 0.5rem 1.5rem' } }}
-        className="rounded-[2.5rem] overflow-hidden"
-      >
-        <Form
-          form={createForm}
-          layout="vertical"
-          onFinish={handleCreateDashboard}
-          className="space-y-5"
-        >
-          <Form.Item
-            name="name"
-            label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Dashboard Name</span>}
-            rules={[
-              { required: true, message: 'Please enter a name for your dashboard' },
-              {
-                validator: (_, value) => {
-                  const trimmed = (value || '').trim();
-                  if (!trimmed) {
-                    return Promise.reject(new Error('Dashboard name cannot be empty or contain only spaces'));
-                  }
-                  if (trimmed.length < 2) {
-                    return Promise.reject(new Error('Dashboard name must be at least 2 characters long'));
-                  }
-                  if (trimmed.length > 32) {
-                    return Promise.reject(new Error('Dashboard name cannot exceed 32 characters'));
-                  }
-                  if (/[<>]/.test(trimmed)) {
-                    return Promise.reject(new Error('Dashboard name contains invalid characters (< or >)'));
-                  }
-                  return Promise.resolve();
-                }
-              }
-            ]}
-          >
-            <Input
-              placeholder="e.g. My Dashboard Workspace"
-              className="rounded-xl h-11 bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all font-semibold"
-              maxLength={32}
-            />
-          </Form.Item>
-
-          <Form.Item
-            name="description"
-            label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Description</span>}
-          >
-            <Input.TextArea placeholder="Describe the focus or theme of this dashboard..." rows={4} className="rounded-xl bg-gray-50 border-none hover:bg-gray-100/70 focus:bg-white focus:ring-1 focus:ring-primary/20 transition-all" />
-          </Form.Item>
-
-          <Form.Item
-            name="share_type"
-            label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Access Control</span>}
-            initialValue="PRIVATE"
-            rules={[{ required: true }]}
-          >
-            <Select
-              className="vismap-select h-11"
-              value={createShareType}
-              onChange={(val) => {
-                setCreateShareType(val);
-                createForm.setFieldValue('share_type', val);
-              }}
-              options={[
-                { label: 'Private (Only you can access)', value: 'PRIVATE' },
-                { label: 'GeoServer Roles (Grant access to selected roles)', value: 'ROLES' },
-                { label: 'Public (Anyone with link can view)', value: 'PUBLIC' },
-              ]}
-            />
-          </Form.Item>
-
-          {createShareType === 'ROLES' && (
-            <Form.Item
-              name="allowed_roles"
-              label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Select GeoServer Roles</span>}
-              rules={[{ required: true, message: 'Please select at least one GeoServer role' }]}
-            >
-              <Select
-                mode="multiple"
-                placeholder="Search and select GeoServer roles..."
-                loading={loadingRoles}
-                className="w-full rounded-xl"
-                options={availableRoles
-                  .filter((r) => !['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(r.toUpperCase()))
-                  .map((r) => ({
-                    label: r,
-                    value: r,
-                  }))}
-              />
-            </Form.Item>
-          )}
-
-          <div className="text-[11px] text-gray-400 -mt-2">
-            {createShareType === 'PRIVATE' && '🔒 Only you can view or edit this dashboard.'}
-            {createShareType === 'ROLES' && '🛡️ Only users possessing the selected GeoServer roles can access this dashboard.'}
-            {createShareType === 'PUBLIC' && '🌐 Anyone with the link can view this dashboard without logging in.'}
-          </div>
-
-          <div className="flex gap-3 justify-end pt-5 border-t border-gray-100 mt-8">
-            <Button className="rounded-xl h-11 px-6 font-semibold" onClick={() => setCreateOpen(false)}>
-              Cancel
-            </Button>
-            <Button
-              type="primary"
-              htmlType="submit"
-              loading={creating}
-              className="rounded-xl h-11 px-8 font-bold border-none shadow-md hover:shadow-lg transition-all"
-            >
-              Create Dashboard
-            </Button>
-          </div>
-        </Form>
-      </Modal>
 
       {/* Edit Dashboard Details Modal */}
       <Modal

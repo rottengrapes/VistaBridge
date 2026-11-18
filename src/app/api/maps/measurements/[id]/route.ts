@@ -30,14 +30,7 @@ export async function DELETE(
       );
     }
 
-    const result = await pool.query('DELETE FROM map_measurements WHERE id = $1 RETURNING id', [id]);
-    if (result.rows.length === 0) {
-      return NextResponse.json(
-        { detail: `Measurement with ID "${id}" not found.` },
-        { status: 404 }
-      );
-    }
-
+    await pool.query('DELETE FROM map_measurements WHERE id = $1', [id]);
     return NextResponse.json({ success: true });
   } catch (err) {
     console.error('Failed to delete map measurement:', err);

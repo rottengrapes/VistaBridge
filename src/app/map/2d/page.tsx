@@ -2080,7 +2080,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
 
   // Load saved annotations from DB
   useEffect(() => {
-    if (loading || !mapId || !mapInstance.current || !annotationSourceRef.current) return;
+    if (isQuick || loading || !mapId || mapId === 'quick-map' || !mapInstance.current || !annotationSourceRef.current) return;
 
     const loadAnnotations = async () => {
       try {
@@ -2115,11 +2115,11 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     };
 
     loadAnnotations();
-  }, [mapId, loading]);
+  }, [mapId, loading, isQuick]);
 
   // Load saved measurements from DB
   useEffect(() => {
-    if (loading || !mapId || !mapInstance.current || !measurementSourceRef.current) return;
+    if (isQuick || loading || !mapId || mapId === 'quick-map' || !mapInstance.current || !measurementSourceRef.current) return;
 
     const loadMeasurements = async () => {
       try {
@@ -2154,7 +2154,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     };
 
     loadMeasurements();
-  }, [mapId, loading]);
+  }, [mapId, loading, isQuick]);
 
   // Load saved layers from workspace on initialization (2D)
   useEffect(() => {
@@ -2712,7 +2712,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const saveAnnotationToDB = async (feature: any, labelTextVal?: string) => {
-    if (!mapId) return;
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const geojsonFormat = new GeoJSON();
       const geometry = feature.getGeometry();
@@ -2750,6 +2750,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const deleteAnnotationFromDB = async (id: string) => {
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const response = await apiRequest(`/maps/annotations/${id}`, {
         method: 'DELETE'
@@ -2768,7 +2769,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const clearAnnotationsFromDB = async () => {
-    if (!mapId) return;
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const response = await apiRequest(`/maps/annotations/clear?map_id=${mapId}`, {
         method: 'DELETE'
@@ -3075,7 +3076,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const saveMeasurementToDB = async (feature: any, type: string, displayVal: string) => {
-    if (!mapId) return;
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const geojsonFormat = new GeoJSON();
       const geometry = feature.getGeometry();
@@ -3113,6 +3114,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const deleteMeasurementFromDB = async (id: string) => {
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const response = await apiRequest(`/maps/measurements/${id}`, {
         method: 'DELETE'
@@ -3131,7 +3133,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const clearMeasurementsFromDB = async () => {
-    if (!mapId) return;
+    if (isQuick || !mapId || mapId === 'quick-map') return;
     try {
       const response = await apiRequest(`/maps/measurements/clear?map_id=${mapId}`, {
         method: 'DELETE'
@@ -7955,7 +7957,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
               </div>
               <div className="flex-grow overflow-y-auto p-4">
                 <GoToXY
-                  mapId={mapId}
+                  mapId={mapDetail?.id || mapId}
                   currentZoom={zoomLevel}
                   onGoToLocation={handleGoToXYLocation}
                   onClearMarker={handleClearGotoXYMarker}

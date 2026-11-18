@@ -118,12 +118,24 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
         .then((res) => (res.ok ? res.json() : { roles: [] }))
         .then((data) => {
           const list = Array.isArray(data) ? data : data?.roles || [];
-          if (Array.isArray(list)) setAvailableRoles(list);
+          const combined = Array.from(new Set(['ADMIN', 'ROLE_ADMINISTRATOR', ...(Array.isArray(list) ? list : [])])).filter(Boolean);
+          setAvailableRoles(combined);
         })
-        .catch(() => {})
+        .catch(() => {
+          setAvailableRoles(['ADMIN', 'ROLE_ADMINISTRATOR']);
+        })
         .finally(() => setLoadingRoles(false));
     }
   }, [createDashboardModalOpen, availableRoles.length]);
+
+  useEffect(() => {
+    if (createDashboardModalOpen) {
+      const current = dashboardForm.getFieldValue('allowed_roles');
+      if (!current || !current.includes('ADMIN')) {
+        dashboardForm.setFieldValue('allowed_roles', ['ADMIN', ...(current || [])]);
+      }
+    }
+  }, [createDashboardModalOpen, dashboardForm]);
 
   useEffect(() => {
     if (createMapModalOpen || createDashboardModalOpen) {
@@ -228,18 +240,11 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
     if (!trimmedName || trimmedName.length < 2) return;
 
     const shareType = values.share_type || createDashboardShareType || 'PRIVATE';
-    const allowedRoles = shareType === 'ROLES'
-      ? (values.allowed_roles || []).map((r: string) => ({ role: r, permission: 'VIEWER' as const }))
+    const rawRoles = values.allowed_roles || [];
+    const rolesList = shareType === 'ROLES'
+      ? Array.from(new Set(['ADMIN', ...rawRoles]))
       : [];
-
-    if (shareType === 'ROLES' && allowedRoles.length === 0) {
-      notification.warning({
-        message: 'No Roles Selected',
-        description: 'Please select at least one GeoServer role for role-based access.',
-        placement: 'topRight',
-      });
-      return;
-    }
+    const allowedRoles = rolesList.map((r: string) => ({ role: r, permission: 'VIEWER' as const }));
 
     setSavingDashboard(true);
     try {
@@ -647,12 +652,12 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
         maskTransitionName=""
         title={
           <div className="flex items-center gap-3 text-gray-800 pr-6">
-            <div className="p-3.5 bg-blue-50 text-blue-600 rounded-2xl shrink-0">
-              <LayoutDashboard size={32} />
+            <div className="p-3.5 bg-primary/10 text-primary rounded-2xl shrink-0">
+              <LayoutDashboard size={22} />
             </div>
             <div>
-              <Title level={4} className="!m-0 font-extrabold text-gray-800">Create Dashboard</Title>
-              <Text className="text-gray-400 text-[11px] font-medium block mt-0.5">Define name and access level for your new dashboard</Text>
+              <Title level={4} className="!m-0 font-extrabold text-gray-800">Configure Dashboard</Title>
+              <Text className="text-gray-400 text-[11px] font-medium block mt-0.5">Define metadata and access levels for your new dashboard workspace</Text>
             </div>
           </div>
         }
@@ -669,6 +674,10 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
           form={dashboardForm}
           layout="vertical"
           onFinish={handleSaveDashboard}
+          initialValues={{
+            share_type: 'PRIVATE',
+            allowed_roles: ['ADMIN'],
+          }}
           className="space-y-5"
         >
           <Form.Item
@@ -722,10 +731,16 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
               onChange={(val) => {
                 setCreateDashboardShareType(val);
                 dashboardForm.setFieldValue('share_type', val);
+                if (val === 'ROLES') {
+                  const currentRoles: string[] = dashboardForm.getFieldValue('allowed_roles') || [];
+                  if (!currentRoles.includes('ADMIN')) {
+                    dashboardForm.setFieldValue('allowed_roles', ['ADMIN', ...currentRoles]);
+                  }
+                }
               }}
               options={[
-                { label: 'Private (Only you can access)', value: 'PRIVATE' },
-                { label: 'GeoServer Roles (Grant access to security roles)', value: 'ROLES' },
+                { label: 'Private (Only you and Administrators can access)', value: 'PRIVATE' },
+                { label: 'GeoServer Roles (Grant access to selected security roles)', value: 'ROLES' },
                 { label: 'Public (Anyone with link can view)', value: 'PUBLIC' }
               ]}
             />
@@ -735,40 +750,59 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
             <Form.Item
               name="allowed_roles"
               label={<span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Select GeoServer Roles</span>}
-              rules={[{ required: true, message: 'Please select at least one GeoServer role' }]}
             >
               <Select
                 mode="multiple"
-                placeholder="Select GeoServer security roles..."
+                placeholder="Search and select GeoServer roles..."
                 loading={loadingRoles}
                 className="w-full rounded-xl"
-                tagRender={(props) => (
-                  <Tag
-                    closable={props.closable}
-                    onClose={props.onClose}
-                    className="rounded-lg text-xs font-semibold px-2 py-0.5 mr-1 bg-blue-50 border border-blue-200 text-blue-700 flex items-center gap-1"
-                  >
-                    <Shield size={11} className="inline mr-1" />
-                    {props.value}
-                  </Tag>
-                )}
-                options={availableRoles
-                  .filter((role) => !['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(role.toUpperCase()))
-                  .map((role) => ({
-                  label: (
-                    <div className="flex items-center gap-2 text-xs py-0.5">
-                      <Shield size={13} className="text-primary shrink-0" />
-                      <span className="font-semibold text-gray-800">{role}</span>
-                    </div>
-                  ),
-                  value: role,
-                }))}
+                onChange={(vals: string[]) => {
+                  const finalVals = vals.includes('ADMIN') ? vals : ['ADMIN', ...vals];
+                  dashboardForm.setFieldValue('allowed_roles', finalVals);
+                }}
+                tagRender={(props) => {
+                  const isAdminRole = String(props.value).toUpperCase() === 'ADMIN';
+                  return (
+                    <Tag
+                      closable={!isAdminRole}
+                      onClose={isAdminRole ? undefined : props.onClose}
+                      className={`rounded-lg text-xs font-semibold px-2 py-0.5 mr-1 flex items-center gap-1 ${
+                        isAdminRole
+                          ? 'bg-purple-50 border border-purple-200 text-purple-700'
+                          : 'bg-blue-50 border border-blue-200 text-blue-700'
+                      }`}
+                    >
+                      <Shield size={11} className="inline mr-1" />
+                      {props.value}
+                    </Tag>
+                  );
+                }}
+                options={availableRoles.map((role) => {
+                  const isAdminRole = role.toUpperCase() === 'ADMIN';
+                  return {
+                    label: (
+                      <div className="flex items-center justify-between gap-2 text-xs py-0.5 w-full">
+                        <div className="flex items-center gap-2">
+                          <Shield size={13} className="text-primary shrink-0" />
+                          <span className="font-semibold text-gray-800">{role}</span>
+                        </div>
+                        {isAdminRole && (
+                          <Tag color="purple" className="text-[9px] font-bold px-1.5 py-0 border-none m-0">
+                            System Admin
+                          </Tag>
+                        )}
+                      </div>
+                    ),
+                    value: role,
+                    disabled: isAdminRole,
+                  };
+                })}
               />
             </Form.Item>
           )}
 
           <div className="text-[11px] text-gray-400 -mt-2">
-            {createDashboardShareType === 'PRIVATE' && '🔒 Only you can view or edit this dashboard.'}
+            {createDashboardShareType === 'PRIVATE' && '🔒 Only you and System Administrators can access this dashboard.'}
             {createDashboardShareType === 'ROLES' && '🛡️ Users holding any of the selected GeoServer roles can access this dashboard.'}
             {createDashboardShareType === 'PUBLIC' && '🌐 Anyone with the link can view this dashboard without logging in.'}
           </div>

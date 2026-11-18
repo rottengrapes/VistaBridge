@@ -29,11 +29,8 @@ export async function GET(request: Request) {
     const { searchParams } = new URL(request.url);
     const mapId = searchParams.get('map_id');
 
-    if (!mapId) {
-      return NextResponse.json(
-        { detail: 'map_id query parameter is required.' },
-        { status: 400 }
-      );
+    if (!mapId || mapId === 'quick-map') {
+      return NextResponse.json([]);
     }
 
     const mapCheck = await pool.query('SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [mapId]);
@@ -74,6 +71,10 @@ export async function POST(request: Request) {
         { detail: 'Missing required fields: id, map, geometry, type.' },
         { status: 400 }
       );
+    }
+
+    if (map === 'quick-map') {
+      return NextResponse.json({ success: true, ephemeral: true }, { status: 200 });
     }
 
     const mapCheck = await pool.query('SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)', [map]);

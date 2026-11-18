@@ -220,8 +220,8 @@ export default function GoToXY({
     setExportError(false);
     try {
       const url = mapId
-        ? `/advanced-tools/goto-xy/?map_id=${encodeURIComponent(mapId)}&page_size=100`
-        : '/advanced-tools/goto-xy/?page_size=100';
+        ? `/advanced-tools/goto-xy?map_id=${encodeURIComponent(mapId)}&page_size=100`
+        : '/advanced-tools/goto-xy?page_size=100';
       const res = await apiRequest(url);
       if (!res.ok) throw new Error();
       const data = await res.json();
@@ -386,7 +386,7 @@ export default function GoToXY({
       onOk: async () => {
         const finalName = name.trim() || `Point ${savedPoints.length + 1}`;
         try {
-          const res = await apiRequest('/advanced-tools/goto-xy/', {
+          const res = await apiRequest('/advanced-tools/goto-xy', {
             method: 'POST',
             body: JSON.stringify({
               map_id: mapId || null,
@@ -397,7 +397,8 @@ export default function GoToXY({
             }),
           });
           if (!res.ok) {
-            throw new Error('Failed to save point to the server.');
+            const errData = await res.json().catch(() => null);
+            throw new Error(errData?.detail || 'Failed to save point to the server.');
           }
           loadSavedPoints();
           resetAll();
@@ -436,12 +437,24 @@ export default function GoToXY({
   async function handleRenamePoint(id: number) {
     const trimmed = editingName.trim();
     if (!trimmed) return;
-    await apiRequest(`/advanced-tools/goto-xy/${id}/`, {
-      method: 'PATCH',
-      body: JSON.stringify({ name: trimmed }),
-    });
-    setSavedPoints(prev => prev.map(p => p.id === id ? { ...p, name: trimmed } : p));
-    setEditingId(null);
+    try {
+      const res = await apiRequest(`/advanced-tools/goto-xy/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: trimmed }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null);
+        throw new Error(errData?.detail || 'Failed to update point.');
+      }
+      setSavedPoints(prev => prev.map(p => p.id === id ? { ...p, name: trimmed } : p));
+      setEditingId(null);
+    } catch (err: any) {
+      notification.error({
+        message: 'Update Failed',
+        description: err.message || 'Could not update point name.',
+        placement: 'topRight',
+      });
+    }
   }
 
   function handleDeletePoint(id: number) {
@@ -453,13 +466,25 @@ export default function GoToXY({
       okType: 'danger',
       cancelText: 'Cancel',
       onOk: async () => {
-        await apiRequest(`/advanced-tools/goto-xy/${id}/`, { method: 'DELETE' });
-        setSavedPoints(prev => prev.filter(p => p.id !== id));
-        notification.success({
-          message: 'Point Deleted',
-          description: `"${point?.name}" has been deleted.`,
-          placement: 'topRight',
-        });
+        try {
+          const res = await apiRequest(`/advanced-tools/goto-xy/${id}`, { method: 'DELETE' });
+          if (!res.ok) {
+            const errData = await res.json().catch(() => null);
+            throw new Error(errData?.detail || 'Failed to delete point.');
+          }
+          setSavedPoints(prev => prev.filter(p => p.id !== id));
+          notification.success({
+            message: 'Point Deleted',
+            description: `"${point?.name}" has been deleted.`,
+            placement: 'topRight',
+          });
+        } catch (err: any) {
+          notification.error({
+            message: 'Delete Failed',
+            description: err.message || 'Could not delete point.',
+            placement: 'topRight',
+          });
+        }
       },
     });
   }

@@ -34,8 +34,15 @@ export async function GET(request: Request) {
     let params: any[];
 
     if (mapId) {
-      query = 'SELECT id, map_id, name, latitude, longitude, zoom, created_at, username FROM goto_xy_points WHERE map_id = $1 ORDER BY created_at DESC';
-      params = [mapId];
+      // Resolve slug or ID to the primary map workspace ID (UUID)
+      const mapCheck = await pool.query(
+        'SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)',
+        [mapId]
+      );
+      const resolvedMapId = mapCheck.rows.length > 0 ? mapCheck.rows[0].id : mapId;
+
+      query = 'SELECT id, map_id, name, latitude, longitude, zoom, created_at, username FROM goto_xy_points WHERE map_id = $1 OR map_id = $2 ORDER BY created_at DESC';
+      params = [resolvedMapId, mapId];
     } else {
       query = 'SELECT id, map_id, name, latitude, longitude, zoom, created_at, username FROM goto_xy_points WHERE username = $1 AND (map_id IS NULL OR map_id = \'\') ORDER BY created_at DESC';
       params = [user.username];
@@ -45,7 +52,7 @@ export async function GET(request: Request) {
     return NextResponse.json(result.rows);
   } catch (err: any) {
     console.error('Failed to get GoToXY points:', err);
-    return NextResponse.json({ detail: 'Internal server error.' }, { status: 500 });
+    return NextResponse.json({ detail: err?.message || 'Internal server error.' }, { status: 500 });
   }
 }
 
@@ -66,14 +73,45 @@ export async function POST(request: Request) {
     }
 
     await initDb();
+
+    // Resolve map_id (which may be a slug like 'test_map_1') to map_workspaces.id
+    // This prevents foreign key constraint failures (SQLITE_CONSTRAINT_FOREIGNKEY)
+    let resolvedMapId: string | null = null;
+    if (map_id) {
+      const mapCheck = await pool.query(
+        'SELECT id FROM map_workspaces WHERE id = $1 OR LOWER(slug) = LOWER($1)',
+        [map_id]
+      );
+      if (mapCheck.rows.length > 0) {
+        resolvedMapId = mapCheck.rows[0].id;
+      }
+    }
+
+    const username = user.username || 'user';
+    const numLat = parseFloat(latitude);
+    const numLon = parseFloat(longitude);
+    const numZoom = zoom !== undefined && zoom !== null && !isNaN(Number(zoom)) ? Number(zoom) : null;
+
     const result = await pool.query(
       'INSERT INTO goto_xy_points (username, map_id, name, latitude, longitude, zoom) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, map_id, name, latitude, longitude, zoom, created_at',
-      [user.username, map_id || null, name.trim(), latitude, longitude, zoom ?? null]
+      [username, resolvedMapId, name.trim(), numLat, numLon, numZoom]
     );
 
-    return NextResponse.json(result.rows[0], { status: 201 });
+    const createdPoint = result.rows && result.rows.length > 0
+      ? result.rows[0]
+      : {
+          id: (result as any).lastInsertRowid ?? Date.now(),
+          map_id: resolvedMapId,
+          name: name.trim(),
+          latitude: numLat,
+          longitude: numLon,
+          zoom: numZoom,
+          created_at: new Date().toISOString(),
+        };
+
+    return NextResponse.json(createdPoint, { status: 201 });
   } catch (err: any) {
     console.error('Failed to create GoToXY point:', err);
-    return NextResponse.json({ detail: 'Internal server error.' }, { status: 500 });
+    return NextResponse.json({ detail: err?.message || 'Internal server error.' }, { status: 500 });
   }
 }

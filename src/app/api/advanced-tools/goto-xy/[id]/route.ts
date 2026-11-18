@@ -39,7 +39,7 @@ export async function PATCH(
 
     await initDb();
     const result = await pool.query(
-      'UPDATE goto_xy_points SET name = $1 WHERE id = $2 AND (username = $3 OR map_id IS NOT NULL) RETURNING id, map_id, name, latitude, longitude, zoom, created_at',
+      'UPDATE goto_xy_points SET name = $1 WHERE (id = $2 OR id = CAST($2 AS INTEGER)) AND (username = $3 OR map_id IS NOT NULL) RETURNING id, map_id, name, latitude, longitude, zoom, created_at',
       [name.trim(), id, user.username]
     );
 
@@ -50,7 +50,7 @@ export async function PATCH(
     return NextResponse.json(result.rows[0]);
   } catch (err: any) {
     console.error('Failed to update GoToXY point:', err);
-    return NextResponse.json({ detail: 'Internal server error.' }, { status: 500 });
+    return NextResponse.json({ detail: err?.message || 'Internal server error.' }, { status: 500 });
   }
 }
 
@@ -68,7 +68,7 @@ export async function DELETE(
   try {
     await initDb();
     const result = await pool.query(
-      'DELETE FROM goto_xy_points WHERE id = $1 AND (username = $2 OR map_id IS NOT NULL) RETURNING id',
+      'DELETE FROM goto_xy_points WHERE (id = $1 OR id = CAST($1 AS INTEGER)) AND (username = $2 OR map_id IS NOT NULL) RETURNING id',
       [id, user.username]
     );
 
@@ -79,6 +79,6 @@ export async function DELETE(
     return NextResponse.json({ detail: 'Point deleted successfully.' });
   } catch (err: any) {
     console.error('Failed to delete GoToXY point:', err);
-    return NextResponse.json({ detail: 'Internal server error.' }, { status: 500 });
+    return NextResponse.json({ detail: err?.message || 'Internal server error.' }, { status: 500 });
   }
 }
