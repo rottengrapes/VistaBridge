@@ -752,7 +752,9 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
                     {props.value}
                   </Tag>
                 )}
-                options={availableRoles.map((role) => ({
+                options={availableRoles
+                  .filter((role) => !['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(role.toUpperCase()))
+                  .map((role) => ({
                   label: (
                     <div className="flex items-center gap-2 text-xs py-0.5">
                       <Shield size={13} className="text-primary shrink-0" />

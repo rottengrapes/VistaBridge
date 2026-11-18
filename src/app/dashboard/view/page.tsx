@@ -21,14 +21,14 @@ import {
   Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Trash2,
   BarChart3, PieChart, LineChart, Table, Hash, Map, X, Paintbrush, Info, ImageIcon,
   Printer, Eye, Donut, ScatterChart, TrendingUp, Lock, Unlock, Palette,
-  Globe, Layers, LayoutDashboard, Share2, Users, Pencil, Shield, RefreshCw, Clock
+  Globe, Layers, LayoutDashboard, Share2, Users, Pencil, Shield, RefreshCw, Clock, Check
 } from 'lucide-react';
 import ChartThemePicker from '@/components/dashboard/ChartThemePicker';
 import ShareDashboardModal from '@/components/dashboard/ShareDashboardModal';
 import { useRouter, useSearchParams, useParams } from 'next/navigation';
 import GeoChartWidget, { type GeoChartConfig } from '@/components/dashboard/widgets/GeoChartWidget';
 import MapWidget, { type MapLayer } from '@/components/dashboard/widgets/MapWidget';
-import { normalizeAllowedUsers, AllowedUserEntry, normalizeAllowedRoles, AllowedRoleEntry, isUserAdmin } from '@/lib/dashboardPermissions';
+import { normalizeAllowedUsers, AllowedUserEntry, normalizeAllowedRoles, AllowedRoleEntry, DashboardUserRole, isUserAdmin } from '@/lib/dashboardPermissions';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useDashboardStore } from '@/store/useDashboardStore';
 import { apiRequest } from '@/lib/api';
@@ -71,6 +71,7 @@ interface CanvasWidget {
   isTransparent?: boolean;
   /** map widgets only: when true, touch/drag is passed to OL map; when false, the card can be repositioned */
   locked?: boolean;
+  savedChartId?: string;
 }
 
 function CustomWidthProvider<P extends { width?: number }>(
@@ -951,6 +952,8 @@ function ViewDashboardContent() {
   const [renameModalOpen, setRenameModalOpen] = useState(false);
   const [newName, setNewName] = useState('');
   const [isPublic, setIsPublic] = useState(false);
+  const isPublicOnlyGuest = Boolean(isPublic && (!token || !user));
+  const [publicPermission, setPublicPermission] = useState<DashboardUserRole>('VIEWER');
   const [shareType, setShareType] = useState<'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC'>('PRIVATE');
   const [allowedUsers, setAllowedUsers] = useState<AllowedUserEntry[]>([]);
   const [allowedRoles, setAllowedRoles] = useState<AllowedRoleEntry[]>([]);
@@ -1077,15 +1080,33 @@ function ViewDashboardContent() {
       .catch(() => { });
   }, [token]);
 
-  const persistChartAdd = async (title: string, chartType: string, config: GeoChartConfig) => {
+  const [renamingChartId, setRenamingChartId] = useState<string | null>(null);
+  const [renamingChartTitle, setRenamingChartTitle] = useState<string>('');
+
+  const persistChartAdd = async (title: string, chartType: string, config: GeoChartConfig): Promise<string | null> => {
     try {
       const res = await apiRequest('/dashboards/charts', {
         method: 'POST',
         body: JSON.stringify({ title, chart_type: chartType, config }),
       });
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const row = await res.json();
       setSavedCharts(prev => [{ id: String(row.id), title: row.title, chartType: row.chart_type, config: row.config }, ...prev]);
+      return String(row.id);
+    } catch {
+      return null;
+    }
+  };
+
+  const persistChartUpdate = async (id: string, title: string, config?: GeoChartConfig) => {
+    try {
+      const res = await apiRequest(`/dashboards/charts/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ title, config }),
+      });
+      if (!res.ok) return;
+      const row = await res.json();
+      setSavedCharts(prev => prev.map(c => c.id === id ? { ...c, title: row.title, config: row.config ?? c.config } : c));
     } catch { }
   };
 
@@ -1150,24 +1171,14 @@ function ViewDashboardContent() {
         const cleanMetric = formatLayerDisplayName(metricName);
         return cleanMetric.slice(0, 32);
       }
-      return values?.aggregation === 'count' ? 'Total Features' : 'KPI Widget';
+      return cleanLayerName || (values?.aggregation === 'count' ? 'Total Features' : 'KPI Widget');
     }
 
-    if (!cleanLayerName) {
-      return chartLabel.slice(0, 32);
+    if (cleanLayerName) {
+      return cleanLayerName.slice(0, 32);
     }
 
-    // Format: "${chartLabel} - ${cleanLayerName}" up to 32 characters
-    const prefix = `${chartLabel} - `;
-    const maxLayerLen = 32 - prefix.length;
-    if (maxLayerLen >= 4) {
-      const truncatedLayer = cleanLayerName.length > maxLayerLen
-        ? cleanLayerName.slice(0, maxLayerLen).trim()
-        : cleanLayerName;
-      return `${prefix}${truncatedLayer}`.slice(0, 32);
-    }
-
-    return cleanLayerName.slice(0, 32);
+    return chartLabel.slice(0, 32);
   };
 
   const formatSavedChartTitle = (rawTitle: string): string => {
@@ -1222,7 +1233,7 @@ function ViewDashboardContent() {
     if (geoChartPresetType) geoChartForm.setFieldValue('chartType', geoChartPresetType);
   };
 
-  const handleAddGeoChart = (values: any) => {
+  const handleAddGeoChart = async (values: any) => {
     if (!geoChartLayerId) return;
     const chartType = geoChartPresetType ?? values.chartType;
 
@@ -1247,6 +1258,9 @@ function ViewDashboardContent() {
     };
 
     if (editingWidgetId) {
+      const targetWidget = widgets.find(w => w.id === editingWidgetId);
+      const oldTitle = targetWidget?.title;
+
       setWidgets(prev =>
         prev.map(w =>
           w.id === editingWidgetId
@@ -1254,22 +1268,40 @@ function ViewDashboardContent() {
             : w
         )
       );
+
+      // Find matching chart in savedCharts library
+      const matchedChart = savedCharts.find(sc =>
+        (targetWidget?.savedChartId && sc.id === targetWidget.savedChartId) ||
+        (targetWidget?.geoChartConfig?.layerId && sc.config?.layerId === targetWidget.geoChartConfig.layerId && sc.chartType === targetWidget.geoChartConfig.chartType) ||
+        (oldTitle && (sc.title === oldTitle || formatSavedChartTitle(sc.title) === formatSavedChartTitle(oldTitle)))
+      );
+
+      if (matchedChart) {
+        setSavedCharts(prev => prev.map(sc =>
+          sc.id === matchedChart.id
+            ? { ...sc, title, config: { ...sc.config, ...config } }
+            : sc
+        ));
+        persistChartUpdate(matchedChart.id, title, config);
+      }
+
       notification.success({ message: `"${title}" updated`, duration: 2 });
       setEditingWidgetId(null);
     } else {
       const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 300) + 16), 0);
+      const savedId = await persistChartAdd(title, chartType, config);
       const widget: CanvasWidget = {
         id: `gc_${Date.now()}`,
         type: 'geochart',
         geoChartConfig: config,
         title,
+        savedChartId: savedId ?? undefined,
         x: 0,
         y: nextY,
         w: chartType === 'kpi' ? 3 : 6,
         h: chartType === 'kpi' ? 120 : 300,
       };
       setWidgets(prev => [...prev, widget]);
-      persistChartAdd(title, chartType, config);
       notification.success({ message: `"${title}" added to canvas`, duration: 2 });
     }
 
@@ -1326,15 +1358,21 @@ function ViewDashboardContent() {
         const sType = data.share_type || (data.is_public ? 'PUBLIC' : 'PRIVATE');
         setShareType(sType);
         setIsPublic(sType === 'PUBLIC' || Boolean(data.is_public));
+        setPublicPermission(data.public_permission === 'EDITOR' ? 'EDITOR' : 'VIEWER');
         setAllowedUsers(normalizeAllowedUsers(data.allowed_users));
         setAllowedRoles(normalizeAllowedRoles(data.allowed_roles));
         setDashboardSlug(data.slug || data.id || '');
         setCreatedBy(data.created_by || '');
+        const isUserLoggedIn = Boolean(token && user);
         if (typeof data.is_owner === 'boolean') {
-          setIsOwner(Boolean(data.is_owner || isUserAdmin(user)));
+          setIsOwner(Boolean(isUserLoggedIn && (data.is_owner || isUserAdmin(user))));
+        } else {
+          setIsOwner(false);
         }
         if (typeof data.can_edit === 'boolean') {
-          setCanEdit(Boolean(data.can_edit || isUserAdmin(user)));
+          setCanEdit(Boolean(isUserLoggedIn && (data.can_edit || isUserAdmin(user))));
+        } else {
+          setCanEdit(false);
         }
         const loadedInterval = Number(data.refresh_interval) || Number(data.content?.refreshInterval) || 0;
         setRefreshInterval(loadedInterval);
@@ -1398,6 +1436,14 @@ function ViewDashboardContent() {
   const handleSaveDashboard = async () => {
     if (!dashboardId || dashboardId === 'undefined') {
       notification.error({ message: 'Cannot save: dashboard was not created yet. Please go back and create it first.', placement: 'topRight' });
+      return;
+    }
+    if (!token || !user) {
+      notification.warning({
+        message: 'Authentication Required',
+        description: 'You must be logged in as an authorized user to save changes to this dashboard.',
+        placement: 'topRight',
+      });
       return;
     }
     if (!canEdit) {
@@ -1945,7 +1991,7 @@ function ViewDashboardContent() {
     }
   };
 
-  if (loading || !hydrated || !token) {
+  if (loading || !hydrated || (!token && !isPublic)) {
     return (
       <div className="flex items-center justify-center min-h-screen bg-gray-50">
         <Spin size="large" description="Loading Dashboard Workspace..." />
@@ -1979,11 +2025,11 @@ function ViewDashboardContent() {
         <div className="flex items-center gap-1.5 md:gap-3.5 min-w-0 flex-1 overflow-hidden">
           <div
             onClick={() => {
-              if (!(isPublic && !token)) {
+              if (!isPublicOnlyGuest) {
                 router.push('/dashboard/manage');
               }
             }}
-            className={`flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 ${!(isPublic && !token) ? 'cursor-pointer hover:opacity-85' : 'cursor-default'} transition-opacity`}
+            className={`flex items-center gap-2 sm:gap-2.5 min-w-fit shrink-0 ${!isPublicOnlyGuest ? 'cursor-pointer hover:opacity-85' : 'cursor-default'} transition-opacity`}
           >
             {/* Primary Logo (VistaBridge) */}
             {siteConfig.logo && (
@@ -2341,22 +2387,24 @@ function ViewDashboardContent() {
             </Tooltip>
           </Popover>
 
-          {!(isPublic && !token) && (
-            <Divider type="vertical" className="h-5 bg-gray-100 !m-0" />
-          )}
+          <Divider type="vertical" className="h-5 bg-gray-100 !m-0" />
 
-          {/* Back: disabled/hidden for public link viewers without token */}
-          {!(isPublic && !token) && (
-            <Tooltip title="Back to Manage">
-              <Button
-                type="text"
-                icon={<ArrowLeft size={16} className="text-gray-500 hover:text-primary transition-colors" />}
-                onClick={() => router.push('/dashboard/manage')}
-                className="flex items-center justify-center hover:bg-gray-50 rounded-xl"
-                style={{ width: 34, height: 34 }}
-              />
-            </Tooltip>
-          )}
+          {/* Back: disabled only if no one is logged in and directly accessing public dashboard link */}
+          <Tooltip title={isPublicOnlyGuest ? "Back navigation is disabled for public link" : "Back to Manage"}>
+            <Button
+              type="text"
+              disabled={isPublicOnlyGuest}
+              icon={
+                <ArrowLeft
+                  size={16}
+                  className={isPublicOnlyGuest ? "text-gray-300 cursor-not-allowed" : "text-gray-500 hover:text-primary transition-colors"}
+                />
+              }
+              onClick={!isPublicOnlyGuest ? () => router.push('/dashboard/manage') : undefined}
+              className={`flex items-center justify-center rounded-xl ${isPublicOnlyGuest ? 'cursor-not-allowed opacity-40 hover:bg-transparent' : 'hover:bg-gray-50'}`}
+              style={{ width: 34, height: 34 }}
+            />
+          </Tooltip>
 
         </div>
       </header>
@@ -3585,39 +3633,96 @@ function ViewDashboardContent() {
                           kpi: <Hash size={11} />, table: <Table size={11} />,
                         };
                         const cleanTitle = formatSavedChartTitle(sc.title);
+                        const isRenamingThis = renamingChartId === sc.id;
+
                         return (
                           <div key={sc.id} className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-xl px-2.5 py-2 hover:border-gray-300 transition-colors group">
                             <span className="text-gray-400 shrink-0">{typeIcon[sc.chartType] ?? <BarChart3 size={11} />}</span>
-                            <span className="text-[10px] font-semibold text-gray-700 truncate flex-1" title={cleanTitle}>{cleanTitle}</span>
-                            <button
-                              title="Add to canvas"
-                              onClick={() => {
-                                const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 300) + 16), 0);
-                                const w: CanvasWidget = {
-                                  id: `gc_${Date.now()}`,
-                                  type: 'geochart',
-                                  geoChartConfig: sc.config,
-                                  title: cleanTitle,
-                                  x: 0,
-                                  y: nextY,
-                                  w: sc.chartType === 'kpi' ? 3 : 6,
-                                  h: sc.chartType === 'kpi' ? 120 : 300,
-                                };
-                                setWidgets(prev => [...prev, w]);
-                                notification.success({ message: `"${cleanTitle}" added to canvas`, duration: 2 });
-                              }}
-                              className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-primary transition-colors"
-                              style={{} as any}
-                            >
-                              <Plus size={11} />
-                            </button>
-                            <button
-                              title="Remove from library"
-                              onClick={() => persistChartDelete(sc.id)}
-                              className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-300 hover:text-red-500 hover:bg-red-50 transition-colors"
-                            >
-                              <Trash2 size={11} />
-                            </button>
+                            {isRenamingThis ? (
+                              <div className="flex items-center gap-1 flex-1 min-w-0">
+                                <Input
+                                  size="small"
+                                  autoFocus
+                                  value={renamingChartTitle}
+                                  maxLength={32}
+                                  onChange={e => setRenamingChartTitle(e.target.value)}
+                                  onPressEnter={() => {
+                                    const trimmed = renamingChartTitle.trim();
+                                    if (trimmed) {
+                                      setSavedCharts(prev => prev.map(c => c.id === sc.id ? { ...c, title: trimmed } : c));
+                                      setWidgets(prev => prev.map(w => (w.savedChartId === sc.id || w.title === cleanTitle) ? { ...w, title: trimmed } : w));
+                                      persistChartUpdate(sc.id, trimmed);
+                                    }
+                                    setRenamingChartId(null);
+                                  }}
+                                  className="text-[10px] h-6 flex-1"
+                                />
+                                <Button
+                                  size="small"
+                                  type="primary"
+                                  icon={<Check size={11} />}
+                                  className="h-6 w-6 min-w-0 p-0 flex items-center justify-center shrink-0"
+                                  onClick={() => {
+                                    const trimmed = renamingChartTitle.trim();
+                                    if (trimmed) {
+                                      setSavedCharts(prev => prev.map(c => c.id === sc.id ? { ...c, title: trimmed } : c));
+                                      setWidgets(prev => prev.map(w => (w.savedChartId === sc.id || w.title === cleanTitle) ? { ...w, title: trimmed } : w));
+                                      persistChartUpdate(sc.id, trimmed);
+                                    }
+                                    setRenamingChartId(null);
+                                  }}
+                                />
+                                <Button
+                                  size="small"
+                                  icon={<X size={11} />}
+                                  className="h-6 w-6 min-w-0 p-0 flex items-center justify-center shrink-0"
+                                  onClick={() => setRenamingChartId(null)}
+                                />
+                              </div>
+                            ) : (
+                              <>
+                                <span className="text-[10px] font-semibold text-gray-700 truncate flex-1" title={cleanTitle}>{cleanTitle}</span>
+                                <button
+                                  title="Rename chart"
+                                  onClick={() => {
+                                    setRenamingChartId(sc.id);
+                                    setRenamingChartTitle(cleanTitle);
+                                  }}
+                                  className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-400 hover:text-primary hover:bg-primary/10 transition-colors"
+                                >
+                                  <Pencil size={11} />
+                                </button>
+                                <button
+                                  title="Add to canvas"
+                                  onClick={() => {
+                                    const nextY = widgets.reduce((maxY, item) => Math.max(maxY, (item.y !== undefined && item.y !== Infinity && !isNaN(item.y) ? item.y : 0) + (item.h || 300) + 16), 0);
+                                    const w: CanvasWidget = {
+                                      id: `gc_${Date.now()}`,
+                                      type: 'geochart',
+                                      geoChartConfig: sc.config,
+                                      title: cleanTitle,
+                                      savedChartId: sc.id,
+                                      x: 0,
+                                      y: nextY,
+                                      w: sc.chartType === 'kpi' ? 3 : 6,
+                                      h: sc.chartType === 'kpi' ? 120 : 300,
+                                    };
+                                    setWidgets(prev => [...prev, w]);
+                                    notification.success({ message: `"${cleanTitle}" added to canvas`, duration: 2 });
+                                  }}
+                                  className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-400 hover:text-white hover:bg-primary transition-colors"
+                                >
+                                  <Plus size={11} />
+                                </button>
+                                <button
+                                  title="Remove from library"
+                                  onClick={() => persistChartDelete(sc.id)}
+                                  className="shrink-0 w-6 h-6 rounded-lg flex items-center justify-center text-gray-300 hover:text-red-500 hover:bg-red-50 transition-colors"
+                                >
+                                  <Trash2 size={11} />
+                                </button>
+                              </>
+                            )}
                           </div>
                         );
                       })}
@@ -4067,11 +4172,13 @@ function ViewDashboardContent() {
           dashboardSlug={dashboardSlug}
           createdBy={createdBy}
           initialShareType={shareType}
+          initialPublicPermission={publicPermission}
           initialAllowedUsers={allowedUsers}
           initialAllowedRoles={allowedRoles}
-          onShareUpdated={({ share_type, allowed_users, allowed_roles }) => {
+          onShareUpdated={({ share_type, public_permission, allowed_users, allowed_roles }) => {
             setShareType(share_type as any);
             setIsPublic(share_type === 'PUBLIC');
+            if (public_permission) setPublicPermission(public_permission);
             setAllowedUsers(allowed_users || []);
             setAllowedRoles(allowed_roles || []);
           }}

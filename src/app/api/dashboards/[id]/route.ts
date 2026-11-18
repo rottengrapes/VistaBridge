@@ -33,7 +33,45 @@ function getUser(req: Request) {
   return verifyJwt(h.slice(7));
 }
 
-const COLS = `id, slug, name, description, is_public, share_type, allowed_users, allowed_roles, content, tags, version, thumbnail, created_by, geoserver_url, refresh_interval, created_at, updated_at`;
+async function resolveUserGeoRoles(user: any, geoserverUrl?: string): Promise<{ userGeoRoles: string[]; isAdmin: boolean }> {
+  if (!user) {
+    return { userGeoRoles: [], isAdmin: false };
+  }
+  let roles: string[] = Array.isArray(user.roles) && user.roles.length > 0 ? [...user.roles] : [];
+  try {
+    const upRes = await pool.query(
+      `SELECT role, geoserver_roles FROM user_profiles WHERE username = $1 AND (geoserver_url = $2 OR geoserver_url = '' OR geoserver_url IS NULL) ORDER BY geoserver_url DESC LIMIT 1`,
+      [user.username, geoserverUrl || '']
+    );
+    if (upRes.rows.length > 0) {
+      const rawDbRoles = upRes.rows[0].geoserver_roles;
+      const parsedDbRoles = Array.isArray(rawDbRoles) ? rawDbRoles : (typeof rawDbRoles === 'string' ? JSON.parse(rawDbRoles) : []);
+      if (Array.isArray(parsedDbRoles) && parsedDbRoles.length > 0) {
+        const merged = new Set([...roles, ...parsedDbRoles]);
+        roles = Array.from(merged);
+      }
+      if (upRes.rows[0].role === 'ADMIN' && !roles.includes('ADMIN')) {
+        roles.push('ADMIN');
+      }
+    }
+  } catch {}
+
+  const isAdmin = Boolean(
+    user.role === 'ADMIN' ||
+    user.username?.toLowerCase() === 'admin' ||
+    roles.some((r) => ['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(r.toUpperCase()))
+  );
+
+  if (roles.length === 0) {
+    roles = isAdmin
+      ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED']
+      : ['ROLE_AUTHENTICATED'];
+  }
+
+  return { userGeoRoles: roles, isAdmin };
+}
+
+const COLS = `id, slug, name, description, is_public, share_type, public_permission, allowed_users, allowed_roles, content, tags, version, thumbnail, created_by, geoserver_url, refresh_interval, created_at, updated_at`;
 
 type Ctx = { params: Promise<{ id: string }> };
 
@@ -75,10 +113,8 @@ export async function GET(req: Request, ctx: Ctx) {
     };
 
     const isPublic = shareType === 'PUBLIC' || Boolean(row.is_public);
-    const userGeoRoles: string[] = Array.isArray(user?.roles) && user.roles.length > 0
-      ? user.roles
-      : (user?.role === 'ADMIN' ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED'] : ['ROLE_AUTHENTICATED']);
-    const isAdmin = Boolean(user && (user.role === 'ADMIN' || user.username?.toLowerCase() === 'admin' || userGeoRoles.includes('ADMIN') || userGeoRoles.includes('ROLE_ADMINISTRATOR')));
+    const publicPermission = (row.public_permission || parsedContent?.public_permission || 'VIEWER') === 'EDITOR' ? 'EDITOR' : 'VIEWER';
+    const { userGeoRoles, isAdmin } = await resolveUserGeoRoles(user, row.geoserver_url);
 
     // Enforce authentication & authorization for non-public dashboards
     if (!isPublic) {
@@ -101,20 +137,22 @@ export async function GET(req: Request, ctx: Ctx) {
       }
     }
 
-    const isOwner = Boolean(user?.username && dashboard.created_by && dashboard.created_by.toLowerCase() === user.username.toLowerCase());
+    const isAuthenticated = Boolean(user?.username);
+    const isOwner = Boolean(isAuthenticated && dashboard.created_by && user?.username && dashboard.created_by.toLowerCase() === user.username.toLowerCase());
     const userDirectRole = user?.username ? getUserAssignedRole(allowedUsers, user.username) : null;
-    const userRoleFromGroup = user ? getRoleAssignedPermission(allowedRoles, userGeoRoles) : null;
+    const userRoleFromGroup = isAuthenticated ? getRoleAssignedPermission(allowedRoles, userGeoRoles) : null;
     const effectivePermission = isOwner
       ? 'OWNER'
       : (isAdmin
           ? 'ADMIN'
-          : (userDirectRole === 'EDITOR' || userRoleFromGroup === 'EDITOR'
+          : (isAuthenticated && (userDirectRole === 'EDITOR' || userRoleFromGroup === 'EDITOR' || (isPublic && publicPermission === 'EDITOR'))
               ? 'EDITOR'
               : (userDirectRole || userRoleFromGroup || (isPublic ? 'VIEWER' : 'NONE'))));
-    const canEdit = isOwner || isAdmin || effectivePermission === 'EDITOR';
+    const canEdit = Boolean(isAuthenticated && (isOwner || isAdmin || effectivePermission === 'EDITOR'));
 
     return NextResponse.json({
       ...dashboard,
+      public_permission: publicPermission,
       is_owner: isOwner,
       user_role: effectivePermission,
       can_edit: canEdit,
@@ -138,13 +176,13 @@ export async function PUT(req: Request, ctx: Ctx) {
     try { body = await req.json(); }
     catch { return NextResponse.json({ detail: 'Invalid JSON body.' }, { status: 400 }); }
 
-    const { name, slug, description, is_public, share_type, allowed_users, allowed_roles, content, tags, thumbnail, refresh_interval } = body;
+    const { name, slug, description, is_public, share_type, public_permission, allowed_users, allowed_roles, content, tags, thumbnail, refresh_interval } = body;
     if (!content || !Array.isArray(content.widgets)) {
       return NextResponse.json({ detail: 'content.widgets array is required.' }, { status: 400 });
     }
 
     const check = await pool.query(
-      'SELECT id, slug, created_by, allowed_users, share_type, is_public FROM dashboards WHERE id = $1 OR LOWER(slug) = LOWER($1)',
+      'SELECT id, slug, created_by, allowed_users, allowed_roles, share_type, is_public, public_permission FROM dashboards WHERE id = $1 OR LOWER(slug) = LOWER($1)',
       [id]
     );
     if (!check.rows.length) {
@@ -156,17 +194,15 @@ export async function PUT(req: Request, ctx: Ctx) {
     const existing = check.rows[0];
     const internalId = existing.id;
     const isOwner = Boolean(existing.created_by && existing.created_by.toLowerCase() === user.username.toLowerCase());
-    const userGeoRoles: string[] = Array.isArray(user.roles) && user.roles.length > 0
-      ? user.roles
-      : (user.role === 'ADMIN' ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED'] : ['ROLE_AUTHENTICATED']);
-    const isAdmin = Boolean(user && (user.role === 'ADMIN' || user.username?.toLowerCase() === 'admin' || userGeoRoles.includes('ADMIN') || userGeoRoles.includes('ROLE_ADMINISTRATOR')));
+    const { userGeoRoles, isAdmin } = await resolveUserGeoRoles(user, existing.geoserver_url);
     const allowedUsers = normalizeAllowedUsers(existing.allowed_users);
     const userRole = getUserAssignedRole(allowedUsers, user.username);
     const isEditor = userRole === 'EDITOR';
     const allowedRoles = normalizeAllowedRoles(existing.allowed_roles);
     const isRoleEditor = getRoleAssignedPermission(allowedRoles, userGeoRoles) === 'EDITOR';
+    const isPublicEditor = (existing.share_type === 'PUBLIC' || Boolean(existing.is_public)) && existing.public_permission === 'EDITOR';
 
-    if (!isOwner && !isAdmin && !isEditor && !isRoleEditor) {
+    if (!isOwner && !isAdmin && !isEditor && !isRoleEditor && !isPublicEditor) {
       return NextResponse.json({
         detail: 'You do not have permission to modify this dashboard. You have view-only access.',
       }, { status: 403 });
@@ -226,26 +262,30 @@ export async function PUT(req: Request, ctx: Ctx) {
     const finalIsPublic = canManageSettings
       ? (finalShareType === 'PUBLIC' ? 1 : (finalShareType ? 0 : (is_public != null ? (is_public ? 1 : 0) : null)))
       : null;
+    const finalPublicPermission = canManageSettings && public_permission !== undefined
+      ? (public_permission === 'EDITOR' ? 'EDITOR' : 'VIEWER')
+      : null;
 
     const finalRefreshInterval = refresh_interval !== undefined ? Number(refresh_interval) : (content?.refreshInterval !== undefined ? Number(content.refreshInterval) : null);
 
     const now = new Date().toISOString();
     const { rows } = await pool.query(
       `UPDATE dashboards
-          SET name             = COALESCE($1, name),
-               slug             = COALESCE($2, slug),
-               description      = COALESCE($3, description),
-               is_public        = COALESCE($4, is_public),
-               share_type       = COALESCE($5, share_type),
-               allowed_users    = COALESCE($6, allowed_users),
-               allowed_roles    = COALESCE($7, allowed_roles),
-               content          = $8::jsonb,
-               tags             = COALESCE($9::text[], tags),
-               thumbnail        = COALESCE($10, thumbnail),
-               refresh_interval = COALESCE($11, refresh_interval),
-               version          = version + 1,
-               updated_at       = $12
-         WHERE id = $13
+          SET name              = COALESCE($1, name),
+               slug              = COALESCE($2, slug),
+               description       = COALESCE($3, description),
+               is_public         = COALESCE($4, is_public),
+               share_type        = COALESCE($5, share_type),
+               allowed_users     = COALESCE($6, allowed_users),
+               allowed_roles     = COALESCE($7, allowed_roles),
+               content           = $8::jsonb,
+               tags              = COALESCE($9::text[], tags),
+               thumbnail         = COALESCE($10, thumbnail),
+               refresh_interval  = COALESCE($11, refresh_interval),
+               public_permission = COALESCE($12, public_permission),
+               version           = version + 1,
+               updated_at        = $13
+         WHERE id = $14
          RETURNING ${COLS}`,
       [
         finalName,
@@ -259,6 +299,7 @@ export async function PUT(req: Request, ctx: Ctx) {
         tagsArr,
         thumbnail ?? null,
         finalRefreshInterval,
+        finalPublicPermission,
         now,
         internalId,
       ]
@@ -294,10 +335,7 @@ export async function PATCH(req: Request, ctx: Ctx) {
     const existing = check.rows[0];
     const internalId = existing.id;
     const isOwner = Boolean(existing.created_by && existing.created_by.toLowerCase() === user.username.toLowerCase());
-    const userGeoRoles: string[] = Array.isArray(user?.roles) && user.roles.length > 0
-      ? user.roles
-      : (user?.role === 'ADMIN' ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED'] : ['ROLE_AUTHENTICATED']);
-    const isAdmin = Boolean(user && (user.role === 'ADMIN' || user.username?.toLowerCase() === 'admin' || userGeoRoles.includes('ADMIN') || userGeoRoles.includes('ROLE_ADMINISTRATOR')));
+    const { userGeoRoles, isAdmin } = await resolveUserGeoRoles(user, existing.geoserver_url);
 
     if (!isOwner && !isAdmin) {
       return NextResponse.json({ detail: 'You do not have permission to update this dashboard.' }, { status: 403 });
@@ -350,6 +388,10 @@ export async function PATCH(req: Request, ctx: Ctx) {
       vals.push(body.is_public ? 1 : 0);
       sets.push(`share_type=$${i++}`);
       vals.push(body.is_public ? 'PUBLIC' : 'PRIVATE');
+    }
+    if (body.public_permission != null) {
+      sets.push(`public_permission=$${i++}`);
+      vals.push(body.public_permission === 'EDITOR' ? 'EDITOR' : 'VIEWER');
     }
     if (body.allowed_users != null) {
       sets.push(`allowed_users=$${i++}`);

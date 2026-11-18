@@ -14,6 +14,7 @@ export interface LayerAttributeSchema {
   type: 'string' | 'integer' | 'float' | 'boolean' | 'date' | 'datetime';
   required: boolean;
   nillable: boolean;
+  maxLength?: number;
 }
 
 export interface WfsLayerSchema {
@@ -222,7 +223,8 @@ export function parseDescribeFeatureTypeXml(
   const targetXml = sequenceMatch ? sequenceMatch[1] : scopeXml;
 
   // Parse elements using regex for cross-environment compatibility (Node and Browser)
-  const elementRegex = /<xsd:element\s+([^>]+)\/>/gi;
+  // Matches both self-closing <xsd:element .../> and block <xsd:element ...>...</xsd:element>
+  const elementRegex = /<xsd:element\b([^>]*?)(?:\/>|>([\s\S]*?)<\/xsd:element>)/gi;
   let match: RegExpExecArray | null;
 
   const GEOM_COL_NAMES = new Set([
@@ -232,8 +234,9 @@ export function parseDescribeFeatureTypeXml(
 
   while ((match = elementRegex.exec(targetXml)) !== null) {
     const attrsStr = match[1];
+    const innerXml = match[2] || '';
     const nameMatch = attrsStr.match(/name="([^"]+)"/);
-    const typeMatch = attrsStr.match(/type="([^"]+)"/);
+    const typeMatch = attrsStr.match(/type="([^"]+)"/) || innerXml.match(/base="([^"]+)"/);
     const nillableMatch = attrsStr.match(/nillable="([^"]+)"/);
     const minOccursMatch = attrsStr.match(/minOccurs="([^"]+)"/);
 
@@ -244,6 +247,10 @@ export function parseDescribeFeatureTypeXml(
     const isNillable = nillableMatch ? nillableMatch[1] === 'true' : true;
     const minOccurs = minOccursMatch ? parseInt(minOccursMatch[1], 10) : 0;
     const isRequired = minOccurs > 0 && !isNillable;
+
+    // Extract maxLength restriction if present in schema (e.g. <xsd:maxLength value="5"/>)
+    const maxLengthMatch = (innerXml + attrsStr).match(/maxLength\s+value="(\d+)"/i);
+    const maxLength = maxLengthMatch ? parseInt(maxLengthMatch[1], 10) : undefined;
 
     // Skip geometry field
     if (
@@ -289,7 +296,8 @@ export function parseDescribeFeatureTypeXml(
       name: colName,
       type: mappedType,
       required: isRequired,
-      nillable: isNillable
+      nillable: isNillable,
+      maxLength,
     });
   }
 
@@ -322,7 +330,7 @@ export function getFieldPlaceholder(type?: string, isRequired = false): string {
   if (type === 'integer') typeLabel = 'int';
   else if (type === 'float') typeLabel = 'decimal';
   else if (type === 'boolean') typeLabel = 'boolean';
-  else if (type === 'date') typeLabel = 'date (YYYY-MM-DD)';
+  else if (type === 'date') typeLabel = 'date';
   else if (type === 'datetime') typeLabel = 'datetime';
 
   return isRequired ? `${typeLabel} (required)` : typeLabel;

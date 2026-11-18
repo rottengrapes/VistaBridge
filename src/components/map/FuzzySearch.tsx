@@ -12,7 +12,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 'use client';
 
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Select, Button, Tag, Spin, Empty } from 'antd';
 import { Search, X, FileJson } from 'lucide-react';
 import { apiRequest } from '@/lib/api';
@@ -38,7 +38,34 @@ export default function FuzzySearch({ layers, onSearch, loading, selectedLayerId
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const debounceTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const vectorLayers = layers.filter(l => l.type === 'VECTOR' || l.data_type === 'VECTOR');
+  const vectorLayers = useMemo(() => {
+    return (layers || []).filter((l: any) => {
+      const id = String(l?.id || l?.layer_id || l?.name || '').toLowerCase();
+      // Exclude on-the-fly and temporary result layers (e.g. WPS results, in-memory GeoJSON)
+      if (
+        !id ||
+        id.startsWith('wps_result_') ||
+        id.startsWith('raster_res_') ||
+        id.startsWith('result_') ||
+        id.startsWith('temp_') ||
+        id.startsWith('measure_') ||
+        id.startsWith('annotation_') ||
+        Boolean(l?.geojson) ||
+        Boolean(l?.isResult)
+      ) {
+        return false;
+      }
+
+      const t = String(l.type || l.data_type || '').toUpperCase();
+      return (
+        t === 'VECTOR' ||
+        (!t &&
+          !String(l.type || '').toUpperCase().includes('RASTER') &&
+          !String(l.type || '').toUpperCase().includes('POINTCLOUD') &&
+          !String(l.type || '').toUpperCase().includes('GROUP'))
+      );
+    });
+  }, [layers]);
 
 
   const fetchSuggestions = useCallback(async (layerId: string, query: string) => {
@@ -195,9 +222,9 @@ export default function FuzzySearch({ layers, onSearch, loading, selectedLayerId
               <span className="text-xs">{option.label}</span>
             </div>
           )}
-          options={vectorLayers.map(l => ({
-            label: l.name,
-            value: l.id
+          options={vectorLayers.map((l: any) => ({
+            label: l.name || l.title || l.id,
+            value: l.id || l.layer_id || l.name,
           }))}
           notFoundContent={
             <Empty

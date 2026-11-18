@@ -244,8 +244,9 @@ let turfBuffer: ((geom: any, radius: number, opts?: any) => any) | null = null;
 import('@turf/buffer').then(m => { turfBuffer = m.default ?? m.buffer ?? null; }).catch(() => { });
 
 const lonLatToMercator = (lon: number, lat: number): [number, number] => {
+  const clampedLat = Math.max(-85.05112878, Math.min(85.05112878, lat));
   const x = (lon * 20037508.34) / 180;
-  let y = Math.log(Math.tan(((90 + lat) * Math.PI) / 360)) / (Math.PI / 180);
+  let y = Math.log(Math.tan(((90 + clampedLat) * Math.PI) / 360)) / (Math.PI / 180);
   y = (y * 20037508.34) / 180;
   return [x, y];
 };
@@ -732,7 +733,7 @@ export default function WpsAnalysisPanel({
           }
 
           // If it IS a spatial layer input, check if the selected layer is a raster layer
-          const isRasterLayer = addedLayers.some(l => l.id === val && l.type === 'RASTER');
+          const isRasterLayer = addedLayers.some(l => l.id === val && (l.type || '').toUpperCase() === 'RASTER');
           if (isRasterLayer) {
             const layerState = addedLayers.find(l => l.id === val);
             const bbox = layerState?.bbox || [-180, -90, 180, 90];
@@ -793,13 +794,8 @@ export default function WpsAnalysisPanel({
           }
 
           if (isWfsReference) {
-            const isDistanceOrBufferProcess =
-              selectedProcess.toLowerCase() === 'gs:distance' ||
-              selectedProcess.toLowerCase() === 'jts:distance' ||
-              selectedProcess.toLowerCase() === 'gs:bufferfeaturecollection' ||
-              selectedProcess.toLowerCase() === 'gs:buffer' ||
-              selectedProcess.toLowerCase() === 'jts:buffer';
-            const srsName = isDistanceOrBufferProcess ? 'EPSG:3857' : 'EPSG:4326';
+            // Keep WFS query in EPSG:4326 to prevent GeoServer on-the-fly Mercator reprojection failure at poles (e.g. 90°S)
+            const srsName = 'EPSG:4326';
 
             dataInputsXml += `
     <wps:Input>
@@ -900,14 +896,11 @@ export default function WpsAnalysisPanel({
               finalPayload = cleanGeoJsonGeometry(finalPayload);
             }
 
-            // If it is a distance or buffer process, project coordinates to EPSG:3857 (Web Mercator meters) client-side
-            const isDistanceOrBufferProcess =
+            // If it is a distance process, project coordinates to EPSG:3857 (Web Mercator meters) client-side
+            const isDistanceProcess =
               selectedProcess.toLowerCase() === 'gs:distance' ||
-              selectedProcess.toLowerCase() === 'jts:distance' ||
-              selectedProcess.toLowerCase() === 'gs:bufferfeaturecollection' ||
-              selectedProcess.toLowerCase() === 'gs:buffer' ||
-              selectedProcess.toLowerCase() === 'jts:buffer';
-            if (isDistanceOrBufferProcess) {
+              selectedProcess.toLowerCase() === 'jts:distance';
+            if (isDistanceProcess) {
               if (finalPayload.type === 'FeatureCollection') {
                 finalPayload = {
                   ...finalPayload,
@@ -949,11 +942,21 @@ export default function WpsAnalysisPanel({
     </wps:Input>`;
           }
         } else {
+          let literalVal = val;
+          const isBufferProc = selectedProcess.toLowerCase().includes('buffer');
+          if (isBufferProc && input.identifier === 'distance') {
+            const num = Number(val);
+            if (!isNaN(num) && num > 0) {
+              // Layer coordinates are kept in EPSG:4326 (degrees).
+              // Convert user-entered distance in meters to degrees (~111,320m per degree)
+              literalVal = num / 111320;
+            }
+          }
           dataInputsXml += `
     <wps:Input>
       <ows:Identifier>${input.identifier}</ows:Identifier>
       <wps:Data>
-        <wps:LiteralData>${val}</wps:LiteralData>
+        <wps:LiteralData>${literalVal}</wps:LiteralData>
       </wps:Data>
     </wps:Input>`;
         }
@@ -1258,6 +1261,48 @@ export default function WpsAnalysisPanel({
       onExecuteSuccess(geojson, finalLayerName);
     } catch (err: any) {
       console.error(err);
+
+      // Attempt client-side Turf fallback for Buffer if GeoServer execution fails
+      const isBufferProc = selectedProcess.toLowerCase().includes('buffer');
+      if (isBufferProc && turfBuffer) {
+        try {
+          const featuresInput = processInputs.find(i => isLayerInput(i.identifier));
+          const layerVal = featuresInput ? formValues[featuresInput.identifier] : '';
+          const distanceVal = Number(formValues['distance']) || 100;
+
+          let fc: any = null;
+          if (getLayerFeatures && layerVal) {
+            fc = getLayerFeatures(layerVal);
+          }
+          if (!fc && typeof layerVal === 'string') {
+            const matchedLayer = addedLayers.find(l => l.id === layerVal);
+            const typeName = matchedLayer?.name || layerVal;
+            const queryUrl = `${geoserverUrl}/ows?service=WFS&version=1.0.0&request=GetFeature&typeName=${encodeURIComponent(typeName)}&outputFormat=application/json&srsName=EPSG:4326`;
+            const fallbackHeaders: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
+            const fetchRes = await fetch(queryUrl, { headers: fallbackHeaders });
+            if (fetchRes.ok) {
+              fc = await fetchRes.json();
+            }
+          }
+
+          if (fc && fc.features && fc.features.length > 0) {
+            const buffered = turfBuffer(fc, distanceVal, { units: 'meters' });
+            if (buffered) {
+              const finalLayerName = resultLayerName.trim() || `${selectedProcess.split(':').pop()}_result`;
+              onExecuteSuccess(buffered, finalLayerName);
+              notification.success({
+                message: 'WPS Execution Complete',
+                description: `Successfully executed Buffer via Turf.js client-side`,
+                placement: 'topRight'
+              });
+              return;
+            }
+          }
+        } catch (fallbackErr) {
+          console.warn('Client-side turf fallback also failed:', fallbackErr);
+        }
+      }
+
       notification.error({
         message: 'WPS Execution Failed',
         description: err.message || 'An error occurred during WPS process execution.',
@@ -1269,12 +1314,10 @@ export default function WpsAnalysisPanel({
   };
 
   const vectorLayers = addedLayers.filter(l =>
-    l.type === 'VECTOR' &&
-    (allDatasets || []).some(d => d.id === l.id || d.name === l.id)
+    (l.type || '').toUpperCase() === 'VECTOR'
   );
   const _rasterLayers = addedLayers.filter(l =>
-    l.type === 'RASTER' &&
-    (allDatasets || []).some(d => d.id === l.id || d.name === l.id)
+    (l.type || '').toUpperCase() === 'RASTER'
   );
   const activeProcessDetails = processes.find(p => p.identifier === selectedProcess);
 

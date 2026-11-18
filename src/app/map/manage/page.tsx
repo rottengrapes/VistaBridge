@@ -132,7 +132,7 @@ export default function ManageMapsPage() {
   const fetchMaps = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const response = await apiRequest('/maps/');
+      const response = await apiRequest('/maps');
       if (!response.ok) throw new Error('Failed to fetch map workspaces');
       const data = await response.json();
       setMaps(data);

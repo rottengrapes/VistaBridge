@@ -51,18 +51,6 @@ export async function POST(request: NextRequest) {
     return res;
   }
 
-  // Issue a fresh access token (short-lived, 1 hour)
-  const newAccess = signJwt(
-    { username: payload.username, role: payload.role, geoserverUrl: payload.geoserverUrl },
-    3600
-  );
-
-  // Optionally rotate the refresh token (new 7-day token, resets expiry)
-  const newRefresh = signJwt(
-    { username: payload.username, role: payload.role, geoserverUrl: payload.geoserverUrl },
-    7 * 24 * 3600
-  );
-
   // Retrieve GeoServer credentials from secure server-side cookies
   const geoserverAuth = request.cookies.get('geoserver_auth')?.value;
   const geoserverUrl =
@@ -71,25 +59,49 @@ export async function POST(request: NextRequest) {
     process.env.NEXT_PUBLIC_GEOSERVER_URL ||
     'http://localhost:8080/geoserver';
 
-  // Fetch optional profile metadata (first_name, last_name, email) from database
+  // Fetch profile metadata and assigned GeoServer roles from database
   let firstName = '';
   let lastName = '';
   let emailAddress = '';
+  let userRoles: string[] = Array.isArray(payload.roles) && payload.roles.length > 0 ? payload.roles : [];
 
   try {
     await initDb();
     const profileResult = await pool.query(
-      'SELECT first_name, last_name, email FROM user_profiles WHERE username = $1 AND geoserver_url = $2',
+      'SELECT first_name, last_name, email, role, geoserver_roles FROM user_profiles WHERE username = $1 AND (geoserver_url = $2 OR geoserver_url = \'\' OR geoserver_url IS NULL) ORDER BY geoserver_url DESC LIMIT 1',
       [payload.username, geoserverUrl]
     );
     if (profileResult.rows.length > 0) {
       firstName = profileResult.rows[0].first_name || '';
       lastName = profileResult.rows[0].last_name || '';
       emailAddress = profileResult.rows[0].email || '';
+      const rawRoles = profileResult.rows[0].geoserver_roles;
+      const parsedRoles = Array.isArray(rawRoles) ? rawRoles : (typeof rawRoles === 'string' ? JSON.parse(rawRoles) : []);
+      if (Array.isArray(parsedRoles) && parsedRoles.length > 0) {
+        userRoles = parsedRoles;
+      }
     }
   } catch (dbErr) {
     // Non-fatal if database profile lookup is temporarily unavailable
   }
+
+  // Ensure ADMINs always have admin role mappings
+  if (payload.role === 'ADMIN' || payload.username?.toLowerCase() === 'admin') {
+    const adminSet = new Set([...userRoles, 'ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED']);
+    userRoles = Array.from(adminSet);
+  }
+
+  // Issue a fresh access token (short-lived, 1 hour) with roles preserved
+  const newAccess = signJwt(
+    { username: payload.username, role: payload.role, geoserverUrl: payload.geoserverUrl, roles: userRoles },
+    3600
+  );
+
+  // Rotate the refresh token (new 7-day token, resets expiry) with roles preserved
+  const newRefresh = signJwt(
+    { username: payload.username, role: payload.role, geoserverUrl: payload.geoserverUrl, roles: userRoles },
+    7 * 24 * 3600
+  );
 
   const role = payload.role === 'ADMIN' ? 'ADMIN' : 'USER';
   const username = payload.username;
@@ -97,6 +109,7 @@ export async function POST(request: NextRequest) {
   const user = {
     username,
     role,
+    roles: userRoles,
     geoserverUrl,
     geoserverAuth: geoserverAuth || undefined,
     first_name: firstName || undefined,

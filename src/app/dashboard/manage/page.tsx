@@ -68,6 +68,7 @@ interface Dashboard {
   description?: string;
   is_public?: boolean;
   share_type?: 'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC';
+  public_permission?: 'VIEWER' | 'EDITOR';
   allowed_users?: AllowedUserEntry[] | string[];
   allowed_roles?: AllowedRoleEntry[] | string[];
   created_by?: string;
@@ -591,8 +592,24 @@ export default function ManageDashboardsPage() {
       key: 'sharing',
       render: (_: any, record: Dashboard) => {
         const type = record.share_type || (record.is_public ? 'PUBLIC' : 'PRIVATE');
+        if (type === 'PUBLIC' || record.is_public) {
+          return (
+            <div className="flex items-center gap-1.5">
+              <Tag icon={<Globe size={11} className="inline mr-1" />} color="green" className="rounded-lg text-[11px] font-semibold py-0.5">
+                Public Link
+              </Tag>
+              {!record.is_owner && (
+                <Tag color={isAdmin ? 'purple' : 'default'} className="rounded-lg text-[10px] font-bold py-0.5">
+                  {isAdmin ? 'Admin' : 'Viewer'}
+                </Tag>
+              )}
+            </div>
+          );
+        }
         if (type === 'ROLES' || (record.allowed_roles && (record.allowed_roles as any).length > 0)) {
-          const normRoles = normalizeAllowedRoles(record.allowed_roles);
+          const normRoles = normalizeAllowedRoles(record.allowed_roles).filter(
+            (r) => !['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(r.role.toUpperCase())
+          );
           const tooltipText = normRoles.length > 0
             ? normRoles.map((r) => `${r.role} (${r.permission === 'EDITOR' ? 'Editor' : 'Viewer'})`).join(', ')
             : 'No roles';
@@ -631,20 +648,7 @@ export default function ManageDashboardsPage() {
             </div>
           );
         }
-        if (type === 'PUBLIC') {
-          return (
-            <div className="flex items-center gap-1.5">
-              <Tag icon={<Globe size={11} className="inline mr-1" />} color="green" className="rounded-lg text-[11px] font-semibold py-0.5">
-                Public Link
-              </Tag>
-              {!record.is_owner && (
-                <Tag color={isAdmin ? 'purple' : 'default'} className="rounded-lg text-[10px] font-bold py-0.5">
-                  {isAdmin ? 'Admin' : 'Viewer'}
-                </Tag>
-              )}
-            </div>
-          );
-        }
+
         return (
           <Tag icon={<Lock size={11} className="inline mr-1" />} color="orange" className="rounded-lg text-[11px] font-semibold py-0.5">
             {record.is_owner ? 'Private (Only Me)' : (isAdmin ? 'Private (Admin Access)' : 'Private')}
@@ -1190,10 +1194,12 @@ export default function ManageDashboardsPage() {
                 placeholder="Search and select GeoServer roles..."
                 loading={loadingRoles}
                 className="w-full rounded-xl"
-                options={availableRoles.map((r) => ({
-                  label: r,
-                  value: r,
-                }))}
+                options={availableRoles
+                  .filter((r) => !['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(r.toUpperCase()))
+                  .map((r) => ({
+                    label: r,
+                    value: r,
+                  }))}
               />
             </Form.Item>
           )}
@@ -1292,6 +1298,7 @@ export default function ManageDashboardsPage() {
           dashboardSlug={sharingDashboard.slug}
           createdBy={sharingDashboard.created_by}
           initialShareType={sharingDashboard.share_type}
+          initialPublicPermission={sharingDashboard.public_permission}
           initialAllowedUsers={sharingDashboard.allowed_users}
           initialAllowedRoles={sharingDashboard.allowed_roles}
           onShareUpdated={(updated) => {
@@ -1302,6 +1309,7 @@ export default function ManageDashboardsPage() {
                       ...d,
                       name: updated.name || d.name,
                       share_type: updated.share_type as any,
+                      public_permission: updated.public_permission,
                       allowed_users: updated.allowed_users,
                       allowed_roles: updated.allowed_roles,
                     }

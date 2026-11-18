@@ -47,7 +47,7 @@ function getGeoserverUrl(req: Request, user: any): string {
   return (process.env.NEXT_PUBLIC_GEOSERVER_URL || 'http://localhost:8080/geoserver').replace(/\/+$/, '');
 }
 
-const COLS = `id, slug, name, description, is_public, share_type, allowed_users, allowed_roles, content, tags, version, thumbnail, created_by, created_at, updated_at`;
+const COLS = `id, slug, name, description, is_public, share_type, public_permission, allowed_users, allowed_roles, content, tags, version, thumbnail, created_by, created_at, updated_at`;
 
 
 // GET /api/dashboards
@@ -71,16 +71,41 @@ export async function GET(request: Request) {
       [geoserverUrl]
     );
 
-    const userGeoRoles: string[] = Array.isArray(user.roles) && user.roles.length > 0
-      ? user.roles
-      : (user.role === 'ADMIN' ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED'] : ['ROLE_AUTHENTICATED']);
+    // Resolve user's active GeoServer roles from token and user_profiles
+    let userGeoRoles: string[] = Array.isArray(user.roles) && user.roles.length > 0 ? [...user.roles] : [];
 
-    const isSystemAdmin = user.role === 'ADMIN' || user.username?.toLowerCase() === 'admin' || userGeoRoles.includes('ADMIN') || userGeoRoles.includes('ROLE_ADMINISTRATOR');
+    try {
+      const upRes = await pool.query(
+        `SELECT role, geoserver_roles FROM user_profiles WHERE username = $1 AND (geoserver_url = $2 OR geoserver_url = '' OR geoserver_url IS NULL) ORDER BY geoserver_url DESC LIMIT 1`,
+        [user.username, geoserverUrl]
+      );
+      if (upRes.rows.length > 0) {
+        const rawDbRoles = upRes.rows[0].geoserver_roles;
+        const parsedDbRoles = Array.isArray(rawDbRoles) ? rawDbRoles : (typeof rawDbRoles === 'string' ? JSON.parse(rawDbRoles) : []);
+        if (Array.isArray(parsedDbRoles) && parsedDbRoles.length > 0) {
+          const merged = new Set([...userGeoRoles, ...parsedDbRoles]);
+          userGeoRoles = Array.from(merged);
+        }
+        if (upRes.rows[0].role === 'ADMIN' && !userGeoRoles.includes('ADMIN')) {
+          userGeoRoles.push('ADMIN');
+        }
+      }
+    } catch {}
+
+    const isSystemAdmin = user.role === 'ADMIN' || user.username?.toLowerCase() === 'admin' || userGeoRoles.some((r) => ['ADMIN', 'ROLE_ADMINISTRATOR', 'ADMINISTRATOR'].includes(r.toUpperCase()));
+
+    if (userGeoRoles.length === 0) {
+      userGeoRoles = isSystemAdmin
+        ? ['ADMIN', 'ROLE_ADMINISTRATOR', 'ROLE_AUTHENTICATED']
+        : ['ROLE_AUTHENTICATED'];
+    }
 
     const mapped = (rows || []).map((r: any) => {
       const allowedUsers = normalizeAllowedUsers(r.allowed_users);
       const allowedRoles = normalizeAllowedRoles(r.allowed_roles);
       const shareType = r.share_type || (r.is_public ? 'PUBLIC' : (allowedRoles.length > 0 ? 'ROLES' : (allowedUsers.length > 0 ? 'USERS' : 'PRIVATE')));
+      const isPublic = shareType === 'PUBLIC' || Boolean(r.is_public);
+      const publicPermission = (r.public_permission || (typeof r.content === 'object' ? r.content?.public_permission : null) || 'VIEWER') === 'EDITOR' ? 'EDITOR' : 'VIEWER';
       const isOwner = Boolean(r.created_by && r.created_by.toLowerCase() === user.username.toLowerCase());
       const isAdmin = isSystemAdmin;
 
@@ -90,15 +115,16 @@ export async function GET(request: Request) {
         ? 'OWNER'
         : (isAdmin
             ? 'ADMIN'
-            : (userDirectRole === 'EDITOR' || userRoleFromGroup === 'EDITOR'
+            : (userDirectRole === 'EDITOR' || userRoleFromGroup === 'EDITOR' || (isPublic && publicPermission === 'EDITOR')
                 ? 'EDITOR'
-                : (userDirectRole || userRoleFromGroup || (shareType === 'PUBLIC' ? 'VIEWER' : 'NONE'))));
+                : (userDirectRole || userRoleFromGroup || (isPublic ? publicPermission : 'NONE'))));
       const isEditor = effectivePermission === 'EDITOR';
 
       return {
         ...r,
         slug: r.slug || r.id,
         share_type: shareType,
+        public_permission: publicPermission,
         allowed_users: allowedUsers,
         allowed_roles: allowedRoles,
         is_owner: isOwner,
@@ -111,11 +137,13 @@ export async function GET(request: Request) {
     // 1. System administrators see ALL dashboards across the workspace
     // 2. Regular users see:
     //    a. Dashboards they created (d.is_owner)
-    //    b. Dashboards shared with their GeoServer roles (isRoleInAllowedList)
-    //    c. Dashboards shared with their user account (share_type === 'USERS' && allowed_users includes user)
+    //    b. Dashboards that are public / anyone with the link (d.share_type === 'PUBLIC' || d.is_public)
+    //    c. Dashboards shared with their GeoServer roles (isRoleInAllowedList)
+    //    d. Dashboards shared with their user account (share_type === 'USERS' && allowed_users includes user)
     const visible = mapped.filter((d: any) => {
       if (isSystemAdmin) return true;
       if (d.is_owner) return true;
+      if (d.share_type === 'PUBLIC' || d.is_public) return true;
       if (d.share_type === 'USERS' && isUserInAllowedList(d.allowed_users, user.username)) return true;
       if (isRoleInAllowedList(d.allowed_roles, userGeoRoles)) return true;
       return false;
@@ -142,7 +170,7 @@ export async function POST(request: Request) {
     }
 
     const body = await request.json();
-    const { name, slug, description, is_public, share_type, allowed_users, allowed_roles, content, tags, thumbnail } = body;
+    const { name, slug, description, is_public, share_type, public_permission, allowed_users, allowed_roles, content, tags, thumbnail } = body;
     if (!name?.trim()) return NextResponse.json({ detail: 'name is required.' }, { status: 400 });
 
     let finalSlug = '';
@@ -178,17 +206,22 @@ export async function POST(request: Request) {
       : '{}';
 
     const finalShareType = share_type || (is_public ? 'PUBLIC' : 'PRIVATE');
+    const finalPublicPermission = public_permission === 'EDITOR' ? 'EDITOR' : 'VIEWER';
     const normalizedAllowedUsers = normalizeAllowedUsers(allowed_users);
     const finalAllowedUsers = JSON.stringify(normalizedAllowedUsers);
     const finalAllowedRoles = JSON.stringify(normalizeAllowedRoles(allowed_roles));
     const finalIsPublic = finalShareType === 'PUBLIC' || Boolean(is_public) ? 1 : 0;
+    const finalContent = content ?? { widgets: [] };
+    if (typeof finalContent === 'object' && finalContent !== null) {
+      finalContent.public_permission = finalPublicPermission;
+    }
 
     const id = crypto.randomUUID();
     const geoserverUrl = getGeoserverUrl(request, user);
     const now = new Date().toISOString();
     const { rows } = await pool.query(
-      `INSERT INTO dashboards (id, slug, name, description, is_public, share_type, allowed_users, allowed_roles, content, tags, thumbnail, created_by, geoserver_url, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::text[], $11, $12, $13, $14, $15)
+      `INSERT INTO dashboards (id, slug, name, description, is_public, share_type, public_permission, allowed_users, allowed_roles, content, tags, thumbnail, created_by, geoserver_url, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text[], $12, $13, $14, $15, $16)
        RETURNING ${COLS}`,
       [
         id,
@@ -197,9 +230,10 @@ export async function POST(request: Request) {
         description ?? '',
         finalIsPublic,
         finalShareType,
+        finalPublicPermission,
         finalAllowedUsers,
         finalAllowedRoles,
-        JSON.stringify(content ?? { widgets: [] }),
+        JSON.stringify(finalContent),
         tagsArr,
         thumbnail ?? null,
         user.username,

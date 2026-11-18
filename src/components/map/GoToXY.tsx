@@ -30,6 +30,7 @@ interface GoToXYProps {
   token: string | null;
   activeMarkerCoords: [number, number] | null;
   onShowMarker: (lon: number, lat: number) => void;
+  isQuickMap?: boolean;
 }
 
 interface SavedPoint {
@@ -171,7 +172,8 @@ export default function GoToXY({
   onMapClickRegister,
   token,
   activeMarkerCoords,
-  onShowMarker
+  onShowMarker,
+  isQuickMap = false,
 }: GoToXYProps) {
   const { notification } = App.useApp();
   const [activeTab, setActiveTab] = useState<'DD' | 'DMS' | 'UTM' | 'Export'>('DD');
@@ -351,6 +353,14 @@ export default function GoToXY({
   }
 
   function handleSave() {
+    if (isQuickMap || !token) {
+      notification.info({
+        message: 'Quick Map Mode',
+        description: 'Saving coordinate points is not available in Quick Map mode. Please log in to bookmark locations.',
+        placement: 'topRight',
+      });
+      return;
+    }
     if (!isDdValid()) return;
     const lon = parseFloat(dd.lon);
     const lat = parseFloat(dd.lat);
@@ -610,7 +620,17 @@ export default function GoToXY({
       {activeTab !== 'Export' && (
         <div className="grid grid-cols-2 gap-2 pt-2 border-t border-gray-100">
           <Button size="small" icon={<Clipboard size={12} />} onClick={handleCopy} disabled={!isDdValid()} className="w-full flex items-center justify-center gap-1">Copy</Button>
-          <Button size="small" icon={<Save size={12} />} onClick={handleSave} disabled={!isDdValid()} className="w-full flex items-center justify-center gap-1">Save</Button>
+          <Tooltip title={isQuickMap || !token ? "Saving coordinate points is disabled in Quick Map mode (login required)" : "Save Location Point"}>
+            <Button
+              size="small"
+              icon={<Save size={12} />}
+              onClick={handleSave}
+              disabled={Boolean(isQuickMap || !token || !isDdValid())}
+              className="w-full flex items-center justify-center gap-1"
+            >
+              Save
+            </Button>
+          </Tooltip>
           {activeMarkerCoords !== null ? (
             <Button size="small" icon={<Trash2 size={12} />} onClick={handleClear} className="w-full flex items-center justify-center gap-1">Clear</Button>
           ) : (
@@ -624,81 +644,81 @@ export default function GoToXY({
         <div className="flex items-center justify-between">
           <span className="text-xs font-bold text-gray-700">Saved Locations</span>
         </div>
-        {exportLoading && <div className="text-xs text-gray-400 text-center py-4">Loading saved locations...</div>}
-        {exportError && (
+        {isQuickMap || !token ? (
+          <div className="text-[11px] text-gray-400 text-center py-3 bg-gray-50/60 rounded-xl border border-dashed border-gray-200 px-3">
+            Saving locations is disabled in Quick Map mode. Please log in to bookmark and manage coordinate points.
+          </div>
+        ) : exportLoading ? (
+          <div className="text-xs text-gray-400 text-center py-4">Loading saved locations...</div>
+        ) : exportError ? (
           <div className="flex flex-col items-center gap-2 py-4">
             <div className="text-xs text-red-500">Failed to load saved locations.</div>
             <Button size="small" onClick={loadSavedPoints}>Retry</Button>
           </div>
-        )}
-        {!exportLoading && !exportError && (
-          <>
-            {savedPoints.length === 0 ? (
-              <div className="text-xs text-gray-400 text-center py-4 bg-gray-50/50 rounded-xl border border-dashed border-gray-100">No saved points yet.</div>
-            ) : (
-              <div className="flex flex-col gap-1">
-                <Table
-                  size="small"
-                  pagination={false}
-                  dataSource={savedPoints.map((p, i) => ({ ...p, srNo: i + 1 }))}
-                  rowKey="id"
-                  expandable={{
-                    expandedRowKeys: editingId !== null ? [editingId] : [],
-                    showExpandColumn: false,
-                    expandedRowRender: (record: SavedPoint) => (
-                      <div className="flex items-center gap-2 py-1 px-1">
-                        <Input
-                          size="small"
-                          autoFocus
-                          value={editingName}
-                          onChange={e => setEditingName(e.target.value)}
-                          onPressEnter={() => handleRenamePoint(record.id)}
-                          className="flex-1"
-                        />
-                        <Button size="small" type="primary" icon={<Check size={13} />} onClick={() => handleRenamePoint(record.id)} />
-                        <Button size="small" icon={<X size={13} />} onClick={() => setEditingId(null)} />
-                      </div>
-                    ),
-                  }}
-                  columns={[
-                    { title: '#', dataIndex: 'srNo', width: 22, onHeaderCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), onCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }) },
-                    { title: 'Name', dataIndex: 'name', ellipsis: true, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (text: string) => <Tooltip title={text}>{text}</Tooltip> },
-                    { title: 'Lat', dataIndex: 'latitude', width: 62, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (v: number) => <span className="tabular-nums font-mono text-[10px]">{Number(v).toFixed(4)}</span> },
-                    { title: 'Lon', dataIndex: 'longitude', width: 62, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (v: number) => <span className="tabular-nums font-mono text-[10px]">{Number(v).toFixed(4)}</span> },
-                    { title: 'Zoom', dataIndex: 'zoom', width: 44, onHeaderCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), onCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), render: (z: number) => z !== undefined && z !== null ? <span className="tabular-nums font-mono text-[10px] text-primary font-medium">{z}</span> : <span className="text-gray-300 text-[10px]">—</span> },
-                    {
-                      title: '', key: 'actions', width: 26, onHeaderCell: () => ({ style: { padding: '6px 2px' } }), onCell: () => ({ style: { padding: '6px 2px' } }),
-                      render: (_: any, record: SavedPoint) => {
-                        const isThisMarkerActive = activeMarkerCoords !== null &&
-                          Math.abs(activeMarkerCoords[0] - record.longitude) < 0.00001 &&
-                          Math.abs(activeMarkerCoords[1] - record.latitude) < 0.00001;
-                        return (
-                          <Dropdown
-                            trigger={['click']}
-                            menu={{
-                              items: [
-                                { key: 'fly', label: 'Fly to', icon: <ArrowRight size={13} />, onClick: () => onGoToLocation(record.longitude, record.latitude, record.zoom ?? undefined) },
-                                { key: 'rename', label: 'Rename', icon: <Pencil size={13} />, onClick: () => { setEditingId(record.id); setEditingName(record.name); } },
-                                isThisMarkerActive ? (
-                                   { key: 'clear', label: 'Clear marker', icon: <MapPinOff size={13} />, onClick: onClearMarker }
-                                ) : (
-                                  { key: 'show', label: 'Show marker', icon: <MapPin size={13} />, onClick: () => onShowMarker(record.longitude, record.latitude) }
-                                ),
-                                { type: 'divider' },
-                                { key: 'delete', label: 'Delete', icon: <Trash2 size={13} />, danger: true, onClick: () => handleDeletePoint(record.id) },
-                              ],
-                            }}
-                          >
-                            <Button size="small" type="text" icon={<MoreHorizontal size={14} />} style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }} />
-                          </Dropdown>
-                        );
-                      },
-                    },
-                  ]}
-                />
-              </div>
-            )}
-          </>
+        ) : savedPoints.length === 0 ? (
+          <div className="text-xs text-gray-400 text-center py-4 bg-gray-50/50 rounded-xl border border-dashed border-gray-100">No saved points yet.</div>
+        ) : (
+          <div className="flex flex-col gap-1">
+            <Table
+              size="small"
+              pagination={false}
+              dataSource={savedPoints.map((p, i) => ({ ...p, srNo: i + 1 }))}
+              rowKey="id"
+              expandable={{
+                expandedRowKeys: editingId !== null ? [editingId] : [],
+                showExpandColumn: false,
+                expandedRowRender: (record: SavedPoint) => (
+                  <div className="flex items-center gap-2 py-1 px-1">
+                    <Input
+                      size="small"
+                      autoFocus
+                      value={editingName}
+                      onChange={e => setEditingName(e.target.value)}
+                      onPressEnter={() => handleRenamePoint(record.id)}
+                      className="flex-1"
+                    />
+                    <Button size="small" type="primary" icon={<Check size={13} />} onClick={() => handleRenamePoint(record.id)} />
+                    <Button size="small" icon={<X size={13} />} onClick={() => setEditingId(null)} />
+                  </div>
+                ),
+              }}
+              columns={[
+                { title: '#', dataIndex: 'srNo', width: 22, onHeaderCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), onCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }) },
+                { title: 'Name', dataIndex: 'name', ellipsis: true, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (text: string) => <Tooltip title={text}>{text}</Tooltip> },
+                { title: 'Lat', dataIndex: 'latitude', width: 62, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (v: number) => <span className="tabular-nums font-mono text-[10px]">{Number(v).toFixed(4)}</span> },
+                { title: 'Lon', dataIndex: 'longitude', width: 62, onHeaderCell: () => ({ style: { padding: '6px 4px' } }), onCell: () => ({ style: { padding: '6px 4px' } }), render: (v: number) => <span className="tabular-nums font-mono text-[10px]">{Number(v).toFixed(4)}</span> },
+                { title: 'Zoom', dataIndex: 'zoom', width: 44, onHeaderCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), onCell: () => ({ style: { padding: '6px 2px', textAlign: 'center' } }), render: (z: number) => z !== undefined && z !== null ? <span className="tabular-nums font-mono text-[10px] text-primary font-medium">{z}</span> : <span className="text-gray-300 text-[10px]">—</span> },
+                {
+                  title: '', key: 'actions', width: 26, onHeaderCell: () => ({ style: { padding: '6px 2px' } }), onCell: () => ({ style: { padding: '6px 2px' } }),
+                  render: (_: any, record: SavedPoint) => {
+                    const isThisMarkerActive = activeMarkerCoords !== null &&
+                      Math.abs(activeMarkerCoords[0] - record.longitude) < 0.00001 &&
+                      Math.abs(activeMarkerCoords[1] - record.latitude) < 0.00001;
+                    return (
+                      <Dropdown
+                        trigger={['click']}
+                        menu={{
+                          items: [
+                            { key: 'fly', label: 'Fly to', icon: <ArrowRight size={13} />, onClick: () => onGoToLocation(record.longitude, record.latitude, record.zoom ?? undefined) },
+                            { key: 'rename', label: 'Rename', icon: <Pencil size={13} />, onClick: () => { setEditingId(record.id); setEditingName(record.name); } },
+                            isThisMarkerActive ? (
+                               { key: 'clear', label: 'Clear marker', icon: <MapPinOff size={13} />, onClick: onClearMarker }
+                            ) : (
+                              { key: 'show', label: 'Show marker', icon: <MapPin size={13} />, onClick: () => onShowMarker(record.longitude, record.latitude) }
+                            ),
+                            { type: 'divider' },
+                            { key: 'delete', label: 'Delete', icon: <Trash2 size={13} />, danger: true, onClick: () => handleDeletePoint(record.id) },
+                          ],
+                        }}
+                      >
+                        <Button size="small" type="text" icon={<MoreHorizontal size={14} />} style={{ width: 22, height: 22, display: 'flex', alignItems: 'center', justifyContent: 'center' }} />
+                      </Dropdown>
+                    );
+                  },
+                },
+              ]}
+            />
+          </div>
         )}
       </div>
     </div>

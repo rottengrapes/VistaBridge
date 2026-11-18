@@ -33,6 +33,8 @@ export interface WfsUpdateParams extends WfsTransactionOptions {
     type: string;
     coordinates: any;
   } | null;
+  primaryKeyAttr?: string;
+  primaryKeyValue?: any;
 }
 
 export interface WfsDeleteParams extends WfsTransactionOptions {
@@ -360,7 +362,7 @@ export function buildInsertXml(
  */
 export function buildUpdateXml(
   params: WfsUpdateParams,
-  options?: { wfsVersion?: '1.1.0' | '1.0.0' }
+  options?: { wfsVersion?: '1.1.0' | '1.0.0'; usePkFilter?: boolean }
 ): string {
   const {
     workspace,
@@ -371,15 +373,33 @@ export function buildUpdateXml(
     fid,
     updatedAttributes,
     updatedGeometry,
+    primaryKeyAttr,
+    primaryKeyValue,
   } = params;
 
   const version = options?.wfsVersion || '1.1.0';
   const effectiveSrs = resolveCleanSrs(srsName);
 
+  // System, geometry, and Primary Key column names that MUST NOT be modified via <wfs:Property>
+  const systemCols = new Set([
+    'ogc_fid',
+    'fid',
+    'gid',
+    'objectid',
+    'feature_id',
+    'geometry',
+    'the_geom',
+    'geom',
+    'key',
+    'layer',
+    geomFieldName.toLowerCase(),
+  ]);
+
   let propertiesXml = '';
 
   for (const [key, val] of Object.entries(updatedAttributes)) {
-    if (key === geomFieldName || key === 'geometry' || key.toLowerCase().endsWith('_geom')) continue;
+    const keyLower = key.toLowerCase();
+    if (systemCols.has(keyLower) || keyLower.endsWith('_geom')) continue;
     if (val === undefined || val === null) continue;
     propertiesXml += `
     <wfs:Property>
@@ -404,16 +424,46 @@ export function buildUpdateXml(
     </wfs:Property>`;
   }
 
+  // Clean fid: strip workspace prefix if present (e.g. "ne:ne_10m_airports.1" -> "ne_10m_airports.1")
+  let cleanFid = fid ? String(fid).trim() : '';
+  if (cleanFid.includes(':')) {
+    cleanFid = cleanFid.split(':').pop()!;
+  }
+  // If fid is purely numeric (e.g. "1"), prefix with layerName (e.g. "ne_10m_airports.1")
+  if (/^\d+$/.test(cleanFid)) {
+    cleanFid = `${layerName}.${cleanFid}`;
+  }
+
+  let filterXml = '';
+  const isTemporaryFid =
+    !cleanFid ||
+    cleanFid === 'none' ||
+    cleanFid.includes('new-') ||
+    cleanFid.endsWith('.new') ||
+    cleanFid.startsWith('wms_');
+
+  if ((options?.usePkFilter || isTemporaryFid) && primaryKeyAttr && primaryKeyValue !== undefined && primaryKeyValue !== null) {
+    filterXml = `
+    <ogc:Filter>
+      <ogc:PropertyIsEqualTo>
+        <ogc:PropertyName>${primaryKeyAttr}</ogc:PropertyName>
+        <ogc:Literal>${escapeXml(primaryKeyValue)}</ogc:Literal>
+      </ogc:PropertyIsEqualTo>
+    </ogc:Filter>`;
+  } else {
+    filterXml = `
+    <ogc:Filter>
+      <ogc:FeatureId fid="${cleanFid}"/>
+    </ogc:Filter>`;
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <wfs:Transaction service="WFS" version="${version}"
   xmlns:wfs="http://www.opengis.net/wfs"
   xmlns:gml="http://www.opengis.net/gml"
   xmlns:ogc="http://www.opengis.net/ogc"
   xmlns:${workspace}="${targetNamespace}">
-  <wfs:Update typeName="${workspace}:${layerName}">${propertiesXml}
-    <ogc:Filter>
-      <ogc:FeatureId fid="${fid}"/>
-    </ogc:Filter>
+  <wfs:Update typeName="${workspace}:${layerName}">${propertiesXml}${filterXml}
   </wfs:Update>
 </wfs:Transaction>`;
 }
@@ -428,6 +478,14 @@ export function buildDeleteXml(
   const { workspace, layerName, targetNamespace, fid } = params;
   const version = options?.wfsVersion || '1.1.0';
 
+  let cleanFid = fid ? String(fid).trim() : '';
+  if (cleanFid.includes(':')) {
+    cleanFid = cleanFid.split(':').pop()!;
+  }
+  if (/^\d+$/.test(cleanFid)) {
+    cleanFid = `${layerName}.${cleanFid}`;
+  }
+
   return `<?xml version="1.0" encoding="UTF-8"?>
 <wfs:Transaction service="WFS" version="${version}"
   xmlns:wfs="http://www.opengis.net/wfs"
@@ -435,7 +493,7 @@ export function buildDeleteXml(
   xmlns:${workspace}="${targetNamespace}">
   <wfs:Delete typeName="${workspace}:${layerName}">
     <ogc:Filter>
-      <ogc:FeatureId fid="${fid}"/>
+      <ogc:FeatureId fid="${cleanFid}"/>
     </ogc:Filter>
   </wfs:Delete>
 </wfs:Transaction>`;
@@ -481,10 +539,16 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
   let totalUpdated = updatedMatch ? parseInt(updatedMatch[1], 10) : 0;
   let totalDeleted = deletedMatch ? parseInt(deletedMatch[1], 10) : 0;
 
-  // WFS 1.0.0 summary tags (<wfs:SUCCESS/>, <wfs:InsertResult>)
+  // WFS 1.0.0 summary tags (<wfs:SUCCESS/>, <wfs:InsertResult>, <wfs:UpdateResult>)
   if (!insertedMatch && !updatedMatch && !deletedMatch) {
     if (xmlText.includes('<wfs:SUCCESS') || xmlText.includes('<wfs:Status>')) {
-      totalInserted = 1;
+      if (xmlText.includes('UpdateResult') || xmlText.includes('Update')) {
+        totalUpdated = 1;
+      } else if (xmlText.includes('DeleteResult') || xmlText.includes('Delete')) {
+        totalDeleted = 1;
+      } else {
+        totalInserted = 1;
+      }
     }
   }
 
@@ -497,14 +561,8 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
     }
   }
 
-  const isSuccess =
-    xmlText.includes('TransactionResponse') ||
-    xmlText.includes('wfs:TransactionSummary') ||
-    xmlText.includes('wfs:SUCCESS') ||
-    xmlText.includes('WFS_TransactionResponse') ||
-    totalInserted > 0 ||
-    totalUpdated > 0 ||
-    totalDeleted > 0;
+  const hasModifiedFeatures = totalInserted > 0 || totalUpdated > 0 || totalDeleted > 0;
+  const isSuccess = hasModifiedFeatures;
 
   return {
     success: isSuccess,
@@ -513,7 +571,13 @@ export function parseWfsTransactionResponse(xmlText: string): WfsTransactionResu
     totalDeleted,
     insertedFids,
     rawResponse: xmlText,
-    errorMessage: isSuccess ? undefined : 'Transaction did not modify any features.'
+    errorMessage: isSuccess ? undefined : (
+      totalUpdated === 0 && (xmlText.includes('totalUpdated>0') || xmlText.includes('TransactionSummary'))
+        ? 'GeoServer transaction completed but 0 features were updated. Feature ID was not found in the layer.'
+        : totalInserted === 0 && (xmlText.includes('totalInserted>0') || xmlText.includes('TransactionSummary'))
+        ? 'GeoServer transaction completed but 0 features were inserted. The layer datastore may be read-only, non-editable, or coordinate format rejected.'
+        : 'Transaction did not modify any features.'
+    )
   };
 }
 
@@ -597,7 +661,7 @@ export async function executeAdaptiveWfsInsert(
   // Strategy 1: Standard WFS 1.1.0
   const xml1 = buildInsertXml(params, { wfsVersion: '1.1.0' });
   let res = await executeWfsTransaction(geoserverUrl, xml1, params.workspace, geoserverAuth);
-  if (res.success) return res;
+  if (res.success && (res.totalInserted ?? 0) > 0) return res;
 
   // If geometry is point-based and GeoServer complained about feature insertion,
   // test inverting Point <-> MultiPoint (common with shapefiles where DescribeFeatureType returned Point but datastore expects MultiPoint)
@@ -606,13 +670,13 @@ export async function executeAdaptiveWfsInsert(
     const invertedGeomType = params.geomType?.toLowerCase().includes('multipoint') ? 'Point' : 'MultiPoint';
     const xml2 = buildInsertXml(params, { wfsVersion: '1.1.0', overrideGeomType: invertedGeomType });
     res = await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
-    if (res.success) return res;
+    if (res.success && (res.totalInserted ?? 0) > 0) return res;
   }
 
   // Strategy 3: Fallback to universal WFS 1.0.0 (GML2)
   const xml3 = buildInsertXml(params, { wfsVersion: '1.0.0' });
   const res3 = await executeWfsTransaction(geoserverUrl, xml3, params.workspace, geoserverAuth);
-  if (res3.success) return res3;
+  if (res3.success && (res3.totalInserted ?? 0) > 0) return res3;
 
   // Return best informative result
   return res3.errorMessage ? res3 : res;
@@ -620,20 +684,39 @@ export async function executeAdaptiveWfsInsert(
 
 /**
  * Adaptive WFS Update Runner.
- * Tries WFS 1.1.0 then falls back to WFS 1.0.0.
+ * Tries WFS 1.1.0 with FeatureId filter, then primary key filter,
+ * with fallback to WFS 1.0.0.
  */
 export async function executeAdaptiveWfsUpdate(
   params: WfsUpdateParams,
   geoserverUrl: string,
   geoserverAuth?: string
 ): Promise<WfsTransactionResult> {
+  // Strategy 1: WFS 1.1.0 with FeatureId (or PK if temporary/fallback fid)
   const xml1 = buildUpdateXml(params, { wfsVersion: '1.1.0' });
   const res1 = await executeWfsTransaction(geoserverUrl, xml1, params.workspace, geoserverAuth);
-  if (res1.success) return res1;
+  if (res1.success && (res1.totalUpdated ?? 0) > 0) return res1;
 
-  // Fallback to WFS 1.0.0
+  // Strategy 2: If primary key attribute is available and Strategy 1 updated 0 features, try WFS 1.1.0 with PK filter
+  if (params.primaryKeyAttr && params.primaryKeyValue !== undefined && params.primaryKeyValue !== null) {
+    const xmlPk = buildUpdateXml(params, { wfsVersion: '1.1.0', usePkFilter: true });
+    const resPk = await executeWfsTransaction(geoserverUrl, xmlPk, params.workspace, geoserverAuth);
+    if (resPk.success && (resPk.totalUpdated ?? 0) > 0) return resPk;
+  }
+
+  // Strategy 3: Fallback to WFS 1.0.0 with FeatureId
   const xml2 = buildUpdateXml(params, { wfsVersion: '1.0.0' });
-  return await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
+  const res2 = await executeWfsTransaction(geoserverUrl, xml2, params.workspace, geoserverAuth);
+  if (res2.success && (res2.totalUpdated ?? 0) > 0) return res2;
+
+  // Strategy 4: Fallback to WFS 1.0.0 with PK filter
+  if (params.primaryKeyAttr && params.primaryKeyValue !== undefined && params.primaryKeyValue !== null) {
+    const xml2Pk = buildUpdateXml(params, { wfsVersion: '1.0.0', usePkFilter: true });
+    const res2Pk = await executeWfsTransaction(geoserverUrl, xml2Pk, params.workspace, geoserverAuth);
+    if (res2Pk.success && (res2Pk.totalUpdated ?? 0) > 0) return res2Pk;
+  }
+
+  return (res1.totalUpdated ?? 0) > 0 ? res1 : res2.errorMessage ? res2 : res1;
 }
 
 /**

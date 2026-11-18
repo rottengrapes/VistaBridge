@@ -15,6 +15,11 @@ import { apiRequest } from '@/lib/api';
 import { useAuthStore } from '@/store/useAuthStore';
 import { normalizeAllowedRoles, AllowedRoleEntry, DashboardUserRole, isUserAdmin } from '@/lib/dashboardPermissions';
 
+const isAdminIdentifier = (val: string) => {
+  const u = String(val || '').toUpperCase().trim();
+  return u === 'ADMIN' || u === 'ROLE_ADMINISTRATOR' || u === 'ADMINISTRATOR';
+};
+
 export interface ShareDashboardModalProps {
   open: boolean;
   onClose: () => void;
@@ -24,6 +29,7 @@ export interface ShareDashboardModalProps {
   dashboardSlug?: string;
   createdBy?: string;
   initialShareType?: 'PRIVATE' | 'USERS' | 'ROLES' | 'PUBLIC';
+  initialPublicPermission?: DashboardUserRole;
   initialAllowedUsers?: any;
   initialAllowedRoles?: AllowedRoleEntry[] | string[] | any;
   initialTab?: 'details' | 'sharing';
@@ -31,6 +37,7 @@ export interface ShareDashboardModalProps {
     name?: string;
     description?: string;
     share_type: string;
+    public_permission?: DashboardUserRole;
     allowed_users?: any[];
     allowed_roles: AllowedRoleEntry[];
   }) => void;
@@ -57,6 +64,7 @@ export default function ShareDashboardModal({
   dashboardSlug,
   createdBy,
   initialShareType = 'PRIVATE',
+  initialPublicPermission = 'VIEWER',
   initialAllowedRoles = [],
   onShareUpdated,
 }: ShareDashboardModalProps) {
@@ -70,6 +78,7 @@ export default function ShareDashboardModal({
   const canManagePermissions = Boolean(isCurrentOwner || isSystemAdmin);
 
   const [generalAccess, setGeneralAccess] = useState<'RESTRICTED' | 'PUBLIC'>('RESTRICTED');
+  const [publicPermission, setPublicPermission] = useState<DashboardUserRole>('VIEWER');
   const [rolePermissions, setRolePermissions] = useState<AllowedRoleEntry[]>([]);
 
   const [selectedNewRole, setSelectedNewRole] = useState<string | null>(null);
@@ -85,6 +94,7 @@ export default function ShareDashboardModal({
     if (open) {
       const isPublic = initialShareType === 'PUBLIC';
       setGeneralAccess(isPublic ? 'PUBLIC' : 'RESTRICTED');
+      setPublicPermission(initialPublicPermission === 'EDITOR' ? 'EDITOR' : 'VIEWER');
 
       const normalized = normalizeAllowedRoles(initialAllowedRoles);
       setRolePermissions(normalized);
@@ -93,7 +103,7 @@ export default function ShareDashboardModal({
       setSelectedNewPermission('VIEWER');
       setCopied(false);
     }
-  }, [open, dashboardTitle, initialShareType, initialAllowedRoles, currentUser?.username, createdBy, canManagePermissions]);
+  }, [open, dashboardTitle, initialShareType, initialPublicPermission, initialAllowedRoles, currentUser?.username, createdBy, canManagePermissions]);
 
   // Load available roles from /api/geoserver/roles
   useEffect(() => {
@@ -111,11 +121,12 @@ export default function ShareDashboardModal({
     }
   }, [open, availableRoles.length]);
 
-  // Exclude already added roles from the dropdown (ADMIN is already permanently granted System Admin access)
+  // Exclude already added roles and built-in Admin roles from the dropdown
   const unaddedRoles = useMemo(() => {
     const existing = new Set(rolePermissions.map((r) => r.role.toUpperCase()));
-    existing.add('ADMIN');
-    return availableRoles.filter((r) => !existing.has(r.toUpperCase()));
+    return availableRoles.filter(
+      (r) => !isAdminIdentifier(r) && !existing.has(r.toUpperCase())
+    );
   }, [availableRoles, rolePermissions]);
 
   const targetSlug = dashboardSlug || dashboardId;
@@ -159,9 +170,26 @@ export default function ShareDashboardModal({
   const handleSave = async () => {
     setSaving(true);
     try {
+      let effectiveRoles: AllowedRoleEntry[] = [];
+      if (generalAccess === 'PUBLIC') {
+        let allRoles = availableRoles;
+        if (allRoles.length === 0) {
+          try {
+            const r = await apiRequest('/geoserver/roles');
+            const data = await r.json();
+            if (Array.isArray(data.roles)) allRoles = data.roles;
+          } catch {}
+        }
+        effectiveRoles = allRoles
+          .filter((r) => !isAdminIdentifier(r))
+          .map((r) => ({ role: r, permission: publicPermission }));
+      } else {
+        effectiveRoles = rolePermissions.filter((entry) => !isAdminIdentifier(entry.role));
+      }
+
       const effectiveShareType = generalAccess === 'PUBLIC'
         ? 'PUBLIC'
-        : rolePermissions.length > 0
+        : effectiveRoles.length > 0
           ? 'ROLES'
           : 'PRIVATE';
 
@@ -169,7 +197,9 @@ export default function ShareDashboardModal({
         method: 'PATCH',
         body: JSON.stringify({
           share_type: effectiveShareType,
-          allowed_roles: rolePermissions,
+          is_public: generalAccess === 'PUBLIC' ? 1 : 0,
+          public_permission: publicPermission,
+          allowed_roles: effectiveRoles,
           allowed_users: [],
         }),
       });
@@ -181,7 +211,9 @@ export default function ShareDashboardModal({
 
       notification.success({
         message: 'Settings Saved',
-        description: `GeoServer role permissions and access settings updated.`,
+        description: generalAccess === 'PUBLIC'
+          ? `Dashboard is now shared with all GeoServer roles as ${publicPermission === 'EDITOR' ? 'Editor' : 'Viewer'}.`
+          : `GeoServer role permissions and access settings updated.`,
         placement: 'topRight',
       });
 
@@ -189,7 +221,8 @@ export default function ShareDashboardModal({
         onShareUpdated({
           name: dashboardTitle,
           share_type: effectiveShareType,
-          allowed_roles: rolePermissions,
+          public_permission: publicPermission,
+          allowed_roles: effectiveRoles,
         });
       }
 
@@ -237,8 +270,8 @@ export default function ShareDashboardModal({
     >
       <div className="pt-3 pb-1 flex flex-col gap-4">
 
-        {/* Section 1: Add GeoServer Role with Permission (Owner & Admin only) */}
-        {canManagePermissions ? (
+        {/* Section 1: Add GeoServer Role with Permission (Owner & Admin only, Restricted mode) */}
+        {canManagePermissions && generalAccess === 'RESTRICTED' && (
           <div className="bg-gray-50/80 border border-gray-200/90 rounded-2xl p-3">
             <div className="text-[11px] font-bold text-gray-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
               <ShieldCheck size={14} className="text-primary" />
@@ -295,7 +328,9 @@ export default function ShareDashboardModal({
               </Button>
             </div>
           </div>
-        ) : (
+        )}
+
+        {!canManagePermissions && (
           <div className="bg-blue-50/70 border border-blue-100 rounded-2xl p-3 flex items-center gap-2.5 text-xs text-blue-800">
             <LinkIcon size={16} className="text-blue-600 shrink-0" />
             <span>
@@ -327,95 +362,98 @@ export default function ShareDashboardModal({
                   </div>
                 </div>
               </div>
-              <Tag color="default" className="text-[11px] font-semibold rounded-lg px-2 py-0.5 border-gray-200 text-gray-600 shrink-0">
-                Owner
+              <Tag color={isAdminIdentifier(ownerUsername) ? 'purple' : 'default'} className="text-[11px] font-semibold rounded-lg px-2 py-0.5 border-gray-200 shrink-0">
+                {isAdminIdentifier(ownerUsername) ? 'Owner (System Admin)' : 'Owner'}
               </Tag>
             </div>
 
-            {/* GeoServer System Admin (Built-in full access) */}
-            <div className="p-3 flex items-center justify-between gap-3 hover:bg-gray-50/60 transition-colors border-t border-gray-100">
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="w-8 h-8 rounded-xl bg-purple-50 border border-purple-100 flex items-center justify-center text-purple-600 shrink-0">
-                  <ShieldCheck size={16} />
-                </div>
-                <div className="min-w-0 flex items-center gap-2">
-                  <span className="text-xs font-bold text-gray-800 font-mono truncate">
-                    ADMIN
-                  </span>
-                </div>
-              </div>
-              <Tooltip title="GeoServer Administrators have system-wide full access to all workspaces">
-                <Tag color="purple" className="rounded-lg text-[10px] font-bold px-2 py-0.5 border-none shrink-0 cursor-help">
-                  System Admin
-                </Tag>
-              </Tooltip>
-            </div>
-
-            {/* Added Roles List */}
-            {rolePermissions.filter((entry) => entry.role.toUpperCase() !== 'ADMIN').map((entry) => (
-              <div key={entry.role} className="p-3 flex items-center justify-between gap-3 hover:bg-gray-50/60 transition-colors border-t border-gray-100">
+            {/* GeoServer System Admin (Built-in full access) - only shown if owner is NOT already admin */}
+            {!isAdminIdentifier(ownerUsername) && (
+              <div className="p-3 flex items-center justify-between gap-3 hover:bg-gray-50/60 transition-colors border-t border-gray-100">
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shrink-0">
-                    <Shield size={16} />
+                  <div className="w-8 h-8 rounded-xl bg-purple-50 border border-purple-100 flex items-center justify-center text-purple-600 shrink-0">
+                    <ShieldCheck size={16} />
                   </div>
                   <div className="min-w-0 flex items-center gap-2">
                     <span className="text-xs font-bold text-gray-800 font-mono truncate">
-                      {entry.role}
+                      ADMIN
                     </span>
                   </div>
                 </div>
-
-                <div className="flex items-center gap-1.5 shrink-0">
-                  {canManagePermissions ? (
-                    <>
-                      <Select
-                        value={entry.permission}
-                        onChange={(newPerm) => handlePermissionChange(entry.role, newPerm)}
-                        variant="borderless"
-                        className="w-28 text-xs font-semibold"
-                        options={[
-                          {
-                            label: (
-                              <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
-                                <Eye size={12} className="text-blue-500" /> Viewer
-                              </span>
-                            ),
-                            value: 'VIEWER',
-                          },
-                          {
-                            label: (
-                              <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
-                                <Edit3 size={12} className="text-indigo-600" /> Editor
-                              </span>
-                            ),
-                            value: 'EDITOR',
-                          },
-                        ]}
-                      />
-
-                      <Tooltip title="Remove role access">
-                        <Button
-                          type="text"
-                          size="small"
-                          danger
-                          icon={<Trash2 size={14} />}
-                          onClick={() => handleRemoveRole(entry.role)}
-                          className="flex items-center justify-center rounded-lg"
-                          style={{ width: 28, height: 28 }}
-                        />
-                      </Tooltip>
-                    </>
-                  ) : (
-                    <Tag
-                      color={entry.permission === 'EDITOR' ? 'purple' : 'default'}
-                      className="rounded-lg text-[11px] font-semibold px-2 py-0.5 border-none"
-                    >
-                      {entry.permission === 'EDITOR' ? 'Editor' : 'Viewer'}
-                    </Tag>
-                  )}
-                </div>
+                <Tooltip title="GeoServer Administrators have system-wide full access to all workspaces">
+                  <Tag color="purple" className="rounded-lg text-[10px] font-bold px-2 py-0.5 border-none shrink-0 cursor-help">
+                    System Admin
+                  </Tag>
+                </Tooltip>
               </div>
-            ))}
+            )}
+
+            {/* Added Roles List (shown in Restricted mode, excluding any admin duplicates) */}
+            {generalAccess === 'RESTRICTED' &&
+              rolePermissions.filter((entry) => !isAdminIdentifier(entry.role)).map((entry) => (
+                <div key={entry.role} className="p-3 flex items-center justify-between gap-3 hover:bg-gray-50/60 transition-colors border-t border-gray-100">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="w-8 h-8 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shrink-0">
+                      <Shield size={16} />
+                    </div>
+                    <div className="min-w-0 flex items-center gap-2">
+                      <span className="text-xs font-bold text-gray-800 font-mono truncate">
+                        {entry.role}
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    {canManagePermissions ? (
+                      <>
+                        <Select
+                          value={entry.permission}
+                          onChange={(newPerm) => handlePermissionChange(entry.role, newPerm)}
+                          variant="borderless"
+                          className="w-28 text-xs font-semibold"
+                          options={[
+                            {
+                              label: (
+                                <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+                                  <Eye size={12} className="text-blue-500" /> Viewer
+                                </span>
+                              ),
+                              value: 'VIEWER',
+                            },
+                            {
+                              label: (
+                                <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+                                  <Edit3 size={12} className="text-indigo-600" /> Editor
+                                </span>
+                              ),
+                              value: 'EDITOR',
+                            },
+                          ]}
+                        />
+
+                        <Tooltip title="Remove role access">
+                          <Button
+                            type="text"
+                            size="small"
+                            danger
+                            icon={<Trash2 size={14} />}
+                            onClick={() => handleRemoveRole(entry.role)}
+                            className="flex items-center justify-center rounded-lg"
+                            style={{ width: 28, height: 28 }}
+                          />
+                        </Tooltip>
+                      </>
+                    ) : (
+                      <Tag
+                        color={entry.permission === 'EDITOR' ? 'purple' : 'default'}
+                        className="rounded-lg text-[11px] font-semibold px-2 py-0.5 border-none"
+                      >
+                        {entry.permission === 'EDITOR' ? 'Editor' : 'Viewer'}
+                      </Tag>
+                    )}
+                  </div>
+                </div>
+              ))}
           </div>
         </div>
 
@@ -454,7 +492,7 @@ export default function ShareDashboardModal({
                         label: (
                           <div className="flex flex-col py-1">
                             <span className="font-bold text-xs text-gray-800">Anyone with the link (Public)</span>
-                            <span className="text-[11px] text-gray-400">Anyone on the internet with the link can view</span>
+                            <span className="text-[11px] text-gray-400">Anyone on the internet with the link can access</span>
                           </div>
                         ),
                         value: 'PUBLIC',
@@ -468,7 +506,7 @@ export default function ShareDashboardModal({
                 )}
                 <div className="text-[11px] text-gray-400">
                   {generalAccess === 'PUBLIC'
-                    ? 'Anyone on the internet with the link can view without signing in.'
+                    ? `Anyone on the internet with the link can ${publicPermission === 'EDITOR' ? 'edit' : 'view'} without signing in.`
                     : rolePermissions.length > 0
                       ? 'Only users with the assigned GeoServer roles can access this dashboard.'
                       : 'Only the owner can access this dashboard.'}
@@ -477,9 +515,35 @@ export default function ShareDashboardModal({
             </div>
 
             {generalAccess === 'PUBLIC' && (
-              <Tag color="green" className="text-[11px] font-semibold rounded-lg px-2 py-0.5 border-none shrink-0">
-                Public (Viewer)
-              </Tag>
+              canManagePermissions ? (
+                <Select
+                  value={publicPermission}
+                  onChange={(val) => setPublicPermission(val)}
+                  className="w-28 text-xs font-semibold shrink-0"
+                  options={[
+                    {
+                      label: (
+                        <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+                          <Eye size={12} className="text-blue-500" /> Viewer
+                        </span>
+                      ),
+                      value: 'VIEWER',
+                    },
+                    {
+                      label: (
+                        <span className="flex items-center gap-1.5 text-xs font-semibold text-gray-700">
+                          <Edit3 size={12} className="text-indigo-600" /> Editor
+                        </span>
+                      ),
+                      value: 'EDITOR',
+                    },
+                  ]}
+                />
+              ) : (
+                <Tag color={publicPermission === 'EDITOR' ? 'purple' : 'green'} className="text-[11px] font-semibold rounded-lg px-2 py-0.5 border-none shrink-0">
+                  Public ({publicPermission === 'EDITOR' ? 'Editor' : 'Viewer'})
+                </Tag>
+              )
             )}
           </div>
         </div>

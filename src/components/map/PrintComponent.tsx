@@ -16,7 +16,7 @@
 import 'ol/ol.css';
 import React, { useState, useRef, useCallback, useEffect } from 'react';
    import { Modal, Button, Input, Select, Checkbox, Radio, Tooltip, App, Popconfirm } from 'antd';
-import { Printer, Download, Map as MapIcon, Save, Trash2, Plus, Bookmark, Settings } from 'lucide-react';
+import { Printer, Download, Map as MapIcon, Save, Trash2, Bookmark, Settings } from 'lucide-react';
 import Map from 'ol/Map';
 import View from 'ol/View';
 import TileLayer from 'ol/layer/Tile';
@@ -5750,48 +5750,39 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
 
               {/* Saved Custom Template Toolbar (hidden on Quick Maps) */}
               {isCustomTemplate && !isQuickMap && (
-                <div className="mt-2.5 p-2.5 bg-blue-50/70 rounded-xl border border-blue-150 flex flex-col gap-2">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="text-[11px] font-semibold text-blue-900 flex items-center gap-1.5 truncate">
+                <div className="mt-2.5 p-2.5 bg-blue-50/70 rounded-xl border border-blue-200/60 flex flex-col gap-2">
+                  <div className="flex items-center justify-between gap-1.5">
+                    <span className="text-xs font-semibold text-blue-950 flex items-center gap-1.5 truncate">
                       <span className="truncate">
                         {currentSavedTemplate ? currentSavedTemplate.name : 'Custom Layout'}
                       </span>
                     </span>
                     {hasUnsavedChanges ? (
-                      <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">
-                        Unsaved Changes
+                      <span className="text-[10px] bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full font-medium shrink-0 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                        Unsaved
                       </span>
                     ) : (
-                      <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium shrink-0">
+                      <span className="text-[10px] bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full font-medium shrink-0 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                         Saved
                       </span>
                     )}
                   </div>
 
-                  <div className="flex items-center gap-1.5">
+                  <div className="w-full">
                     {currentSavedTemplate ? (
-                      <>
+                      <div className="grid grid-cols-2 gap-2 w-full pt-0.5">
                         <Button
                           size="small"
-                          type="primary"
-                          icon={<Save size={12} />}
+                          type={hasUnsavedChanges ? 'primary' : 'default'}
+                          icon={<Save size={13} />}
                           disabled={!hasUnsavedChanges}
                           loading={isSavingTemplate}
                           onClick={() => handleSaveTemplate(currentSavedTemplate.name)}
-                          className="text-[10px] h-6 px-2.5 font-medium"
+                          className="w-full text-xs h-7 font-medium flex items-center justify-center gap-1.5 shadow-none"
                         >
                           Update
-                        </Button>
-                        <Button
-                          size="small"
-                          icon={<Plus size={12} />}
-                          onClick={() => {
-                            setSaveTemplateName(`${currentSavedTemplate.name} Copy`);
-                            setIsSaveModalOpen(true);
-                          }}
-                          className="text-[10px] h-6 px-2 text-gray-700 font-medium"
-                        >
-                          Save as New
                         </Button>
                         <Popconfirm
                           title="Delete Template"
@@ -5800,28 +5791,29 @@ export const PrintComponent: React.FC<PrintComponentProps> = ({ mapInstance, add
                           okText="Delete"
                           cancelText="Cancel"
                           okButtonProps={{ danger: true, size: 'small' }}
+                          placement="topRight"
                         >
                           <Button
                             size="small"
                             danger
-                            icon={<Trash2 size={12} />}
-                            className="text-[10px] h-6 px-2.5 ml-auto font-medium"
+                            icon={<Trash2 size={13} />}
+                            className="w-full text-xs h-7 font-medium flex items-center justify-center gap-1.5 hover:bg-red-50"
                           >
                             Delete
                           </Button>
                         </Popconfirm>
-                      </>
+                      </div>
                     ) : (
                       <Button
                         size="small"
                         type="primary"
-                        icon={<Save size={12} />}
+                        icon={<Save size={13} />}
                         loading={isSavingTemplate}
                         onClick={() => {
                           setSaveTemplateName(`Template ${savedTemplates.length + 1}`);
                           setIsSaveModalOpen(true);
                         }}
-                        className="text-[10px] h-6 px-3 w-full justify-center font-medium"
+                        className="w-full text-xs h-7 font-medium flex items-center justify-center gap-1.5 shadow-none"
                       >
                         Save This Template
                       </Button>

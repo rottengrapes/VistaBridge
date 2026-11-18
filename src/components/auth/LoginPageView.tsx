@@ -125,6 +125,7 @@ function LoginForm() {
       setAuth({
         username: values.username || '',
         role: data.role,
+        roles: Array.isArray(data.roles) ? data.roles : [],
         geoserverAuth: basicAuth,
         geoserverUrl: geoserverUrl,
         email: data.email || `${values.username || 'user'}@vismap.com`,

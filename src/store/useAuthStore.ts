@@ -71,11 +71,11 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
   hydrated: false,
 
   setAuth: (user, token) =>
-    set((state) => ({
-      user: state.user ? { ...state.user, ...user } : user,
+    set({
+      user,
       token,
       hydrated: true,
-    })),
+    }),
 
   clearAuth: () => set({ user: null, token: null, hydrated: true }),
 

@@ -75,6 +75,14 @@ export async function POST(request: Request) {
       path: '/api/auth/token',
     });
 
+    res.cookies.set('refresh_token', '', {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      expires: new Date(0),
+      path: '/',
+    });
+
     return res;
   } catch (error) {
     return NextResponse.json({ success: false }, { status: 500 });
