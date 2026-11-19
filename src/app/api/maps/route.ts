@@ -85,7 +85,7 @@ export async function GET(request: Request) {
        ORDER BY updated_at DESC, created_at DESC`,
       [user.username, geoserverUrl]
     );
-    
+
     const workspaces = result.rows.map(row => ({
       id: row.id,
       slug: row.slug || row.id,
@@ -100,8 +100,8 @@ export async function GET(request: Request) {
       layers: Array.isArray(row.layers)
         ? row.layers
         : typeof row.layers === 'string'
-        ? (() => { try { return JSON.parse(row.layers); } catch { return []; } })()
-        : [],
+          ? (() => { try { return JSON.parse(row.layers); } catch { return []; } })()
+          : [],
       created_by: row.created_by,
       created_at: row.created_at,
       updated_at: row.updated_at,
@@ -249,8 +249,8 @@ export async function POST(request: Request) {
     const finalLayers = Array.isArray(body.layers)
       ? JSON.stringify(body.layers)
       : typeof body.layers === 'string'
-      ? body.layers
-      : JSON.stringify([]);
+        ? body.layers
+        : JSON.stringify([]);
 
     await pool.query(
       `INSERT INTO map_workspaces (id, slug, name, description, share, type, center_lon, center_lat, zoom, basemap_id, created_at, updated_at, layers, created_by, geoserver_url)

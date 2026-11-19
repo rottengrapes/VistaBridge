@@ -501,11 +501,11 @@ async function handleDirectGeoServerDatasetRequest(endpoint: string, options: Re
               !wmsXml.includes('ExceptionReport') &&
               (wmsXml.includes('WMS_Capabilities') || wmsXml.includes('WMT_MS_Capabilities') || wmsXml.includes('<Capability>'))
             ) {
+              wmsSuccess = true;
+              serviceUsed = 'WMS';
               const capDoc = parser.parseFromString(wmsXml, 'application/xml');
               const leafNames = capDoc.querySelectorAll('Layer > Name');
               if (leafNames.length > 0) {
-                wmsSuccess = true;
-                serviceUsed = 'WMS';
 
                 leafNames.forEach((nameEl) => {
                   const name = nameEl.textContent?.trim() || '';

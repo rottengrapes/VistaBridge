@@ -101,6 +101,27 @@ body {
   border-radius: 9999px;
 }
 
+/* Query Builder - horizontal scrollbar ONLY for the active pills row */
+.qb-pills-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: #d1d5db transparent;
+}
+
+.qb-pills-scroll::-webkit-scrollbar {
+  height: 4px;
+}
+
+.qb-pills-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.qb-pills-scroll::-webkit-scrollbar-thumb {
+  background-color: #d1d5db;
+  border-radius: 9999px;
+}
+
 /* Query Builder section accent borders */
 .qb-section-buffer {
   border-left: 3px solid #6818d2;

@@ -858,6 +858,7 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   const [attributeTableFilterIds, setAttributeTableFilterIds] = useState<Record<string, string[]>>({});
   const [attributeTableFilterCqls, setAttributeTableFilterCqls] = useState<Record<string, string>>({});
   const [qbActiveFilters, setQbActiveFilters] = useState<Record<string, LayerActiveFilters>>({});
+  const [queryBuilderTargetLayerId, setQueryBuilderTargetLayerId] = useState<string>('');
   const highlightSourceRef = useRef<VectorSource | null>(null);
   const highlightLayerRef = useRef<VectorLayer<any> | null>(null);
 
@@ -2186,69 +2187,80 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         headers['Authorization'] = geoserverAuth;
       }
 
-      // Fetch WMS GetCapabilities to extract styles and bounding boxes
+      // Fetch WMS GetCapabilities to extract styles and bounding boxes and verify layer access
       const layersStylesMap = new globalThis.Map<string, any[]>();
       const layersBboxMap = new globalThis.Map<string, number[]>();
+      const accessibleLayersSet = new Set<string>();
+      let capabilitiesFetchedSuccessfully = false;
+
       try {
         const capUrl = `${geoserverUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`;
         const capRes = await fetch(capUrl, { headers });
         if (capRes.ok) {
           const capText = await capRes.text();
-          const parser = new DOMParser();
-          const xml = parser.parseFromString(capText, 'text/xml');
-          const layerElements = xml.getElementsByTagNameNS('*', 'Layer');
-          for (let i = 0; i < layerElements.length; i++) {
-            const nameEl = layerElements[i].getElementsByTagNameNS('*', 'Name')[0];
-            const name = nameEl?.textContent?.trim();
-            if (name) {
-              const stylesList: any[] = [];
-              const styleElements = layerElements[i].getElementsByTagNameNS('*', 'Style');
-              for (let j = 0; j < styleElements.length; j++) {
-                const sNameEl = styleElements[j].getElementsByTagNameNS('*', 'Name')[0];
-                const sName = sNameEl?.textContent?.trim() || '';
-                const sTitleEl = styleElements[j].getElementsByTagNameNS('*', 'Title')[0];
-                const sTitle = sTitleEl?.textContent?.trim() || sName;
+          if (!capText.includes('ServiceExceptionReport') && !capText.includes('ExceptionReport')) {
+            capabilitiesFetchedSuccessfully = true;
+            const parser = new DOMParser();
+            const xml = parser.parseFromString(capText, 'text/xml');
+            const layerElements = xml.getElementsByTagNameNS('*', 'Layer');
+            for (let i = 0; i < layerElements.length; i++) {
+              const nameEl = layerElements[i].getElementsByTagNameNS('*', 'Name')[0] || layerElements[i].getElementsByTagName('Name')[0];
+              const name = nameEl?.textContent?.trim();
+              if (name) {
+                accessibleLayersSet.add(name.toLowerCase());
+                if (name.includes(':')) {
+                  accessibleLayersSet.add(name.split(':').pop()!.toLowerCase());
+                }
 
-                const legendUrlEl = styleElements[j].getElementsByTagNameNS('*', 'LegendURL')[0];
-                const resourceEl = legendUrlEl ? legendUrlEl.getElementsByTagNameNS('*', 'OnlineResource')[0] : null;
-                const legendHref = resourceEl
-                  ? (resourceEl.getAttribute('xlink:href') || resourceEl.getAttribute('href') || '')
-                  : '';
+                const stylesList: any[] = [];
+                const styleElements = layerElements[i].getElementsByTagNameNS('*', 'Style');
+                for (let j = 0; j < styleElements.length; j++) {
+                  const sNameEl = styleElements[j].getElementsByTagNameNS('*', 'Name')[0];
+                  const sName = sNameEl?.textContent?.trim() || '';
+                  const sTitleEl = styleElements[j].getElementsByTagNameNS('*', 'Title')[0];
+                  const sTitle = sTitleEl?.textContent?.trim() || sName;
 
-                stylesList.push({ name: sName, title: sTitle, legendUrl: legendHref });
-              }
-              layersStylesMap.set(name, stylesList);
-              if (name.includes(':')) {
-                layersStylesMap.set(name.split(':').pop()!, stylesList);
-              }
+                  const legendUrlEl = styleElements[j].getElementsByTagNameNS('*', 'LegendURL')[0];
+                  const resourceEl = legendUrlEl ? legendUrlEl.getElementsByTagNameNS('*', 'OnlineResource')[0] : null;
+                  const legendHref = resourceEl
+                    ? (resourceEl.getAttribute('xlink:href') || resourceEl.getAttribute('href') || '')
+                    : '';
 
-              // Extract bounding box
-              let bbox: number[] = [-180, -90, 180, 90];
-              const bboxEl = layerElements[i].getElementsByTagNameNS('*', 'EX_GeographicBoundingBox')[0] ||
-                layerElements[i].getElementsByTagName('EX_GeographicBoundingBox')[0];
-              if (bboxEl) {
-                const west = parseFloat(bboxEl.getElementsByTagNameNS('*', 'westBoundLongitude')[0]?.textContent || bboxEl.getElementsByTagName('westBoundLongitude')[0]?.textContent || '-180');
-                const east = parseFloat(bboxEl.getElementsByTagNameNS('*', 'eastBoundLongitude')[0]?.textContent || bboxEl.getElementsByTagName('eastBoundLongitude')[0]?.textContent || '180');
-                const south = parseFloat(bboxEl.getElementsByTagNameNS('*', 'southBoundLatitude')[0]?.textContent || bboxEl.getElementsByTagName('southBoundLatitude')[0]?.textContent || '-90');
-                const north = parseFloat(bboxEl.getElementsByTagNameNS('*', 'northBoundLatitude')[0]?.textContent || bboxEl.getElementsByTagName('northBoundLatitude')[0]?.textContent || '90');
-                bbox = [west, south, east, north];
-              } else {
-                const bboxes = layerElements[i].getElementsByTagNameNS('*', 'BoundingBox') || layerElements[i].getElementsByTagName('BoundingBox');
-                for (let k = 0; k < bboxes.length; k++) {
-                  const crs = bboxes[k].getAttribute('CRS') || bboxes[k].getAttribute('crs');
-                  if (crs === 'EPSG:4326' || crs === 'CRS:84') {
-                    const minx = parseFloat(bboxes[k].getAttribute('minx') || '0');
-                    const miny = parseFloat(bboxes[k].getAttribute('miny') || '0');
-                    const maxx = parseFloat(bboxes[k].getAttribute('maxx') || '0');
-                    const maxy = parseFloat(bboxes[k].getAttribute('maxy') || '0');
-                    bbox = [minx, miny, maxx, maxy];
-                    break;
+                  stylesList.push({ name: sName, title: sTitle, legendUrl: legendHref });
+                }
+                layersStylesMap.set(name, stylesList);
+                if (name.includes(':')) {
+                  layersStylesMap.set(name.split(':').pop()!, stylesList);
+                }
+
+                // Extract bounding box
+                let bbox: number[] = [-180, -90, 180, 90];
+                const bboxEl = layerElements[i].getElementsByTagNameNS('*', 'EX_GeographicBoundingBox')[0] ||
+                  layerElements[i].getElementsByTagName('EX_GeographicBoundingBox')[0];
+                if (bboxEl) {
+                  const west = parseFloat(bboxEl.getElementsByTagNameNS('*', 'westBoundLongitude')[0]?.textContent || bboxEl.getElementsByTagName('westBoundLongitude')[0]?.textContent || '-180');
+                  const east = parseFloat(bboxEl.getElementsByTagNameNS('*', 'eastBoundLongitude')[0]?.textContent || bboxEl.getElementsByTagName('eastBoundLongitude')[0]?.textContent || '180');
+                  const south = parseFloat(bboxEl.getElementsByTagNameNS('*', 'southBoundLatitude')[0]?.textContent || bboxEl.getElementsByTagName('southBoundLatitude')[0]?.textContent || '-90');
+                  const north = parseFloat(bboxEl.getElementsByTagNameNS('*', 'northBoundLatitude')[0]?.textContent || bboxEl.getElementsByTagName('northBoundLatitude')[0]?.textContent || '90');
+                  bbox = [west, south, east, north];
+                } else {
+                  const bboxes = layerElements[i].getElementsByTagNameNS('*', 'BoundingBox') || layerElements[i].getElementsByTagName('BoundingBox');
+                  for (let k = 0; k < bboxes.length; k++) {
+                    const crs = bboxes[k].getAttribute('CRS') || bboxes[k].getAttribute('crs');
+                    if (crs === 'EPSG:4326' || crs === 'CRS:84') {
+                      const minx = parseFloat(bboxes[k].getAttribute('minx') || '0');
+                      const miny = parseFloat(bboxes[k].getAttribute('miny') || '0');
+                      const maxx = parseFloat(bboxes[k].getAttribute('maxx') || '0');
+                      const maxy = parseFloat(bboxes[k].getAttribute('maxy') || '0');
+                      bbox = [minx, miny, maxx, maxy];
+                      break;
+                    }
                   }
                 }
-              }
-              layersBboxMap.set(name, bbox);
-              if (name.includes(':')) {
-                layersBboxMap.set(name.split(':').pop()!, bbox);
+                layersBboxMap.set(name, bbox);
+                if (name.includes(':')) {
+                  layersBboxMap.set(name.split(':').pop()!, bbox);
+                }
               }
             }
           }
@@ -2257,13 +2269,65 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         console.error('Failed to fetch WMS GetCapabilities for layer styles/bbox:', err);
       }
 
+      // If WMS failed or was disabled, fall back to WFS GetCapabilities for vector layers
+      if (!capabilitiesFetchedSuccessfully) {
+        try {
+          const wfsCapUrl = `${geoserverUrl}/ows?service=WFS&version=1.1.0&request=GetCapabilities`;
+          const wfsCapRes = await fetch(wfsCapUrl, { headers });
+          if (wfsCapRes.ok) {
+            const wfsCapText = await wfsCapRes.text();
+            if (!wfsCapText.includes('ServiceExceptionReport') && !wfsCapText.includes('ExceptionReport') && (wfsCapText.includes('WFS_Capabilities') || wfsCapText.includes('FeatureType'))) {
+              capabilitiesFetchedSuccessfully = true;
+              const parser = new DOMParser();
+              const wfsDoc = parser.parseFromString(wfsCapText, 'application/xml');
+              const featureTypeEls = Array.from(wfsDoc.getElementsByTagNameNS('*', 'FeatureType'));
+              for (const ftEl of featureTypeEls) {
+                const ftName = ftEl.getElementsByTagNameNS('*', 'Name')[0]?.textContent?.trim() || ftEl.getElementsByTagName('Name')[0]?.textContent?.trim();
+                if (ftName) {
+                  accessibleLayersSet.add(ftName.toLowerCase());
+                  if (ftName.includes(':')) {
+                    accessibleLayersSet.add(ftName.split(':').pop()!.toLowerCase());
+                  }
+                }
+              }
+            }
+          }
+        } catch (wfsErr) {
+          console.warn('[Discovery] WFS GetCapabilities check failed:', wfsErr);
+        }
+      }
+
       if (isCancelled) return;
+
+      const isLayerAccessible = (layerId: string, layerName: string): boolean => {
+        // Special internal temporary or client-side layers
+        if (layerId.startsWith('wps_result_') || layerId.startsWith('raster_res_') || layerId === 'draw_layer') {
+          return true;
+        }
+        const idLower = layerId.toLowerCase();
+        const nameLower = layerName.toLowerCase();
+        const idLocal = idLower.includes(':') ? idLower.split(':').pop()! : idLower;
+        const nameLocal = nameLower.includes(':') ? nameLower.split(':').pop()! : nameLower;
+
+        return accessibleLayersSet.has(idLower) ||
+               accessibleLayersSet.has(nameLower) ||
+               accessibleLayersSet.has(idLocal) ||
+               accessibleLayersSet.has(nameLocal);
+      };
 
       for (const layerData of layersToLoad) {
         if (!layerData) continue;
         const layerId = layerData.layer_id || layerData.id;
         const layerName = layerData.name || layerId;
         if (!layerId) continue;
+
+        // If GeoServer capabilities were resolved, enforce layer access permissions:
+        // If the user lacks GeoServer read access for this specific layer,
+        // do not display it in the layer list or render it on the map.
+        if (capabilitiesFetchedSuccessfully && !isLayerAccessible(layerId, layerName)) {
+          console.info(`[Map Workspace] Layer "${layerName}" (${layerId}) excluded: current user lacks GeoServer read access.`);
+          continue;
+        }
 
         const styleData = migrateStyleConfig(layerData.style_json);
         const layerOpacity = layerData.opacity ?? styleData.opacity ?? 1.0;
@@ -8011,6 +8075,8 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 mode="attribute"
                 activeFilters={qbActiveFilters}
                 onActiveFiltersChange={setQbActiveFilters}
+                selectedLayerId={queryBuilderTargetLayerId}
+                onSelectLayerId={setQueryBuilderTargetLayerId}
                 layers={addedLayers}
                 allDatasets={datasetsList}
                 onStartDraw={handleStartQueryDraw}
@@ -8079,6 +8145,8 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 mode="buffer"
                 activeFilters={qbActiveFilters}
                 onActiveFiltersChange={setQbActiveFilters}
+                selectedLayerId={queryBuilderTargetLayerId}
+                onSelectLayerId={setQueryBuilderTargetLayerId}
                 layers={addedLayers}
                 allDatasets={datasetsList}
                 onStartDraw={handleStartQueryDraw}
@@ -8147,6 +8215,8 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                 mode="spatial"
                 activeFilters={qbActiveFilters}
                 onActiveFiltersChange={setQbActiveFilters}
+                selectedLayerId={queryBuilderTargetLayerId}
+                onSelectLayerId={setQueryBuilderTargetLayerId}
                 layers={addedLayers}
                 allDatasets={datasetsList}
                 onStartDraw={handleStartQueryDraw}

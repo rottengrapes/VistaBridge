@@ -36,6 +36,8 @@ interface QueryBuilderProps {
   onShowGeometryOnMap?: (geometry: any, owner: 'buffer' | 'spatial') => void;
   activeFilters?: Record<string, LayerActiveFilters>;
   onActiveFiltersChange?: React.Dispatch<React.SetStateAction<Record<string, LayerActiveFilters>>>;
+  selectedLayerId?: string;
+  onSelectLayerId?: (layerId: string) => void;
 }
 
 // Available query builder tabs
@@ -62,12 +64,19 @@ export default function QueryBuilder({
   onShowGeometryOnMap,
   activeFilters: propActiveFilters,
   onActiveFiltersChange,
+  selectedLayerId,
+  onSelectLayerId,
 }: QueryBuilderProps) {
   // Only vector layers have attributes and geometries that can be queried
   const vectorLayers = layers.filter(l => l.type === 'VECTOR');
 
-  // Currently selected layer to query
-  const [targetLayerId, setTargetLayerId] = useState('');
+  // Currently selected layer to query — synchronized via selectedLayerId if provided
+  const [localTargetLayerId, setLocalTargetLayerId] = useState('');
+  const targetLayerId = selectedLayerId !== undefined ? selectedLayerId : localTargetLayerId;
+  const setTargetLayerId = useCallback((id: string) => {
+    setLocalTargetLayerId(id);
+    onSelectLayerId?.(id);
+  }, [onSelectLayerId]);
 
   // Per-section enabled state only — no collapse
   const [sectionEnabled, setSectionEnabled] = useState<Record<SectionKey, boolean>>(() => ({
@@ -228,12 +237,23 @@ export default function QueryBuilder({
     spatialRef.current?.reset();
   }, [targetLayerId]);
 
-  // Auto-select layer if only one vector layer is on the map
+  // Auto-select layer if only one vector layer is on the map or if a layer has active filters
   useEffect(() => {
-    if (!targetLayerId && vectorLayers.length === 1) {
-      queueMicrotask(() => {
-        setTargetLayerId(vectorLayers[0].id);
-      });
+    if (!targetLayerId) {
+      // 1. If any layer currently has active filters applied on the map, auto-select it
+      const layerWithActiveFilters = Object.keys(activeFilters).find(
+        k => Object.keys(activeFilters[k] || {}).length > 0 && vectorLayers.some(l => l.id === k)
+      );
+      if (layerWithActiveFilters) {
+        setTargetLayerId(layerWithActiveFilters);
+        return;
+      }
+      // 2. If only one vector layer is on the map, auto-select it
+      if (vectorLayers.length === 1) {
+        queueMicrotask(() => {
+          setTargetLayerId(vectorLayers[0].id);
+        });
+      }
     }
     // If the selected layer was removed from the map, clear it
     if (targetLayerId && !vectorLayers.find(l => l.id === targetLayerId)) {
@@ -241,11 +261,20 @@ export default function QueryBuilder({
         setTargetLayerId('');
       });
     }
-  }, [vectorLayers, targetLayerId]);
+  }, [vectorLayers, targetLayerId, activeFilters, setTargetLayerId]);
 
   // Which slots are currently "active" (have a payload applied on the map) for the target layer
   const appliedSlots = targetLayerId ? (activeFilters[targetLayerId] || {}) : {};
   const activeSlotKeys = Object.keys(appliedSlots) as (keyof LayerActiveFilters)[];
+
+  // All active filters across all layers (current target layer first, then others)
+  const allActiveFilterEntries = Object.entries(activeFilters)
+    .filter(([, slots]) => slots && Object.keys(slots).length > 0)
+    .sort(([idA], [idB]) => {
+      if (idA === targetLayerId) return -1;
+      if (idB === targetLayerId) return 1;
+      return 0;
+    });
 
   const fetchGeomFieldName = useCallback(async (layerId: string): Promise<string> => {
     try {
@@ -317,7 +346,7 @@ export default function QueryBuilder({
             ? (refBbox[0] >= -180.1 && refBbox[2] <= 180.1 && refBbox[1] >= -90.1 && refBbox[3] <= 90.1)
             : true;
           refFilterCql = compileSlotsToCql(refSlots, {}, refGeomFieldName, 'geom', refIsGeo) || 'INCLUDE';
-        } catch {}
+        } catch { }
       }
     }
 
@@ -593,6 +622,8 @@ export default function QueryBuilder({
     attrRef.current?.reset();
     bufferRef.current?.reset();
     spatialRef.current?.reset();
+    onClearBufferDraw();
+    onClearSpatialDraw();
     setSectionEnabled({
       buffer: mode === 'buffer',
       attribute: mode === 'attribute',
@@ -604,32 +635,50 @@ export default function QueryBuilder({
       ensureLayerMock(targetLayerId);
       onResetLayer(targetLayerId);
       setActiveFilters(prev => { const n = { ...prev }; delete n[targetLayerId]; return n; });
+    } else {
+      for (const lId of Object.keys(activeFilters)) {
+        ensureLayerMock(lId);
+        onResetLayer(lId);
+      }
+      setActiveFilters({});
     }
   };
 
-  const handleRemoveSlot = async (slot: keyof LayerActiveFilters) => {
-    if (!targetLayerId) return;
-    const current = activeFiltersRef.current[targetLayerId] || {};
+  const handleRemoveSlot = async (slot: keyof LayerActiveFilters, specificLayerId?: string) => {
+    const lId = specificLayerId || targetLayerId;
+    if (!lId) return;
+
+    if (slot === 'buffer') {
+      onClearBufferDraw();
+      bufferRef.current?.reset();
+    } else if (slot === 'spatial' || slot === 'layer') {
+      onClearSpatialDraw();
+      spatialRef.current?.reset();
+    } else if (slot === 'attribute') {
+      attrRef.current?.reset();
+    }
+
+    const current = activeFiltersRef.current[lId] || {};
     const updated = { ...current };
     delete updated[slot];
 
     setActiveFilters(prev => {
       const n = { ...prev };
-      if (Object.keys(updated).length === 0) delete n[targetLayerId];
-      else n[targetLayerId] = updated;
+      if (Object.keys(updated).length === 0) delete n[lId];
+      else n[lId] = updated;
       return n;
     });
 
     if (Object.keys(updated).length === 0) {
-      ensureLayerMock(targetLayerId);
-      onResetLayer(targetLayerId);
+      ensureLayerMock(lId);
+      onResetLayer(lId);
     } else {
       try {
-        const ids = await runCombinedQuery(targetLayerId, updated);
+        const ids = await runCombinedQuery(lId, updated);
 
         if (ids.length === 0) {
-          ensureLayerMock(targetLayerId);
-          onResetLayer(targetLayerId);
+          ensureLayerMock(lId);
+          onResetLayer(lId);
           return;
         }
 
@@ -640,12 +689,12 @@ export default function QueryBuilder({
           if (hasLayerFilter) {
             cqlFilterStr = ''; // Filtered via WMS featureid parameter, not CQL_FILTER
           } else {
-            const geomFieldName = await fetchGeomFieldName(targetLayerId);
+            const geomFieldName = await fetchGeomFieldName(lId);
             let refGeomFieldName = 'geom';
             if (updated.layer?.layer_filter?.dataset_id) {
               refGeomFieldName = await fetchGeomFieldName(updated.layer.layer_filter.dataset_id);
             }
-            const targetDataset = allDatasets.find(d => d.id === targetLayerId);
+            const targetDataset = allDatasets.find(d => d.id === lId);
             const bbox = targetDataset?.metadata?.bbox;
             const isGeographic = bbox
               ? (bbox[0] >= -180.1 && bbox[2] <= 180.1 && bbox[1] >= -90.1 && bbox[3] <= 90.1)
@@ -659,17 +708,17 @@ export default function QueryBuilder({
         // Set properties on the OpenLayers layer to avoid large WMS IN queries
         let olLayer = null;
         if (typeof window !== 'undefined' && (window as any).vismapLayers) {
-          olLayer = (window as any).vismapLayers[targetLayerId];
+          olLayer = (window as any).vismapLayers[lId];
         }
         if (olLayer) {
           olLayer.set('cql_filter_string', cqlFilterStr);
         }
 
-        ensureLayerMock(targetLayerId);
-        onUpdateMapFilter(targetLayerId, ids, cqlFilterStr);
+        ensureLayerMock(lId);
+        onUpdateMapFilter(lId, ids, cqlFilterStr);
       } catch {
-        ensureLayerMock(targetLayerId);
-        onResetLayer(targetLayerId);
+        ensureLayerMock(lId);
+        onResetLayer(lId);
       }
     }
   };
@@ -783,28 +832,33 @@ export default function QueryBuilder({
       {/* ── Action bar — part of normal flow, never overlaps content ── */}
       <div className="shrink-0 border-t border-gray-100 bg-white flex flex-col gap-2.5 py-3 ">
         {/* Active filter pills */}
-        {activeSlotKeys.length > 0 && (
-          <div className="flex flex-col gap-1">
+        {allActiveFilterEntries.length > 0 && (
+          <div className="flex flex-col gap-1.5">
             <div className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Active on Map</div>
-            <div className="flex flex-wrap gap-1">
-              {activeSlotKeys.map(slot => {
-                const cfg = SLOT_LABELS[slot];
-                if (!cfg) return null;
-                return (
-                  <div
-                    key={slot}
-                    className={`flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-bold transition-opacity duration-100 ${cfg.bg} ${cfg.color}`}
-                  >
-                    <span className="w-1.5 h-1.5 rounded-full bg-current opacity-60" />
-                    {cfg.label}
-                    <button
-                      onClick={() => handleRemoveSlot(slot)}
-                      className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity duration-100"
+            <div className="flex items-center gap-1.5 qb-pills-scroll pb-1 max-w-full">
+              {allActiveFilterEntries.flatMap(([layerId, slots]) => {
+                const layerName = vectorLayers.find(l => l.id === layerId)?.name || allDatasets.find(d => d.id === layerId)?.name || layerId;
+                return (Object.keys(slots) as (keyof LayerActiveFilters)[]).map(slot => {
+                  const cfg = SLOT_LABELS[slot];
+                  if (!cfg) return null;
+                  return (
+                    <div
+                      key={`${layerId}-${slot}`}
+                      className={`shrink-0 flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-bold transition-opacity duration-100 ${cfg.bg} ${cfg.color}`}
+                      title={`${layerName}: ${cfg.label}`}
                     >
-                      <X size={9} />
-                    </button>
-                  </div>
-                );
+                      <span className="w-1.5 h-1.5 rounded-full bg-current opacity-60" />
+                      <span className="max-w-[80px] truncate text-gray-500 font-normal">{layerName}:</span>
+                      {cfg.label}
+                      <button
+                        onClick={() => handleRemoveSlot(slot, layerId)}
+                        className="ml-0.5 opacity-50 hover:opacity-100 transition-opacity duration-100"
+                      >
+                        <X size={9} />
+                      </button>
+                    </div>
+                  );
+                });
               })}
             </div>
           </div>
@@ -818,7 +872,7 @@ export default function QueryBuilder({
               size="small"
               icon={<RotateCcw size={13} />}
               onClick={handleReset}
-              disabled={!targetLayerId}
+              disabled={!targetLayerId && allActiveFilterEntries.length === 0}
               className="h-8 w-8 flex items-center justify-center shrink-0"
             />
           </Tooltip>

@@ -297,7 +297,10 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
 
   const handleLogout = async () => {
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        credentials: 'include',
+      });
     } catch (err) {
       console.error('Failed to log out from server:', err);
     }
@@ -305,7 +308,7 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
     // finish before the DOM element is unmounted, avoiding browser pointer-capture errors.
     setTimeout(() => {
       clearAuth();
-      router.push('/login');
+      window.location.href = '/login';
     }, 50);
   };
 

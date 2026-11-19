@@ -22,6 +22,28 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  const isProduction = process.env.NODE_ENV === 'production';
+  const proto = request.headers.get('x-forwarded-proto');
+  const isSecure = isProduction || proto === 'https' || request.url.startsWith('https://');
+
+  const clearAuthCookies = (res: NextResponse) => {
+    const cookieNames = ['refresh_token', 'geoserver_auth', 'geoserver_url', 'geoserver_username', 'GEOSERVER_JSESSIONID', 'JSESSIONID'];
+    const paths = ['/', '/api/auth/token', '/api/auth'];
+    const secureAttr = isSecure ? '; Secure' : '';
+    for (const name of cookieNames) {
+      for (const p of paths) {
+        res.headers.append(
+          'Set-Cookie',
+          `${name}=; Path=${p}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax${secureAttr}`
+        );
+        res.headers.append(
+          'Set-Cookie',
+          `${name}=; Path=${p}; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax${secureAttr}`
+        );
+      }
+    }
+  };
+
   const payload = verifyJwt(refreshToken);
   if (!payload) {
     // Token is invalid or expired — clear the cookie
@@ -29,10 +51,7 @@ export async function POST(request: NextRequest) {
       { detail: 'Refresh token expired or invalid. Please log in again.' },
       { status: 401 }
     );
-    res.cookies.delete('refresh_token');
-    res.cookies.delete('geoserver_auth');
-    res.cookies.delete('geoserver_url');
-    res.cookies.delete('geoserver_username');
+    clearAuthCookies(res);
     return res;
   }
 
@@ -44,10 +63,7 @@ export async function POST(request: NextRequest) {
       { detail: 'Active GeoServer instance changed. Please sign in again.' },
       { status: 401 }
     );
-    res.cookies.delete('refresh_token');
-    res.cookies.delete('geoserver_auth');
-    res.cookies.delete('geoserver_url');
-    res.cookies.delete('geoserver_username');
+    clearAuthCookies(res);
     return res;
   }
 
@@ -117,7 +133,6 @@ export async function POST(request: NextRequest) {
     email: emailAddress || `${username}@vismap.com`,
   };
 
-  const isProduction = process.env.NODE_ENV === 'production';
   const res = NextResponse.json({
     access: newAccess,
     user,

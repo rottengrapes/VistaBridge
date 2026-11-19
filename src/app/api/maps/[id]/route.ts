@@ -73,14 +73,6 @@ export async function GET(
       );
     }
 
-    // Enforce ownership checks for private maps
-    if (!isPublicMap && row.created_by && (!user || row.created_by !== user.username)) {
-      return NextResponse.json(
-        { detail: 'You do not have permission to view this workspace.' },
-        { status: 403 }
-      );
-    }
-
     const map = {
       id: row.id,
       slug: row.slug || row.id,
