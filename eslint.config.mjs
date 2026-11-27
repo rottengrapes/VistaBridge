@@ -11,6 +11,7 @@ const eslintConfig = defineConfig([
       "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_", varsIgnorePattern: "^_" }],
       "react-hooks/set-state-in-effect": "warn",
       "react-hooks/immutability": "warn",
+      "react-hooks/refs": "warn",
       "react/no-unescaped-entities": "warn",
       "@next/next/no-img-element": "warn",
       "@typescript-eslint/no-require-imports": "warn",

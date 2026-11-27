@@ -8,6 +8,7 @@
 // - Customize login screen wallpaper image, headline, and subtitle
 // ============================================================================
 
+/* eslint-disable @next/next/no-img-element */
 'use client';
 
 import React, { useEffect, useState, useRef } from 'react';
@@ -282,8 +283,9 @@ export default function AppearancePage() {
       setNewBasemapThumbnail('');
       setNewBasemapAttributions('');
       setIsAddBasemapModalOpen(false);
-    } catch (err: any) {
-      notification.error({ message: 'Error', description: err.message || 'Failed to add basemap.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to add basemap.';
+      notification.error({ message: 'Error', description: msg });
     } finally {
       setAddingBasemap(false);
     }
@@ -309,8 +311,9 @@ export default function AppearancePage() {
         setLocalBasemap('osm');
       }
       notification.success({ message: 'Success', description: `Basemap "${bmName}" deleted.` });
-    } catch (err: any) {
-      notification.error({ message: 'Error', description: err.message || 'Failed to delete basemap.' });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Failed to delete basemap.';
+      notification.error({ message: 'Error', description: msg });
     }
   };
 
@@ -471,10 +474,11 @@ export default function AppearancePage() {
         description: 'Branding, theme, basemap defaults, and login styling have been updated.',
         placement: 'topRight',
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not save appearance settings to the database.';
       notification.error({
         message: 'Save Failed',
-        description: err.message || 'Could not save appearance settings to the database.',
+        description: msg,
         placement: 'topRight',
       });
     } finally {
@@ -517,10 +521,11 @@ export default function AppearancePage() {
         description: 'Restored default VistaBridge branding, theme, basemap, and login layout.',
         placement: 'topRight',
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Could not reset appearance.';
       notification.error({
         message: 'Reset Failed',
-        description: err.message || 'Could not reset appearance.',
+        description: msg,
         placement: 'topRight',
       });
     }

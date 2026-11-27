@@ -27,6 +27,7 @@ import {
   Home,
   Palette,
   Shield,
+  Terminal,
 } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -337,6 +338,11 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
       ],
     },
     {
+      key: '/logs',
+      label: 'GeoServer Logs',
+      icon: <Terminal size={20} />,
+    },
+    {
       key: 'accounts',
       label: 'Account Settings',
       icon: <UserCircle size={20} />,
@@ -444,9 +450,9 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
           collapsible
           collapsed={collapsed}
           className={`${isMobile
-              ? `absolute z-50 top-0 left-0 h-full border-r border-gray-100 bg-white ${collapsed ? '' : 'shadow-2xl'
-              }`
-              : 'bg-white border-r border-gray-100 h-full overflow-visible shrink-0 relative'
+            ? `absolute z-50 top-0 left-0 h-full border-r border-gray-100 bg-white ${collapsed ? '' : 'shadow-2xl'
+            }`
+            : 'bg-white border-r border-gray-100 h-full overflow-visible shrink-0 relative'
             }`}
           style={{
             backgroundColor: 'color-mix(in srgb, var(--primary-color) 2%, white)',
@@ -769,11 +775,10 @@ export default function DashboardLayout({ children }: DashboardLayoutProps) {
                     <Tag
                       closable={!isAdminRole}
                       onClose={isAdminRole ? undefined : props.onClose}
-                      className={`rounded-lg text-xs font-semibold px-2 py-0.5 mr-1 flex items-center gap-1 ${
-                        isAdminRole
-                          ? 'bg-purple-50 border border-purple-200 text-purple-700'
-                          : 'bg-blue-50 border border-blue-200 text-blue-700'
-                      }`}
+                      className={`rounded-lg text-xs font-semibold px-2 py-0.5 mr-1 flex items-center gap-1 ${isAdminRole
+                        ? 'bg-purple-50 border border-purple-200 text-purple-700'
+                        : 'bg-blue-50 border border-blue-200 text-blue-700'
+                        }`}
                     >
                       <Shield size={11} className="inline mr-1" />
                       {props.value}

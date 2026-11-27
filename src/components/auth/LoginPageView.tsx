@@ -140,7 +140,11 @@ function LoginForm() {
       try {
         const checkRes = await fetch('/api/geoserver/services/check', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': basicAuth,
+            'x-geoserver-url': geoserverUrl,
+          },
           body: JSON.stringify({
             geoserverUrl,
             username: values.username,

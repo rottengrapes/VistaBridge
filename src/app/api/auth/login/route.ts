@@ -272,6 +272,7 @@ export async function POST(request: Request) {
       last_name: lastName || undefined,
       email: emailAddress || undefined,
       geoserverUrl: cleanUrl,
+      geoserverAuth: basicAuth,
     });
 
     // Set GeoServer Auth Cookies

@@ -33,16 +33,27 @@ export async function POST(req: NextRequest) {
     const cookieStore = await cookies();
     const geoserverAuthCookie = cookieStore.get('geoserver_auth')?.value;
     const geoserverUrlCookie = cookieStore.get('geoserver_url')?.value;
+    const headerAuth = req.headers.get('authorization');
+    const headerUrl = req.headers.get('x-geoserver-url');
 
     const defaultGeoserverUrl = await getAppSetting('geoserver_url', 'http://localhost:8080/geoserver');
-    const rawTarget = body.geoserverUrl || geoserverUrlCookie || defaultGeoserverUrl;
+    const rawTarget = headerUrl || body.geoserverUrl || geoserverUrlCookie || defaultGeoserverUrl;
     const serverFetchUrl = resolveInternalGeoServerUrl(rawTarget).replace(/\/+$/, '');
 
     let authHeader = '';
-    if (body.username && body.password) {
+    if (headerAuth) {
+      authHeader = headerAuth;
+    } else if (body.username && body.password) {
       authHeader = 'Basic ' + Buffer.from(`${body.username}:${body.password}`).toString('base64');
     } else if (geoserverAuthCookie) {
       authHeader = geoserverAuthCookie;
+    }
+
+    // Fallback: check stored admin auth from SQLite database
+    if (!authHeader) {
+      const storedAdminAuth = await getAppSetting(`geoserver_admin_auth:${rawTarget}`, '');
+      const globalAdminAuth = await getAppSetting('geoserver_admin_auth', '');
+      authHeader = storedAdminAuth || globalAdminAuth;
     }
 
     const headers: Record<string, string> = {};
@@ -55,7 +66,7 @@ export async function POST(req: NextRequest) {
         const res = await fetch(url, {
           method: 'GET',
           headers,
-          signal: AbortSignal.timeout(3500),
+          signal: AbortSignal.timeout(8000),
         });
 
         // 200 is available. Note: some GeoServers return XML ExceptionReport if service is disabled
@@ -72,22 +83,14 @@ export async function POST(req: NextRequest) {
       }
     };
 
-    // Parallel probes with fallback for WMTS
-    const [wmsResult, wfsResult, wcsResult, wpsResult] = await Promise.all([
+    // Parallel probes: WMS, WFS, WCS, WPS via OWS, and WMTS via GeoWebCache
+    const [wmsResult, wfsResult, wcsResult, wpsResult, wmtsResult] = await Promise.all([
       probeEndpoint(`${serverFetchUrl}/ows?service=WMS&version=1.3.0&request=GetCapabilities`, '1.3.0'),
       probeEndpoint(`${serverFetchUrl}/ows?service=WFS&version=1.1.0&request=GetCapabilities`, '1.1.0'),
       probeEndpoint(`${serverFetchUrl}/ows?service=WCS&version=2.0.1&request=GetCapabilities`, '2.0.1'),
       probeEndpoint(`${serverFetchUrl}/ows?service=WPS&version=1.0.0&request=GetCapabilities`, '1.0.0'),
+      probeEndpoint(`${serverFetchUrl}/gwc/service/wmts?REQUEST=GetCapabilities`, '1.0.0'),
     ]);
-
-    // WMTS can be at /gwc/service/wmts or /ows
-    let wmtsResult = await probeEndpoint(`${serverFetchUrl}/gwc/service/wmts?REQUEST=GetCapabilities`, '1.0.0');
-    if (!wmtsResult.available) {
-      const owsWmts = await probeEndpoint(`${serverFetchUrl}/ows?service=WMTS&version=1.0.0&request=GetCapabilities`, '1.0.0');
-      if (owsWmts.available) {
-        wmtsResult = owsWmts;
-      }
-    }
 
     return NextResponse.json({
       success: true,

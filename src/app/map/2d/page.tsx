@@ -940,25 +940,27 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     // Migrate old format
     let defaultStyle: StyleConfig;
 
-    if (layerType === 'RASTER' && schema) {
-      const bandKeys = Object.keys(schema).filter(k => k.startsWith('band_'));
+    if (layerType === 'RASTER') {
+      const bandKeys = schema ? Object.keys(schema).filter(k => k.startsWith('band_')) : [];
       const numBands = bandKeys.length;
-      if (numBands > 1) {
+      if (numBands > 1 || oldConfig?.mode === 'multiband') {
         defaultStyle = oldConfig || {
           mode: 'multiband',
           redBand: 'band_1',
           greenBand: 'band_2',
-          blueBand: 'band_3'
+          blueBand: 'band_3',
+          rasterOpacity: 1.0,
         };
       } else {
         const firstBand = bandKeys[0] || 'band_1';
-        const bandMeta = (schema as any)[firstBand] || {};
+        const bandMeta = (schema as any)?.[firstBand] || {};
         defaultStyle = oldConfig || {
           mode: 'single_band',
           band: firstBand,
           rescaleMin: bandMeta.min !== undefined && bandMeta.min !== null ? bandMeta.min : 0,
           rescaleMax: bandMeta.max !== undefined && bandMeta.max !== null ? bandMeta.max : 255,
-          colormapName: 'gray'
+          colormapName: 'gray',
+          rasterOpacity: 1.0,
         };
       }
     } else {
@@ -2310,9 +2312,9 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
         const nameLocal = nameLower.includes(':') ? nameLower.split(':').pop()! : nameLower;
 
         return accessibleLayersSet.has(idLower) ||
-               accessibleLayersSet.has(nameLower) ||
-               accessibleLayersSet.has(idLocal) ||
-               accessibleLayersSet.has(nameLocal);
+          accessibleLayersSet.has(nameLower) ||
+          accessibleLayersSet.has(idLocal) ||
+          accessibleLayersSet.has(nameLocal);
       };
 
       for (const layerData of layersToLoad) {
@@ -4503,6 +4505,17 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
     styleConfig: any,
     labelsEnabled?: boolean
   ) => {
+    if (!olLayer) return;
+
+    // Handle non-vector layers (e.g. TileLayer / ImageLayer for Raster WMS)
+    if (typeof olLayer.setStyle !== 'function') {
+      const opacity = styleConfig?.rasterOpacity ?? styleConfig?.opacity ?? (styleConfig?.fillOpacity !== undefined ? styleConfig.fillOpacity : undefined);
+      if (opacity !== undefined && typeof olLayer.setOpacity === 'function') {
+        olLayer.setOpacity(opacity);
+      }
+      return;
+    }
+
     // Get layer metadata for labels
     const layerId = Object.keys(olLayersRef.current).find(
       key => olLayersRef.current[key] === olLayer
@@ -4879,24 +4892,38 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
   };
 
   const handleOpenStyleEditor = async (layer: any) => {
-    let schema = {};
+    let schema: Record<string, any> = {};
     try {
       const response = await apiRequest(`/datasets/${layer.id}/`);
       if (response.ok) {
         const data = await response.json();
         schema = data.metadata?.attributes_schema || {};
         setSelectedLayerSchema(schema);
-        setSelectedLayerGeomType(data.metadata?.geometry_type || null);
+        setSelectedLayerGeomType(data.metadata?.geometry_type || (layer.type === 'RASTER' ? 'RASTER' : null));
       }
     } catch (err) {
       console.error('Failed to load schema for layer styling:', err);
+    }
+
+    if (layer.type === 'RASTER') {
+      const hasBands = Object.keys(schema).some(k => k.startsWith('band_'));
+      if (!hasBands) {
+        schema = {
+          band_1: { name: 'Band 1', min: 0, max: 255 },
+          band_2: { name: 'Band 2', min: 0, max: 255 },
+          band_3: { name: 'Band 3', min: 0, max: 255 },
+          band_4: { name: 'Band 4', min: 0, max: 255 },
+        };
+        setSelectedLayerSchema(schema);
+        setSelectedLayerGeomType('RASTER');
+      }
     }
 
     let layerStyleData = vectorLayerStyles[layer.id];
 
     // Migrate if needed
     if (!layerStyleData || !layerStyleData.styles) {
-      layerStyleData = migrateStyleConfig(layerStyleData);
+      layerStyleData = migrateStyleConfig(layerStyleData, layer.type, schema);
       setVectorLayerStyles(prev => ({
         ...prev,
         [layer.id]: layerStyleData
@@ -7292,6 +7319,159 @@ function Map2DContent({ identifier, isQuickMap = false }: { identifier?: string;
                       const olLayer = olLayersRef.current[selectedStyleLayer.id];
                       if (olLayer) {
                         applyStyleToOlLayer(olLayer, newConfig, currentLayer?.labelsEnabled);
+                      }
+                    }}
+                    onStylesLoaded={(stylesList, defaultStyle) => {
+                      if (!stylesList || stylesList.length === 0) return;
+
+                      const mergeStyles = (existing: any[] = [], incoming: any[] = []) => {
+                        const styleDict: Record<string, any> = {};
+                        existing.forEach((s: any) => {
+                          const raw = typeof s === 'string' ? s : s?.name || '';
+                          const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                          if (clean) styleDict[clean.toLowerCase()] = s;
+                        });
+                        incoming.forEach((s: any) => {
+                          const raw = typeof s === 'string' ? s : s?.name || '';
+                          const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                          if (clean) {
+                            const prev = styleDict[clean.toLowerCase()];
+                            styleDict[clean.toLowerCase()] = {
+                              name: clean,
+                              title: (typeof s === 'object' && s?.title) || (typeof prev === 'object' && prev?.title) || clean,
+                              workspace: (typeof s === 'object' && s?.workspace) || (typeof prev === 'object' && prev?.workspace),
+                            };
+                          }
+                        });
+                        return Object.values(styleDict);
+                      };
+
+                      setAddedLayers(prev =>
+                        prev.map(l => {
+                          if (l.id !== selectedStyleLayer.id) return l;
+                          const merged = mergeStyles(l.styles, stylesList);
+                          return {
+                            ...l,
+                            styles: merged,
+                            activeStyle: l.activeStyle || defaultStyle,
+                          };
+                        })
+                      );
+                      setSelectedStyleLayer((prev: any) => {
+                        if (!prev || prev.id !== selectedStyleLayer.id) return prev;
+                        const merged = mergeStyles(prev.styles, stylesList);
+                        return {
+                          ...prev,
+                          styles: merged,
+                          activeStyle: prev.activeStyle || defaultStyle,
+                        };
+                      });
+                    }}
+                    onSaved={(savedStyleName) => {
+                      const cleanSaved = savedStyleName.includes(':')
+                        ? savedStyleName.split(':').pop() || savedStyleName
+                        : savedStyleName;
+
+                      const updateLayerEntry = (l: any) => {
+                        const existingStyles = l.styles || [];
+                        const hasStyle = existingStyles.some((s: any) => {
+                          const raw = typeof s === 'string' ? s : s?.name || '';
+                          const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                          return clean.toLowerCase() === cleanSaved.toLowerCase();
+                        });
+                        const nextStyles = hasStyle
+                          ? existingStyles.map((s: any) => {
+                            const raw = typeof s === 'string' ? s : s?.name || '';
+                            const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                            return clean.toLowerCase() === cleanSaved.toLowerCase()
+                              ? (typeof s === 'object' ? { ...s, name: cleanSaved } : cleanSaved)
+                              : s;
+                          })
+                          : [...existingStyles, { name: cleanSaved, title: cleanSaved }];
+                        return {
+                          ...l,
+                          activeStyle: cleanSaved,
+                          styles: nextStyles,
+                        };
+                      };
+
+                      setAddedLayers(prev =>
+                        prev.map(l => {
+                          if (l.id !== selectedStyleLayer.id) return l;
+                          return updateLayerEntry(l);
+                        })
+                      );
+
+                      setSelectedStyleLayer((prev: any) => {
+                        if (!prev || prev.id !== selectedStyleLayer.id) return prev;
+                        return updateLayerEntry(prev);
+                      });
+
+                      // Refresh the OpenLayers WMS layer with cache-busting timestamp
+                      const olLayer = olLayersRef.current[selectedStyleLayer.id];
+                      if (olLayer && typeof olLayer.getSource === 'function') {
+                        const source = olLayer.getSource();
+                        if (source && typeof source.updateParams === 'function') {
+                          source.updateParams({
+                            STYLES: cleanSaved,
+                            _ts: Date.now(),
+                          });
+                          if (typeof source.refresh === 'function') {
+                            source.refresh();
+                          }
+                        }
+                      }
+
+                      notification.success({
+                        message: 'GeoServer Style Applied',
+                        description: `Style "${cleanSaved}" is now saved and active on GeoServer for layer "${selectedStyleLayer.name}".`,
+                        placement: 'topRight',
+                      });
+                    }}
+                    onDeleted={(deletedStyleName, newActiveStyle, remainingStyles) => {
+                      const cleanDeleted = deletedStyleName.includes(':')
+                        ? deletedStyleName.split(':').pop() || deletedStyleName
+                        : deletedStyleName;
+
+                      const purgeDeletedEntry = (l: any) => {
+                        const existingStyles = l.styles || [];
+                        const filtered = existingStyles.filter((s: any) => {
+                          const raw = typeof s === 'string' ? s : s?.name || '';
+                          const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                          return clean.toLowerCase() !== cleanDeleted.toLowerCase();
+                        });
+                        return {
+                          ...l,
+                          activeStyle: newActiveStyle,
+                          styles: remainingStyles && remainingStyles.length > 0 ? remainingStyles : filtered,
+                        };
+                      };
+
+                      setAddedLayers(prev =>
+                        prev.map(l => {
+                          if (l.id !== selectedStyleLayer.id) return l;
+                          return purgeDeletedEntry(l);
+                        })
+                      );
+
+                      setSelectedStyleLayer((prev: any) => {
+                        if (!prev || prev.id !== selectedStyleLayer.id) return prev;
+                        return purgeDeletedEntry(prev);
+                      });
+
+                      // Refresh the OpenLayers WMS layer with the new active style
+                      const olLayer = olLayersRef.current[selectedStyleLayer.id];
+                      if (olLayer && typeof olLayer.getSource === 'function') {
+                        const source = olLayer.getSource();
+                        if (source && typeof source.updateParams === 'function') {
+                          source.updateParams({
+                            STYLES: newActiveStyle,
+                            _ts: Date.now(),
+                          });
+                          if (typeof source.refresh === 'function') {
+                            source.refresh();
+                          }
+                        }
                       }
                     }}
                   />

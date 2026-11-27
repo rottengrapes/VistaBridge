@@ -250,7 +250,7 @@ if "!NEEDS_REBUILD!"=="1" (
     echo ======================================================================
     echo.
     call npm run build
-    if %ERRORLEVEL% NEQ 0 (
+    if !ERRORLEVEL! NEQ 0 (
         echo.
         echo [ERROR] Build encountered an error! Please check the output above.
         pause

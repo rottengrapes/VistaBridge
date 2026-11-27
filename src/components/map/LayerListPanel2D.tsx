@@ -697,58 +697,112 @@ export default function LayerListPanel2D({
                 </Tooltip>
 
                 {/* Style Dropdown with GeoServer-defined Styles */}
-                <Dropdown
-                  menu={{
-                    items: (layer.styles || []).map((style: any) => ({
-                      key: style.name,
-                      label: (
-                        <div className="flex items-center justify-between gap-2 min-w-[120px]">
-                          <span className="text-xs truncate">{style.title || style.name}</span>
-                          {style.name === (layer.activeStyle || '') && (
-                            <Tag color="blue" className="text-[9px] m-0 px-1 py-0">Active</Tag>
-                          )}
-                        </div>
-                      ),
-                      onClick: () => {
-                        setAddedLayers(prev => prev.map(l => l.id === layer.id ? { ...l, activeStyle: style.name } : l));
-                        setVectorLayerStyles(prev => ({
-                          ...prev,
-                          [layer.id]: {
-                            ...prev[layer.id],
-                            activeStyle: style.name,
-                          }
-                        }));
-                        applyVectorLayerStyle(layer.id, style.name);
-                        notification.success({
-                          message: 'Style Applied',
-                          description: `Applied GeoServer style "${style.title || style.name}" to layer "${layer.name}".`,
-                          placement: 'topRight'
-                        });
-                      }
-                    }))
-                  }}
-                  trigger={['click']}
-                  placement="bottomLeft"
-                  disabled={!layer.styles || layer.styles.length <= 1}
-                >
-                  <Tooltip title={layer.styles && layer.styles.length > 1 ? "Select GeoServer Style" : "No other GeoServer styles"}>
+                {layer.styles && layer.styles.length > 1 ? (
+                  <Dropdown
+                    menu={{
+                      items: [
+                        {
+                          key: '__open_editor__',
+                          label: (
+                            <div className="flex items-center gap-1.5 text-xs font-semibold text-primary py-0.5">
+                              <Palette size={13} />
+                              <span>Open Style Editor</span>
+                            </div>
+                          ),
+                          onClick: () => _handleOpenStyleEditor(layer),
+                        },
+                        { type: 'divider' },
+                        ...(() => {
+                          const seen = new Set<string>();
+                          const uniqueStyles: Array<{ name: string; title?: string }> = [];
+                          (layer.styles || []).forEach((style: any) => {
+                            const raw = typeof style === 'string' ? style : style?.name || '';
+                            const clean = raw.includes(':') ? raw.split(':').pop() || raw : raw;
+                            if (clean && !seen.has(clean.toLowerCase())) {
+                              seen.add(clean.toLowerCase());
+                              uniqueStyles.push({
+                                name: clean,
+                                title: typeof style === 'object' && style?.title ? style.title : clean,
+                              });
+                            }
+                          });
+
+                          return uniqueStyles.map((style) => {
+                            const sName = style.name;
+                            const sTitle = style.title || '';
+                            const hasCustomTitle = sTitle && sTitle !== sName;
+                            const activeClean = (layer.activeStyle || '').includes(':')
+                              ? (layer.activeStyle || '').split(':').pop() || layer.activeStyle
+                              : layer.activeStyle;
+                            const isActive = sName.toLowerCase() === (activeClean || '').toLowerCase();
+
+                            return {
+                              key: sName,
+                              label: (
+                                <div className="flex items-center justify-between gap-3 min-w-[130px] max-w-[220px]">
+                                  <div className="flex flex-col min-w-0">
+                                    <span className="text-xs font-mono font-semibold text-gray-800 truncate">
+                                      {sName}
+                                    </span>
+                                    {hasCustomTitle && (
+                                      <span className="text-[10px] text-gray-400 truncate">
+                                        {sTitle}
+                                      </span>
+                                    )}
+                                  </div>
+                                  {isActive && (
+                                    <Tag color="blue" className="text-[9px] m-0 px-1 py-0 shrink-0">
+                                      Active
+                                    </Tag>
+                                  )}
+                                </div>
+                              ),
+                              onClick: () => {
+                                setAddedLayers((prev) =>
+                                  prev.map((l) => (l.id === layer.id ? { ...l, activeStyle: sName } : l))
+                                );
+                                setVectorLayerStyles((prev) => ({
+                                  ...prev,
+                                  [layer.id]: {
+                                    ...prev[layer.id],
+                                    activeStyle: sName,
+                                  },
+                                }));
+                                applyVectorLayerStyle(layer.id, sName);
+                                notification.success({
+                                  message: 'Style Applied',
+                                  description: `Applied GeoServer style "${sName}" to layer "${layer.name}".`,
+                                  placement: 'topRight',
+                                });
+                              },
+                            };
+                          });
+                        })(),
+                      ]
+                    }}
+                    trigger={['click']}
+                    placement="bottomLeft"
+                  >
+                    <Tooltip title="Layer Styling & GeoServer Styles">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<Palette size={12} className="text-primary hover:scale-110 transition-transform" />}
+                        className="flex items-center justify-center hover:bg-gray-100 rounded h-6 w-6"
+                      />
+                    </Tooltip>
+                  </Dropdown>
+                ) : (
+                  <Tooltip title="Style Layer (GeoStyler)">
                     <Button
                       type="text"
                       size="small"
-                      icon={
-                        layer.styles && layer.styles.length > 1 ? (
-                          <Palette size={12} className="text-blue-500" />
-                        ) : (
-                          <div className="relative flex items-center justify-center w-3 h-3">
-                            <Palette size={12} className="text-gray-400" />
-                            <span className="absolute w-[16px] h-[1.5px] bg-gray-400 rotate-45 pointer-events-none" />
-                          </div>
-                        )
-                      }
-                      className={layer.styles && layer.styles.length > 1 ? "flex items-center justify-center hover:bg-gray-50 rounded h-6 w-6" : "flex items-center justify-center rounded h-6 w-6 cursor-not-allowed opacity-60"}
+                      icon={<Palette size={12} className="text-primary hover:scale-110 transition-transform" />}
+                      onClick={() => _handleOpenStyleEditor(layer)}
+                      className="flex items-center justify-center hover:bg-gray-100 rounded h-6 w-6"
                     />
                   </Tooltip>
-                </Dropdown>
+                )}
 
                 {/* {layer.type === 'VECTOR' && (
                   <Tooltip title={layer.labelsEnabled ? "Hide Labels" : "Show Labels"}>

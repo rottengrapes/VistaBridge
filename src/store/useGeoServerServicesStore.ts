@@ -34,9 +34,9 @@ export interface GeoServerServicesConfig {
 export const DEFAULT_SERVICES_CONFIG: GeoServerServicesConfig = {
   wms: { enabled: true, version: '1.3.0' },
   wfs: { enabled: true, version: '1.1.0' },
-  wmts: { enabled: false, version: '1.0.0' },
-  wcs: { enabled: false, version: '2.0.1' },
-  wps: { enabled: false, version: '1.0.0' },
+  wmts: { enabled: true, version: '1.0.0' },
+  wcs: { enabled: true, version: '2.0.1' },
+  wps: { enabled: true, version: '1.0.0' },
   capabilitiesMode: 'WMS',
   defaultLayerService: 'WMS',
   activeDiscoveryService: null,
